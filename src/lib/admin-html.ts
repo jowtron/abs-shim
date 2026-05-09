@@ -52,7 +52,12 @@ export const ADMIN_HTML = String.raw`<!doctype html>
 </head>
 <body>
   <h1>ABS_shim · admin</h1>
-  <p class="muted">Storage backends + library scans. <a href="/" style="color: var(--accent)">Back to player</a></p>
+  <p class="muted">
+    Storage backends + library scans.
+    <a href="/" style="color: var(--accent)">Open ABS web UI</a>
+    &nbsp;·&nbsp;
+    <a href="/pholia/" style="color: var(--accent)">Open Pholia</a>
+  </p>
 
   <div id="error-banner" class="card" style="display:none; border-color: var(--warn); color: var(--warn)"></div>
 

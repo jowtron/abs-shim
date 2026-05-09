@@ -36,6 +36,8 @@ For backends that can't 302 directly (WebDAV), `proxy-url.ts` mints HMAC-signed 
 
 **Admin UI** (`src/lib/admin-html.ts`): single self-contained HTML+JS embedded in the Worker, served at `/admin`. Cookie-authed with inline login form. Renders all library_folders per library (multi-backend), with attach buttons for S3/WebDAV/pCloud. Includes copy-paste pCloud-support email template when secrets missing.
 
+**Alternative player — Pholia at `/pholia/`:** A second client (Pholia, github.com/jowtron/pholia, MIT) is fetched at deploy time by `scripts/fetch-pholia.sh` and dropped into `web/pholia/` (gitignored). Every `npm run deploy` runs `predeploy` → `fetch:pholia` → `git clone --depth 1` of latest main, injects the short SHA into `id="build-version"` (so Pholia's update-detection probe sees a real version), and copies runtime files only. Pholia uses relative paths and `./sw.js` so it works as a drop-in subdirectory app. Pin a specific ref with `PHOLIA_REF=v1.2.3 npm run deploy`, or skip the fetch (e.g. for offline builds) with `SKIP_PHOLIA=1`. Don't vendor Pholia source into this repo — that bypasses upstream fixes.
+
 ## Strict-client compatibility (ShelfPlayer)
 
 ShelfPlayer uses strict Swift Codable — one field type mismatch fails the entire response, and array-decode failures wipe whole shelves. Lessons learned and locked into the code:

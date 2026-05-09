@@ -11,3 +11,6 @@ dist/
 *.log
 .DS_Store
 .claude/
+
+# Pholia is fetched at deploy time by scripts/fetch-pholia.sh — never vendor it.
+web/pholia/
