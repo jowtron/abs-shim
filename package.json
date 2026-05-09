@@ -1,0 +1,24 @@
+{
+  "name": "abs-shim",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "db:create": "wrangler d1 create abs-shim-db",
+    "db:migrate:local": "wrangler d1 migrations apply abs-shim-db --local",
+    "db:migrate": "wrangler d1 migrations apply abs-shim-db --remote",
+    "db:console:local": "wrangler d1 execute abs-shim-db --local --command",
+    "db:reset:local": "rm -rf .wrangler/state/v3/d1 && npm run db:migrate:local",
+    "db:seed:local": "wrangler d1 execute abs-shim-db --local --file=seed/0001_two_books.sql"
+  },
+  "dependencies": {
+    "hono": "^4.7.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251201.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.70.0"
+  }
+}

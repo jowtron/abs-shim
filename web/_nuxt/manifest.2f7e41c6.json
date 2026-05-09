@@ -1,0 +1,20 @@
+{
+  "name": "Audiobookshelf",
+  "short_name": "Audiobookshelf",
+  "icons": [
+    {
+      "src": "/audiobookshelf/icon.svg",
+      "sizes": "any"
+    },
+    {
+      "src": "/audiobookshelf/icon192.png",
+      "type": "image/png",
+      "sizes": "any"
+    }
+  ],
+  "start_url": "/audiobookshelf/?standalone=true",
+  "display": "standalone",
+  "background_color": "#232323",
+  "theme_color": "#232323",
+  "lang": "en"
+}

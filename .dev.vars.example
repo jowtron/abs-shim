@@ -1,0 +1,14 @@
+# Wrangler local-dev secrets. Copy to `.dev.vars` (which is gitignored) and
+# fill in real values. For production, use `npx wrangler secret put <NAME>`
+# instead — wrangler.toml does not read these in deploys.
+
+# Mandatory: signing key for access tokens + WebDAV proxy URLs.
+# Generate with: openssl rand -base64 48
+JWT_SECRET=replace-me-with-a-long-random-string
+
+# Optional: pCloud OAuth (only if you want to attach a private pCloud
+# folder via the /admin UI). Leave blank if you only use public folders,
+# S3-compat, or WebDAV. Get these by registering an app in pCloud's
+# developer console.
+PCLOUD_CLIENT_ID=
+PCLOUD_CLIENT_SECRET=
