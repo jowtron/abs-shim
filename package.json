@@ -4,8 +4,6 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "fetch:pholia": "bash scripts/fetch-pholia.sh",
-    "predeploy": "npm run fetch:pholia",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "db:create": "wrangler d1 create abs-shim-db",

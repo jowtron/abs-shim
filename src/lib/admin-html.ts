@@ -56,7 +56,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     Storage backends + library scans.
     <a href="/" style="color: var(--accent)">Open ABS web UI</a>
     &nbsp;·&nbsp;
-    <a href="/pholia/" style="color: var(--accent)">Open Pholia</a>
+    <a href="https://pholia.pages.dev" target="_blank" rel="noopener" style="color: var(--accent)">Open Pholia ↗</a>
   </p>
 
   <div id="error-banner" class="card" style="display:none; border-color: var(--warn); color: var(--warn)"></div>
@@ -79,9 +79,10 @@ export const ADMIN_HTML = String.raw`<!doctype html>
       <span class="muted">More providers coming.</span>
     </div>
     <details id="pcloud-setup" class="muted" style="margin-top: 1rem; display:none">
-      <summary style="cursor: pointer; color: var(--accent)">pCloud not configured — setup instructions</summary>
+      <summary style="cursor: pointer; color: var(--accent)">pCloud OAuth not configured — setup instructions (only needed for private pCloud folders)</summary>
       <div style="margin-top: 0.75rem; line-height: 1.5">
-        <p>To enable pCloud, you need an OAuth app's <code>client_id</code> and <code>client_secret</code> stored as Cloudflare Worker secrets.</p>
+        <p><strong>You don't need this if you're already using a pCloud <em>public folder</em> URL</strong> (a <code>filedn.com</code> link). The OAuth flow below is only required to attach a <em>private</em> pCloud folder where files aren't publicly listable.</p>
+        <p>To enable pCloud OAuth, you need an OAuth app's <code>client_id</code> and <code>client_secret</code> stored as Cloudflare Worker secrets.</p>
         <p><strong>Step 1 — Get an OAuth app from pCloud.</strong> Their "New App" button under My Applications is currently disabled (rate-limited due to abuse), so you have to request one manually. Email <a href="mailto:support@pcloud.com" style="color: var(--accent)">support@pcloud.com</a>; here's a template that has worked, just replace <code>&lt;your-handle&gt;</code>:</p>
         <pre style="white-space: pre-wrap; user-select: all">Subject: OAuth app request (manual — &quot;New App&quot; is unavailable)
 
@@ -216,9 +217,12 @@ function formatScanReport(report) {
       if (err.reason && err.reason.indexOf('listing not supported') >= 0) {
         lines.push('  ✗ Auto-scan unavailable for this storage backend.');
         lines.push('    The current folder uses filedn (public-URL) storage,');
-        lines.push('    which has no folder-listing API — pCloud and R2 do.');
-        lines.push('    Until you connect a backend that supports listing,');
-        lines.push('    use "Add book by path" to register one book at a time.');
+        lines.push('    which has no folder-listing API — pCloud OAuth, S3,');
+        lines.push('    and WebDAV do.');
+        lines.push('');
+        lines.push('    To add a single book on a public-URL folder, use the');
+        lines.push('    "Add book by path" button next to "Scan now" (scroll up');
+        lines.push('    to the library card if it just hid behind this output).');
       } else {
         lines.push('  ✗ ' + (err.relPath || '(folder)') + ': ' + err.reason);
       }
@@ -314,10 +318,13 @@ function renderLibraries(status, libraries) {
     } else {
       html += '<div style="margin: 0.5rem 0;">';
       for (const f of folders) {
-        html += '<div style="display:flex; gap:0.5rem; align-items:center; padding:0.4rem 0.5rem; margin:0.25rem 0; background:var(--bg); border:1px solid var(--border); border-radius:4px;">';
-        html += '<code>' + escapeHtml(f.provider) + '</code>';
-        html += '<span class="muted" style="flex:1; font-size: 0.85rem;">' + describeFolder(f) + '</span>';
-        html += '<button class="danger" data-remove-folder="' + escapeHtml(f.id) + '" style="font-size:0.8rem; padding:0.2rem 0.6rem">Remove</button>';
+        html += '<div style="display:flex; gap:0.5rem; align-items:center; padding:0.4rem 0.5rem; margin:0.25rem 0; background:var(--bg); border:1px solid var(--border); border-radius:4px; flex-wrap:wrap;">';
+        html += '<code style="flex-shrink:0">' + escapeHtml(f.provider) + '</code>';
+        // min-width:0 lets flex children shrink below their content width;
+        // word-break makes long URLs wrap inside the card on mobile rather
+        // than spilling out the side.
+        html += '<span class="muted" style="flex:1; min-width:0; font-size: 0.85rem; word-break: break-all;">' + describeFolder(f) + '</span>';
+        html += '<button class="danger" data-remove-folder="' + escapeHtml(f.id) + '" style="font-size:0.8rem; padding:0.2rem 0.6rem; flex-shrink:0">Remove</button>';
         html += '</div>';
       }
       html += '</div>';
