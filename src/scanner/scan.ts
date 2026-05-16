@@ -200,6 +200,19 @@ async function probeBook(args: {
     ),
   ]);
 
+  // Pre-warm the R2 cover cache. We already probed the m4b, so the cover
+  // bytes are in memory — writing them now means the first /cover request
+  // is a cheap R2 hit instead of a 50–500ms re-probe of upstream storage.
+  if (probe.cover) {
+    try {
+      await env.COVERS.put(`covers/${itemId}`, probe.cover.bytes, {
+        httpMetadata: { contentType: probe.cover.mimeType },
+      });
+    } catch {
+      // Non-fatal: the on-demand handler will probe again on first request.
+    }
+  }
+
   return 'added';
 }
 

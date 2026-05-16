@@ -129,6 +129,15 @@ npx wrangler secret put PCLOUD_CLIENT_SECRET</pre>
     <div id="libraries-body" class="muted">Loading…</div>
   </div>
 
+  <div class="card">
+    <h2>Cover cache</h2>
+    <p class="muted">Covers are probed from the m4b on first request and stored in R2 so subsequent loads (from any CF POP) are fast. Click below to pre-fetch every library item's cover now.</p>
+    <div class="row">
+      <button id="warm-covers" class="secondary">Warm cover cache</button>
+      <span id="warm-status" class="muted"></span>
+    </div>
+  </div>
+
   <div id="scan-card" class="card" style="display:none">
     <h2>Last scan</h2>
     <pre id="scan-output"></pre>
@@ -163,6 +172,22 @@ function hideLoginForm() {
   document.getElementById('connections-card').style.display = '';
   document.getElementById('libraries-card').style.display = '';
 }
+
+document.getElementById('warm-covers').addEventListener('click', async (e) => {
+  const btn = e.target;
+  const status = document.getElementById('warm-status');
+  btn.disabled = true;
+  status.textContent = 'Probing…';
+  try {
+    const result = await api('/api/admin/covers/warm', { method: 'POST' });
+    status.textContent = result.warmed + ' warmed, ' + result.skipped + ' already cached, ' + result.failed + ' failed (of ' + result.totalItems + ' items).';
+  } catch (err) {
+    showError('Warm failed: ' + err.message);
+    status.textContent = '';
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 document.getElementById('login-form').addEventListener('submit', async (e) => {
   e.preventDefault();

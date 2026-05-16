@@ -17,11 +17,32 @@ export const itemRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 itemRoutes.get('/:id/cover', async (c) => {
   const id = c.req.param('id');
   const cache = caches.default;
-  // Build a stable cache key (token-stripped) so different users share the cache.
+  // Token-stripped cache key so different users share the same edge cache entry.
   const cacheKey = new Request(new URL(`/__cover_cache__/${id}`, c.req.url).toString(), { method: 'GET' });
-  const hit = await cache.match(cacheKey);
-  if (hit) return hit;
 
+  // Tier 1: Workers Cache (per-POP, ~5ms hit). Most-loaded covers live here.
+  const edgeHit = await cache.match(cacheKey);
+  if (edgeHit) return edgeHit;
+
+  // Tier 2: R2 (account-wide, ~10ms hit). Survives Workers-Cache eviction
+  // and is shared across all CF POPs, so a cold POP only re-probes the m4b
+  // the very first time a cover is ever requested.
+  const r2Key = `covers/${id}`;
+  const r2Hit = await c.env.COVERS.get(r2Key);
+  if (r2Hit) {
+    const headers = new Headers({
+      'Content-Type': r2Hit.httpMetadata?.contentType ?? 'image/jpeg',
+      'Cache-Control': 'public, max-age=2592000, immutable',
+      'Content-Length': String(r2Hit.size),
+    });
+    const res = new Response(r2Hit.body, { status: 200, headers });
+    c.executionCtx.waitUntil(cache.put(cacheKey, res.clone()));
+    return res;
+  }
+
+  // Tier 3: probe upstream. The probeM4b call does a Range read of the moov
+  // atom and pulls the embedded covr blob — expensive (~50–500ms depending
+  // on the storage backend), so we want this to happen at most once per item.
   const bundle = await buildItemBundle(c.env, id);
   if (!bundle) return c.json({ error: 'Item not found' }, 404);
   const audio = bundle.audioFiles[0];
@@ -41,11 +62,18 @@ itemRoutes.get('/:id/cover', async (c) => {
     status: 200,
     headers: {
       'Content-Type': cover.mimeType,
-      'Cache-Control': 'public, max-age=2592000, immutable', // 30 days
+      'Cache-Control': 'public, max-age=2592000, immutable',
       'Content-Length': String(cover.bytes.byteLength),
     },
   });
-  c.executionCtx.waitUntil(cache.put(cacheKey, res.clone()));
+  // Fan out to both tiers in the background so the request returns immediately.
+  // R2 put is idempotent on the same key.
+  c.executionCtx.waitUntil(Promise.all([
+    cache.put(cacheKey, res.clone()),
+    c.env.COVERS.put(r2Key, cover.bytes, {
+      httpMetadata: { contentType: cover.mimeType },
+    }),
+  ]));
   return res;
 });
 

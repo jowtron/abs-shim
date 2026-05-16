@@ -2,6 +2,7 @@ export type Env = {
   DB: D1Database;
   SESSION: DurableObjectNamespace;
   ASSETS: Fetcher; // Cloudflare static-assets binding for the bundled ABS web UI.
+  COVERS: R2Bucket; // Persistent cover cache — see src/routes/items.ts.
   // Secrets (set via `wrangler secret put`):
   JWT_SECRET?: string;
   GOOGLE_CLIENT_ID?: string;

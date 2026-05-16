@@ -6,7 +6,9 @@ import {
   apiHostFromLocationId, type PcloudProfile,
 } from '../storage/pcloud';
 import { runScan, addBookByPath, type ScanReport } from '../scanner/scan';
-import { getLibrary, listFolders } from '../db/library';
+import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem } from '../db/library';
+import { probeM4b } from '../prober/m4b';
+import { resolveProbeUrl } from '../storage/resolve';
 
 // All admin routes are gated by requireAuth + requireRoot. Mount at /api/admin
 // from index.ts. The admin UI itself lives at /admin and is served via the
@@ -304,6 +306,48 @@ adminRoutes.post('/books/add-by-path', async (c) => {
   } catch (e) {
     return c.json({ error: 'Add failed', detail: (e as Error).message }, 502);
   }
+});
+
+// Warm the R2 cover cache for every item that doesn't already have one stored.
+// Useful right after first enabling the R2 layer — otherwise R2 only fills as
+// items are added (via the scanner pre-warm) or as Workers Cache entries
+// evict and re-probe. Idempotent: existing R2 keys are skipped.
+adminRoutes.post('/covers/warm', async (c) => {
+  const rows = await c.env.DB.prepare(
+    'SELECT id FROM library_items WHERE is_missing = 0',
+  ).all<{ id: string }>();
+  const ids = (rows.results ?? []).map((r) => r.id);
+
+  let warmed = 0, skipped = 0, failed = 0;
+  const errors: { id: string; reason: string }[] = [];
+
+  for (const id of ids) {
+    const r2Key = `covers/${id}`;
+    const head = await c.env.COVERS.head(r2Key);
+    if (head) { skipped++; continue; }
+
+    try {
+      const item = await getItem(c.env, id);
+      if (!item) { failed++; errors.push({ id, reason: 'item not found' }); continue; }
+      const folder = await getFolderById(c.env, item.folder_id);
+      if (!folder) { failed++; errors.push({ id, reason: 'folder missing' }); continue; }
+      const audio = (await getAudioFiles(c.env, id))[0];
+      if (!audio) { failed++; errors.push({ id, reason: 'no audio file' }); continue; }
+
+      const probeUrl = await resolveProbeUrl(c.env, folder, audio);
+      const probe = await probeM4b(probeUrl.url);
+      if (!probe.cover) { failed++; errors.push({ id, reason: 'no embedded cover' }); continue; }
+
+      await c.env.COVERS.put(r2Key, probe.cover.bytes, {
+        httpMetadata: { contentType: probe.cover.mimeType },
+      });
+      warmed++;
+    } catch (e) {
+      failed++;
+      errors.push({ id, reason: (e as Error).message });
+    }
+  }
+  return c.json({ totalItems: ids.length, warmed, skipped, failed, errors });
 });
 
 // ─── helpers ────────────────────────────────────────────────────────────────
