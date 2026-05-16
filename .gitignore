@@ -11,3 +11,6 @@ dist/
 *.log
 .DS_Store
 .claude/
+
+# wrangler r2 object get without --file/--pipe drops files in cwd.
+covers/
