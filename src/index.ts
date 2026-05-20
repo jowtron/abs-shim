@@ -16,7 +16,7 @@ import { itemRoutes } from './routes/items';
 import { adminRoutes } from './routes/admin';
 import { listProgressByUser, getProgress, upsertProgress, progressToAbs } from './db/progress';
 import { listSessionsByUser } from './db/sessions';
-import { resolveStreamUrl } from './storage/resolve';
+import { streamAudio } from './storage/resolve';
 import { getFolderById } from './db/library';
 import { ADMIN_HTML } from './lib/admin-html';
 import { verifyProxyUrl } from './storage/proxy-url';
@@ -101,8 +101,7 @@ app.get('/public/session/:id/track/:trackIndex', async (c) => {
   if (!audio) return c.json({ error: 'Track not found' }, 404);
   const folder = await getFolderById(c.env, session.folder_id);
   if (!folder) return c.json({ error: 'Folder not found' }, 404);
-  const stream = await resolveStreamUrl(c.env, folder, audio);
-  return c.redirect(stream.url, 302);
+  return streamAudio(c.env, folder, audio, c.req.raw);
 });
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
@@ -486,6 +485,11 @@ app.get('/api/playlists', requireAuth, (c) => c.json({
 // ─── Misc shapes clients fetch on bootstrap ──────────────────────────────────
 
 app.get('/api/tags', requireAuth, (c) => c.json([]));
+
+// Background-tasks stub. The bundled Nuxt UI polls this on every page load
+// for a "currently running scan" badge. Stock ABS returns { tasks: [], queue:
+// [] }; empty arrays are enough to silence the 404 and keep the badge hidden.
+app.get('/api/tasks', requireAuth, (c) => c.json({ tasks: [], queue: [] }));
 
 app.get('/api/stats/year/:year', requireAuth, (c) => c.json({
   totalDuration: 0,

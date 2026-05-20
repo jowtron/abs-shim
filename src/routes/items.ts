@@ -6,7 +6,7 @@ import { buildItemBundle } from './library';
 import { probeM4b } from '../prober/m4b';
 import { insertListeningSession } from '../db/sessions';
 import { getProgress, progressToAbs } from '../db/progress';
-import { resolveProbeUrl, resolveStreamUrl } from '../storage/resolve';
+import { resolveProbeUrl, streamAudio } from '../storage/resolve';
 
 export const itemRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
@@ -104,8 +104,7 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
     ?? bundle.audioFiles.find((a) => a.index_no === Number(fid))
     ?? bundle.audioFiles[0];
   if (!audio) return c.json({ error: 'No audio' }, 404);
-  const stream = await resolveStreamUrl(c.env, bundle.folder, audio);
-  return c.redirect(stream.url, 302);
+  return streamAudio(c.env, bundle.folder, audio, c.req.raw);
 });
 
 // POST /api/items/:id/play — open a listening session. Returns the session

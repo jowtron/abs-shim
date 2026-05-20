@@ -108,6 +108,14 @@ export async function buildItemDetail(b: ItemBundle, opts?: { userMediaProgress?
         start: c.start_seconds,
         end: c.end_seconds,
       })),
+      // Aggregate counters + total duration/size. The bundled Nuxt UI reads
+      // media.duration here to render runtime under the title; missing means
+      // it shows "0:00".
+      duration: b.audioFiles.reduce((s, a) => s + a.duration_seconds, 0),
+      size: b.audioFiles.reduce((s, a) => s + a.size_bytes, 0),
+      numTracks: b.audioFiles.length,
+      numAudioFiles: b.audioFiles.length,
+      numChapters: b.chapters.length,
       ebookFile: null,
     },
     libraryFiles: b.audioFiles.map((a) => buildLibraryFile(a, b.folder, b.item)),
@@ -164,7 +172,16 @@ function splitNames(s: string | null): string[] {
 function synthPath(folder: LibraryFolderRow, item: LibraryItemRow): string {
   // We don't have a real filesystem; surface a plausible-looking value that
   // mirrors ABS's `<folder.fullPath>/<item.relPath>` convention.
-  return joinUrlOrPath(folder.filedn_base_url, item.rel_path);
+  //
+  // Only public_url folders carry a meaningful filedn_base_url. For pcloud /
+  // s3 / webdav folders the column is either empty or stale (e.g. left over
+  // from a previous public_url configuration that was re-pointed at OAuth)
+  // and embedding it here would surface bogus filedn URLs in book detail.
+  const provider = folder.provider ?? 'public_url';
+  if (provider === 'public_url' && folder.filedn_base_url) {
+    return joinUrlOrPath(folder.filedn_base_url, item.rel_path);
+  }
+  return item.rel_path;
 }
 
 function joinUrlOrPath(base: string, rel: string): string {
@@ -173,9 +190,16 @@ function joinUrlOrPath(base: string, rel: string): string {
 }
 
 function buildAudioFile(a: AudioFileRow, folder: LibraryFolderRow, item: LibraryItemRow) {
-  const filename = filenameFromUrl(a.filedn_url);
-  const ext = extOfFilename(filename);
-  const fullPath = joinUrlOrPath(synthPath(folder, item), filename);
+  // For OAuth-style providers a.filedn_url is empty; fall back to rel_path so
+  // the filename / extension actually populate.
+  const filename = filenameFromUrl(a.filedn_url || a.rel_path || '');
+  const ext = extOfFilename(filename) || '.m4b';
+  // For single-file books, synthPath() already returns the file itself —
+  // joining `filename` again would produce "Outland.m4b/Outland.m4b". Only
+  // dir-based items (is_file=0) need the filename appended.
+  const fullPath = item.is_file === 1
+    ? synthPath(folder, item)
+    : joinUrlOrPath(synthPath(folder, item), filename);
   return {
     index: a.index_no,
     ino: a.ino,
@@ -249,9 +273,14 @@ function buildTracks(b: ItemBundle) {
 }
 
 function buildLibraryFile(a: AudioFileRow, folder: LibraryFolderRow, item: LibraryItemRow) {
-  const filename = filenameFromUrl(a.filedn_url);
-  const ext = extOfFilename(filename);
-  const fullPath = joinUrlOrPath(synthPath(folder, item), filename);
+  const filename = filenameFromUrl(a.filedn_url || a.rel_path || '');
+  const ext = extOfFilename(filename) || '.m4b';
+  // For single-file books, synthPath() already returns the file itself —
+  // joining `filename` again would produce "Outland.m4b/Outland.m4b". Only
+  // dir-based items (is_file=0) need the filename appended.
+  const fullPath = item.is_file === 1
+    ? synthPath(folder, item)
+    : joinUrlOrPath(synthPath(folder, item), filename);
   return {
     ino: a.ino,
     metadata: {

@@ -169,6 +169,19 @@ async function probeBook(args: {
     ? (await adapter.resolveUrl(file.relPath)).url
     : '';
 
+  // Build chapter inserts. chpl chapters have start times only; derive each
+  // chapter's end from the next chapter's start (or the total duration for
+  // the last one). Empty array when the m4b has no chpl atom.
+  const totalDuration = probe.durationSeconds ?? 0;
+  const chapterInserts = probe.chapters.map((ch, i) => {
+    const next = probe.chapters[i + 1];
+    const end = next ? next.start : totalDuration;
+    return env.DB.prepare(
+      `INSERT INTO chapters (library_item_id, chapter_index, title, start_seconds, end_seconds)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).bind(itemId, i, ch.title, ch.start, end);
+  });
+
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO library_items
@@ -192,12 +205,14 @@ async function probeBook(args: {
        VALUES (?, ?, 1, ?, ?, ?, ?, 'audio/mp4', 'mp4', 'aac', NULL, NULL, NULL, ?, ?, ?)`,
     ).bind(
       audioId, itemId, stableUrl, audioIno,
-      probe.durationSeconds ?? 0,
+      totalDuration,
       file.sizeBytes ?? 0,
       now,
       file.relPath,
       file.providerId ?? null,
     ),
+
+    ...chapterInserts,
   ]);
 
   // Pre-warm the R2 cover cache. We already probed the m4b, so the cover
@@ -216,6 +231,75 @@ async function probeBook(args: {
   return 'added';
 }
 
+// Re-probe an existing book: run probeM4b against its audio file, replace
+// the chapters table for it, and refresh the R2 cover from the new probe.
+// Other metadata (title/author/etc) is deliberately NOT overwritten — those
+// rows can be edited (or will be once a metadata-edit UI exists) and we
+// don't want a re-probe to clobber human edits.
+export async function reprobeItem(env: Env, itemId: string): Promise<{
+  itemId: string;
+  chapters: number;
+  durationSeconds: number | null;
+  coverRefreshed: boolean;
+}> {
+  const item = await env.DB.prepare(
+    'SELECT * FROM library_items WHERE id = ?',
+  ).bind(itemId).first<{ id: string; folder_id: string; rel_path: string }>();
+  if (!item) throw new Error('Item not found');
+  const folder = await env.DB.prepare(
+    'SELECT * FROM library_folders WHERE id = ?',
+  ).bind(item.folder_id).first<FolderRow>();
+  if (!folder) throw new Error('Folder not found');
+  const audio = await env.DB.prepare(
+    'SELECT * FROM audio_files WHERE library_item_id = ? ORDER BY index_no ASC LIMIT 1',
+  ).bind(itemId).first<{ id: string; rel_path: string | null; provider_file_id: string | null; filedn_url: string; duration_seconds: number }>();
+  if (!audio) throw new Error('No audio file for item');
+
+  const adapter = await getAdapter(env, folder);
+  const probeUrl = audio.rel_path
+    ? await adapter.resolveProbeUrl(audio.rel_path, audio.provider_file_id)
+    : { url: audio.filedn_url };
+  const probe = await probeM4b(probeUrl.url);
+
+  const totalDuration = probe.durationSeconds ?? audio.duration_seconds ?? 0;
+  const stmts: D1PreparedStatement[] = [
+    env.DB.prepare('DELETE FROM chapters WHERE library_item_id = ?').bind(itemId),
+  ];
+  for (let i = 0; i < probe.chapters.length; i++) {
+    const ch = probe.chapters[i]!;
+    const next = probe.chapters[i + 1];
+    const end = next ? next.start : totalDuration;
+    stmts.push(env.DB.prepare(
+      `INSERT INTO chapters (library_item_id, chapter_index, title, start_seconds, end_seconds)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).bind(itemId, i, ch.title, ch.start, end));
+  }
+  // Update duration if probe found one different.
+  if (probe.durationSeconds && Math.abs(probe.durationSeconds - audio.duration_seconds) > 0.5) {
+    stmts.push(env.DB.prepare(
+      'UPDATE audio_files SET duration_seconds = ? WHERE id = ?',
+    ).bind(probe.durationSeconds, audio.id));
+  }
+  await env.DB.batch(stmts);
+
+  let coverRefreshed = false;
+  if (probe.cover) {
+    try {
+      await env.COVERS.put(`covers/${itemId}`, probe.cover.bytes, {
+        httpMetadata: { contentType: probe.cover.mimeType },
+      });
+      coverRefreshed = true;
+    } catch { /* non-fatal */ }
+  }
+
+  return {
+    itemId,
+    chapters: probe.chapters.length,
+    durationSeconds: probe.durationSeconds,
+    coverRefreshed,
+  };
+}
+
 function sortKey(title: string): string {
   // ABS-style: strip leading "The "/"A "/"An " for sorting.
   return title.replace(/^(The|A|An)\s+/i, '');
@@ -228,6 +312,7 @@ export async function addBookByPath(
   env: Env,
   libraryId: string,
   relPath: string,
+  hints?: { sizeBytes?: number },
 ): Promise<{ added: boolean; itemId?: string; reason?: string }> {
   const folderRow = await env.DB.prepare(
     `SELECT * FROM library_folders WHERE library_id = ? ORDER BY added_at ASC LIMIT 1`,
@@ -243,7 +328,12 @@ export async function addBookByPath(
   if (dup) return { added: false, itemId: dup.id, reason: 'Already in library' };
 
   const adapter = await getAdapter(env, folderRow);
-  const file = { relPath, isDir: false } as RemoteEntry;
+  // Caller can pass sizeBytes (e.g. from the pCloud upload_save response) so
+  // the audio_files row gets a real size on first insert. Without this, the
+  // scanner's listFolder path is the only thing that ever populates size and
+  // single-file uploads via /save end up with size=0.
+  const file: RemoteEntry = { relPath, isDir: false };
+  if (hints?.sizeBytes != null) file.sizeBytes = hints.sizeBytes;
   await probeBook({ env, adapter, folder: folderRow, file, itemRel });
   // probeBook generates an id internally; re-query to surface it.
   const fresh = await env.DB.prepare(

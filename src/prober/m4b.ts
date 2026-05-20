@@ -217,11 +217,222 @@ function findPath(payload: Uint8Array, ...path: string[]): Uint8Array | null {
 
 // ─── Extracted shape ──────────────────────────────────────────────────────────
 
+// Parse a Nero-style chpl atom (moov/udta/chpl). Layout:
+//   1 byte  version
+//   3 bytes flags
+//   4 bytes reserved   (only present when version > 0)
+//   1 byte  count
+//   per chapter:
+//     8 bytes start time in 100-nanosecond units (BE u64)
+//     1 byte  name length
+//     N bytes UTF-8 name
+// QuickTime chapter tracks (referenced via tref `chap`) aren't parsed here —
+// implementing that requires reading a whole sub-track's stbl, which doubles
+// the prober's complexity. Most audiobook tooling writes chpl too, so we
+// cover the common case.
+function parseChpl(udta: Uint8Array): Array<{ start: number; title: string }> {
+  const chpl = findChild(udta, 'chpl');
+  if (!chpl || chpl.length < 9) return [];
+  const v = new DataView(chpl.buffer, chpl.byteOffset, chpl.byteLength);
+  let off = 0;
+  const version = v.getUint8(off); off += 4; // version + 3 flag bytes
+  if (version > 0) off += 4;                 // reserved
+  if (off >= chpl.length) return [];
+  const count = v.getUint8(off); off += 1;
+  const out: Array<{ start: number; title: string }> = [];
+  const dec = new TextDecoder('utf-8');
+  for (let i = 0; i < count; i++) {
+    if (off + 9 > chpl.length) break;
+    const hi = v.getUint32(off); off += 4;
+    const lo = v.getUint32(off); off += 4;
+    const start = (hi * 0x1_0000_0000 + lo) / 10_000_000; // 100ns → seconds
+    const nameLen = v.getUint8(off); off += 1;
+    if (off + nameLen > chpl.length) break;
+    const title = dec.decode(chpl.slice(off, off + nameLen));
+    off += nameLen;
+    out.push({ start, title });
+  }
+  return out;
+}
+
+// Parse a QuickTime chapter track. Layout:
+//   moov/trak (audio) — has tref/chap pointing at chapter-trak track_ids
+//   moov/trak (chapter) — has its own mdia/minf/stbl with text samples; each
+//     sample is `[u16-be length][utf8 text]` (sometimes followed by `encd`).
+// The sample bytes live in mdat — typically interleaved with audio chunks, so
+// chapter samples can be spread across hundreds of MB. We compute each
+// sample's offset+size from stbl, then batch nearby samples into a small
+// number of Range requests rather than issuing one fetch per chapter.
+async function parseQtChapters(moov: Uint8Array, url: string): Promise<Array<{ start: number; title: string }>> {
+  type Trak = { trackId: number; handlerType: string; body: Uint8Array };
+  const traks: Trak[] = [];
+  for (const c of walkChildren(moov)) {
+    if (c.type !== 'trak') continue;
+    const body = moov.slice(c.start + c.headerSize, c.start + c.size);
+    const tkhd = findChild(body, 'tkhd');
+    if (!tkhd || tkhd.length < 24) continue;
+    const tv = new DataView(tkhd.buffer, tkhd.byteOffset, tkhd.byteLength);
+    const tkhdVersion = tv.getUint8(0);
+    const trackId = tkhdVersion === 1 ? tv.getUint32(20) : tv.getUint32(12);
+    const hdlr = findPath(body, 'mdia', 'hdlr');
+    let handlerType = '';
+    if (hdlr && hdlr.length >= 12) {
+      handlerType = fourCC(new DataView(hdlr.buffer, hdlr.byteOffset, hdlr.byteLength), 8);
+    }
+    traks.push({ trackId, handlerType, body });
+  }
+
+  const audio = traks.find((t) => t.handlerType === 'soun');
+  if (!audio) return [];
+  const chap = findPath(audio.body, 'tref', 'chap');
+  if (!chap || chap.length < 4) return [];
+  const cv = new DataView(chap.buffer, chap.byteOffset, chap.byteLength);
+  const chapterTrackIds: number[] = [];
+  for (let i = 0; i + 4 <= chap.length; i += 4) chapterTrackIds.push(cv.getUint32(i));
+  const chapter = traks.find((t) => chapterTrackIds.includes(t.trackId));
+  if (!chapter) return [];
+
+  const mdhd = findPath(chapter.body, 'mdia', 'mdhd');
+  if (!mdhd || mdhd.length < 24) return [];
+  const mv = new DataView(mdhd.buffer, mdhd.byteOffset, mdhd.byteLength);
+  const mdhdVersion = mv.getUint8(0);
+  const timescale = mdhdVersion === 1 ? mv.getUint32(20) : mv.getUint32(12);
+  if (!timescale) return [];
+
+  const stbl = findPath(chapter.body, 'mdia', 'minf', 'stbl');
+  if (!stbl) return [];
+
+  // stts → per-sample durations
+  const stts = findChild(stbl, 'stts');
+  if (!stts) return [];
+  const sv = new DataView(stts.buffer, stts.byteOffset, stts.byteLength);
+  const sttsEntries = sv.getUint32(4);
+  const sampleDurations: number[] = [];
+  for (let i = 0; i < sttsEntries; i++) {
+    const cnt = sv.getUint32(8 + i * 8);
+    const delta = sv.getUint32(12 + i * 8);
+    for (let j = 0; j < cnt; j++) sampleDurations.push(delta);
+  }
+
+  // Chunk offsets (stco u32 or co64 u64)
+  const stco = findChild(stbl, 'stco');
+  const co64 = findChild(stbl, 'co64');
+  const chunkOffsets: number[] = [];
+  if (stco) {
+    const v = new DataView(stco.buffer, stco.byteOffset, stco.byteLength);
+    const cnt = v.getUint32(4);
+    for (let i = 0; i < cnt; i++) chunkOffsets.push(v.getUint32(8 + i * 4));
+  } else if (co64) {
+    const v = new DataView(co64.buffer, co64.byteOffset, co64.byteLength);
+    const cnt = v.getUint32(4);
+    for (let i = 0; i < cnt; i++) {
+      const hi = v.getUint32(8 + i * 8);
+      const lo = v.getUint32(12 + i * 8);
+      chunkOffsets.push(hi * 0x1_0000_0000 + lo);
+    }
+  } else return [];
+
+  // stsc → sample-to-chunk mapping
+  const stsc = findChild(stbl, 'stsc');
+  if (!stsc) return [];
+  const cv2 = new DataView(stsc.buffer, stsc.byteOffset, stsc.byteLength);
+  const stscEntries: Array<{ firstChunk: number; samplesPerChunk: number }> = [];
+  const stscCount = cv2.getUint32(4);
+  for (let i = 0; i < stscCount; i++) {
+    stscEntries.push({
+      firstChunk: cv2.getUint32(8 + i * 12),
+      samplesPerChunk: cv2.getUint32(12 + i * 12),
+    });
+  }
+
+  // stsz → per-sample size (or default size if first field non-zero)
+  const stsz = findChild(stbl, 'stsz');
+  if (!stsz) return [];
+  const zv = new DataView(stsz.buffer, stsz.byteOffset, stsz.byteLength);
+  const defaultSize = zv.getUint32(4);
+  const sampleCount = zv.getUint32(8);
+  const sampleSizes: number[] = [];
+  if (defaultSize === 0) {
+    for (let i = 0; i < sampleCount; i++) sampleSizes.push(zv.getUint32(12 + i * 4));
+  } else {
+    for (let i = 0; i < sampleCount; i++) sampleSizes.push(defaultSize);
+  }
+
+  // Compute each sample's absolute file offset using stsc + chunk offsets.
+  // stsc entries are 1-based; entry k applies to chunk N when k.firstChunk <= N+1.
+  const sampleOffsets = new Array<number>(sampleCount).fill(0);
+  let sIdx = 0;
+  let entryIdx = 0;
+  for (let chunkIdx = 0; chunkIdx < chunkOffsets.length && sIdx < sampleCount; chunkIdx++) {
+    while (entryIdx + 1 < stscEntries.length && stscEntries[entryIdx + 1]!.firstChunk <= chunkIdx + 1) entryIdx++;
+    const samplesInChunk = stscEntries[entryIdx]!.samplesPerChunk;
+    let off = chunkOffsets[chunkIdx]!;
+    for (let s = 0; s < samplesInChunk && sIdx < sampleCount; s++) {
+      sampleOffsets[sIdx] = off;
+      off += sampleSizes[sIdx]!;
+      sIdx++;
+    }
+  }
+
+  // Group samples whose byte ranges are within 64 KB into one batched fetch.
+  // Chapter samples are tiny (~50–200 bytes) so this collapses 87 sequential
+  // fetches into 5–10 even on heavily interleaved files.
+  type Group = { start: number; end: number; samples: number[] };
+  const order = sampleOffsets.map((_, i) => i).sort((a, b) => sampleOffsets[a]! - sampleOffsets[b]!);
+  const groups: Group[] = [];
+  const GAP = 64 * 1024;
+  for (const i of order) {
+    const oStart = sampleOffsets[i]!;
+    const oEnd = oStart + sampleSizes[i]!;
+    const last = groups[groups.length - 1];
+    if (last && oStart - last.end <= GAP) {
+      last.end = Math.max(last.end, oEnd);
+      last.samples.push(i);
+    } else {
+      groups.push({ start: oStart, end: oEnd, samples: [i] });
+    }
+  }
+  if (!groups.length) return [];
+  // Soft cap on total transfer (chapter samples shouldn't exceed a few MB).
+  const totalBytes = groups.reduce((s, g) => s + (g.end - g.start), 0);
+  if (totalBytes > 4 * 1024 * 1024) return [];
+
+  // Fetch each group concurrently.
+  const sampleBytes = new Array<Uint8Array | null>(sampleCount).fill(null);
+  await Promise.all(groups.map(async (g) => {
+    const { bytes } = await rangeFetch(url, g.start, g.end - 1);
+    for (const i of g.samples) {
+      const local = sampleOffsets[i]! - g.start;
+      sampleBytes[i] = bytes.slice(local, local + sampleSizes[i]!);
+    }
+  }));
+
+  const dec = new TextDecoder('utf-8');
+  const out: Array<{ start: number; title: string }> = [];
+  let cum = 0;
+  for (let i = 0; i < sampleCount; i++) {
+    const start = cum / timescale;
+    cum += sampleDurations[i] ?? 0;
+    const buf = sampleBytes[i];
+    if (!buf || buf.length < 2) continue;
+    const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const textLen = view.getUint16(0);
+    if (textLen === 0 || textLen + 2 > buf.length) continue;
+    const title = dec.decode(buf.slice(2, 2 + textLen));
+    out.push({ start, title });
+  }
+  return out;
+}
+
 export type ProbeResult = {
   durationSeconds: number | null;
   timeScale: number | null;
   tags: Record<string, string>;
   cover: { bytes: Uint8Array; mimeType: string } | null;
+  // Chapter list parsed from the Nero `chpl` atom under moov/udta. Empty when
+  // the file has no chpl (some m4b's use only a QT chapter track instead —
+  // that's a future addition).
+  chapters: Array<{ start: number; title: string }>;
 };
 
 export async function probeM4b(url: string): Promise<ProbeResult> {
@@ -286,5 +497,17 @@ export async function probeM4b(url: string): Promise<ProbeResult> {
     // here; we can revisit if a client needs them.
   }
 
-  return { durationSeconds, timeScale, tags, cover };
+  // Prefer chpl (single-atom, no extra fetches). Fall back to a QT chapter
+  // track when the file ships only that — common for Audible/AAX-converted
+  // m4bs that came in via certain rippers.
+  let chapters = udta ? parseChpl(udta) : [];
+  if (!chapters.length) {
+    try {
+      chapters = await parseQtChapters(moov, url);
+    } catch {
+      // Non-fatal: just leave chapters empty.
+    }
+  }
+
+  return { durationSeconds, timeScale, tags, cover, chapters };
 }

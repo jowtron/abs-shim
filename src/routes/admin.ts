@@ -4,11 +4,13 @@ import { requireAuth, type AuthVars } from '../auth/middleware';
 import {
   exchangePcloudCode, pcloudAuthorizeUrl, pcloudUserinfo,
   apiHostFromLocationId, type PcloudProfile,
+  pcloudUploadCreate, pcloudUploadWrite, pcloudUploadSave,
 } from '../storage/pcloud';
-import { runScan, addBookByPath, type ScanReport } from '../scanner/scan';
+import { runScan, addBookByPath, reprobeItem, type ScanReport } from '../scanner/scan';
 import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem } from '../db/library';
 import { probeM4b } from '../prober/m4b';
 import { resolveProbeUrl } from '../storage/resolve';
+import type { OAuthProfileRow } from '../storage/factory';
 
 // All admin routes are gated by requireAuth + requireRoot. Mount at /api/admin
 // from index.ts. The admin UI itself lives at /admin and is served via the
@@ -41,6 +43,44 @@ adminRoutes.get('/storage/status', async (c) => {
        ORDER BY created_at ASC`,
   ).all<ProfileSummary>();
 
+  // Per-library stats. Two queries because counting books requires DISTINCT
+  // over library_items, whereas duration/size sums across audio_files (a book
+  // can have multiple files in principle, even though our scanner only emits
+  // one today).
+  const counts = await c.env.DB.prepare(
+    `SELECT library_id,
+            SUM(CASE WHEN is_missing = 0 THEN 1 ELSE 0 END) AS book_count,
+            SUM(CASE WHEN is_missing = 1 THEN 1 ELSE 0 END) AS missing_count
+       FROM library_items
+       GROUP BY library_id`,
+  ).all<{ library_id: string; book_count: number; missing_count: number }>();
+
+  const sums = await c.env.DB.prepare(
+    `SELECT li.library_id AS library_id,
+            COALESCE(SUM(af.duration_seconds), 0) AS total_duration_seconds,
+            COALESCE(SUM(af.size_bytes), 0) AS total_size_bytes
+       FROM library_items li
+       JOIN audio_files af ON af.library_item_id = li.id
+      WHERE li.is_missing = 0
+      GROUP BY li.library_id`,
+  ).all<{ library_id: string; total_duration_seconds: number; total_size_bytes: number }>();
+
+  const stats: Record<string, { bookCount: number; missingCount: number; totalDurationSeconds: number; totalSizeBytes: number }> = {};
+  for (const r of counts.results) {
+    stats[r.library_id] = {
+      bookCount: r.book_count ?? 0,
+      missingCount: r.missing_count ?? 0,
+      totalDurationSeconds: 0,
+      totalSizeBytes: 0,
+    };
+  }
+  for (const r of sums.results) {
+    const s = stats[r.library_id] ?? { bookCount: 0, missingCount: 0, totalDurationSeconds: 0, totalSizeBytes: 0 };
+    s.totalDurationSeconds = r.total_duration_seconds ?? 0;
+    s.totalSizeBytes = r.total_size_bytes ?? 0;
+    stats[r.library_id] = s;
+  }
+
   return c.json({
     folders: folders.results.map((f) => ({
       id: f.id,
@@ -52,6 +92,7 @@ adminRoutes.get('/storage/status', async (c) => {
       legacyBaseUrl: f.filedn_base_url,
     })),
     profiles: profiles.results,
+    stats,
     // Tell the UI which provider integrations are set up server-side. The UI
     // shows setup instructions when a provider's secrets are missing instead
     // of a "Connect" button that would 500.
@@ -306,6 +347,257 @@ adminRoutes.post('/books/add-by-path', async (c) => {
   } catch (e) {
     return c.json({ error: 'Add failed', detail: (e as Error).message }, 502);
   }
+});
+
+// ─── pCloud upload (chunked) ────────────────────────────────────────────────
+//
+// Three-step browser → Worker → pCloud upload flow. Workers cap inbound bodies
+// at 100 MB (Free) / 500 MB (Paid), so the browser splits files into smaller
+// chunks (~8 MB) and we forward each one to pCloud's upload_write. The actual
+// pCloud upload session has no size limit, so any file fits.
+//
+// Why we don't use pCloud's createuploadlink (which would let the browser POST
+// directly to pCloud and bypass the Worker entirely): it needs write-scope
+// OAuth that pCloud only hands out after manual review, and CORS on those
+// upload hosts is not browser-friendly. The proxy adds one extra hop but is
+// simple, observable, and works today.
+
+// Load a pCloud-OAuth folder + its profile. Returns the same Response shape
+// as a Hono handler when the lookup fails so callers can `return` directly.
+async function loadPcloudFolder(env: Env, folderId: string): Promise<
+  { ok: true; folder: NonNullable<Awaited<ReturnType<typeof getFolderById>>>; profile: PcloudProfile; rootPath: string }
+  | { ok: false; status: number; error: string }
+> {
+  const folder = await getFolderById(env, folderId);
+  if (!folder) return { ok: false, status: 404, error: 'Folder not found' };
+  if (folder.provider !== 'pcloud_oauth') {
+    return { ok: false, status: 400, error: 'Upload is only supported on pcloud_oauth folders' };
+  }
+  if (!folder.profile_id) return { ok: false, status: 400, error: 'Folder has no profile_id' };
+  const profileRow = await env.DB.prepare(
+    'SELECT * FROM oauth_profiles WHERE id = ?',
+  ).bind(folder.profile_id).first<OAuthProfileRow>();
+  if (!profileRow) return { ok: false, status: 404, error: 'pCloud profile missing' };
+  const apiHost = profileRow.api_host ?? 'api.pcloud.com';
+  const profile: PcloudProfile = { accessToken: profileRow.access_token, apiHost };
+  let rootPath = '/';
+  try {
+    const cfg = JSON.parse(folder.config_json ?? '{}') as { rootPath?: string };
+    rootPath = cfg.rootPath ?? '/';
+  } catch { /* default */ }
+  return { ok: true, folder, profile, rootPath };
+}
+
+// Build an absolute pCloud path from a folder's rootPath + a user-supplied
+// relPath. Defends against path-traversal (../) so a compromised browser
+// can't write outside the configured audiobook root.
+function joinPcloudPath(rootPath: string, relPath: string): string {
+  const cleanRoot = rootPath.replace(/\/+$/, '') || '/';
+  const cleanRel = relPath.replace(/^\/+/, '').replace(/\\/g, '/');
+  if (cleanRel.split('/').some((seg) => seg === '..' || seg === '')) {
+    throw new Error(`Invalid relPath: ${relPath}`);
+  }
+  return cleanRoot === '/' ? `/${cleanRel}` : `${cleanRoot}/${cleanRel}`;
+}
+
+// Step 1: create a pCloud upload session.
+// Body: { relPath: string }  (relPath is informational here; the actual save
+// path is chosen in /save so retries / renames are possible)
+// Returns: { uploadId, chunkSize }
+//
+// Chunk size = 25 MB. Larger amortises per-request handshake overhead; the
+// Worker streams the body through (see /chunk below) so we don't hold this
+// in memory.
+adminRoutes.post('/storage/folder/:folderId/upload/init', async (c) => {
+  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'));
+  if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
+  const uploadId = await pcloudUploadCreate(loaded.profile);
+  return c.json({ uploadId, chunkSize: 25 * 1024 * 1024 });
+});
+
+// Step 2: write one chunk.
+// Query: ?uploadId=N&offset=N
+// Body: raw bytes for this chunk
+// Returns: 204
+//
+// The body is streamed through the Worker — `c.req.raw.body` is forwarded
+// directly to pCloud's upload_write as a ReadableStream with the inbound
+// Content-Length passed along. This means browser→Worker and Worker→pCloud
+// transfers overlap in time instead of running sequentially, ~halving wall
+// clock for each chunk on slow uplinks, and Worker memory stays low so we
+// can use large chunks without trouble.
+adminRoutes.post('/storage/folder/:folderId/upload/chunk', async (c) => {
+  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'));
+  if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
+  const uploadId = Number(c.req.query('uploadId') ?? '');
+  const offset = Number(c.req.query('offset') ?? '');
+  const contentLength = Number(c.req.header('content-length') ?? '0');
+  if (!Number.isFinite(uploadId) || !Number.isFinite(offset) || offset < 0) {
+    return c.json({ error: 'uploadId and offset required' }, 400);
+  }
+  if (!contentLength) return c.json({ error: 'Content-Length header required' }, 411);
+  const body = c.req.raw.body;
+  if (!body) return c.json({ error: 'Empty body' }, 400);
+  await pcloudUploadWrite(loaded.profile, {
+    uploadId, offset, body, contentLength,
+  });
+  return c.body(null, 204);
+});
+
+// Step 3: finalize. Saves the assembled bytes to <rootPath>/<relPath> in
+// pCloud. If the saved file looks like an audiobook (.m4b/.m4a/.aac),
+// automatically registers it via addBookByPath so it shows up in the library
+// without a separate scan step.
+//
+// Body: { uploadId: number, relPath: string, registerAsBook?: boolean }
+adminRoutes.post('/storage/folder/:folderId/upload/save', async (c) => {
+  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'));
+  if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  const uploadId = Number(body['uploadId'] ?? '');
+  const relPath = String(body['relPath'] ?? '').trim();
+  const registerAsBook = body['registerAsBook'] !== false;
+  if (!Number.isFinite(uploadId) || !relPath) {
+    return c.json({ error: 'uploadId and relPath required' }, 400);
+  }
+  let absPath: string;
+  try {
+    absPath = joinPcloudPath(loaded.rootPath, relPath);
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+  const saved = await pcloudUploadSave(loaded.profile, { uploadId, path: absPath });
+
+  // Auto-register as a library item when this is the primary audio file.
+  // Failures here are non-fatal (the file is uploaded; manual add-by-path
+  // recovers) but we DO surface them so the UI can show what went wrong
+  // instead of silently dropping the book.
+  let itemId: string | undefined;
+  let registerError: string | undefined;
+  if (registerAsBook && /\.(m4b|m4a|aac)$/i.test(relPath)) {
+    try {
+      // Pass through size from pCloud's upload_save response so audio_files
+      // gets a real size_bytes on first insert (without this, single-file
+      // uploads end up with size=0 in the library).
+      const hints: { sizeBytes?: number } = {};
+      if (saved.metadata?.size != null) hints.sizeBytes = saved.metadata.size;
+      const result = await addBookByPath(c.env, loaded.folder.library_id, relPath, hints);
+      if (result.itemId) itemId = result.itemId;
+      if (!result.added && result.reason) registerError = result.reason;
+    } catch (e) {
+      registerError = (e as Error).message;
+    }
+  }
+
+  const out: { savedPath: string; size?: number; itemId?: string; registerError?: string } = {
+    savedPath: saved.metadata?.path ?? absPath,
+  };
+  if (saved.metadata?.size != null) out.size = saved.metadata.size;
+  if (itemId) out.itemId = itemId;
+  if (registerError) out.registerError = registerError;
+  return c.json(out);
+});
+
+// ─── Library item management ────────────────────────────────────────────────
+
+// Compact book list for the admin UI. Returns just enough to render rows
+// (title, author, duration, chapter count, size). The main /api/libraries
+// endpoint returns the full ABS shape per item which is overkill here.
+adminRoutes.get('/libraries/:libId/items', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT li.id,
+            li.rel_path,
+            li.is_missing,
+            bm.title,
+            bm.author_name,
+            bm.series_name,
+            (SELECT COUNT(*) FROM chapters ch WHERE ch.library_item_id = li.id) AS chapter_count,
+            (SELECT COALESCE(SUM(af.duration_seconds), 0) FROM audio_files af WHERE af.library_item_id = li.id) AS duration_seconds,
+            (SELECT COALESCE(SUM(af.size_bytes), 0) FROM audio_files af WHERE af.library_item_id = li.id) AS size_bytes
+       FROM library_items li
+       LEFT JOIN book_metadata bm ON bm.library_item_id = li.id
+      WHERE li.library_id = ?
+      ORDER BY bm.title COLLATE NOCASE ASC`,
+  ).bind(c.req.param('libId')).all<{
+    id: string;
+    rel_path: string;
+    is_missing: number;
+    title: string | null;
+    author_name: string | null;
+    series_name: string | null;
+    chapter_count: number;
+    duration_seconds: number;
+    size_bytes: number;
+  }>();
+  return c.json({ items: rows.results });
+});
+
+// Re-probe a single item. Useful when chapters or duration came in wrong.
+adminRoutes.post('/items/:itemId/reprobe', async (c) => {
+  try {
+    const result = await reprobeItem(c.env, c.req.param('itemId'));
+    return c.json(result);
+  } catch (e) {
+    return c.json({ error: 'Re-probe failed', detail: (e as Error).message }, 502);
+  }
+});
+
+// Re-probe every item in a library, or only those with zero chapters when
+// onlyMissingChapters=1. Long libraries may exceed Worker wall-clock if
+// audiobooks are huge — we run sequentially to keep memory bounded and
+// surface per-item failures in the response.
+adminRoutes.post('/libraries/:libId/reprobe', async (c) => {
+  const libId = c.req.param('libId');
+  const onlyMissing = c.req.query('onlyMissingChapters') === '1';
+  const filter = onlyMissing
+    ? `AND NOT EXISTS (SELECT 1 FROM chapters ch WHERE ch.library_item_id = li.id)`
+    : '';
+  const rows = await c.env.DB.prepare(
+    `SELECT li.id FROM library_items li
+      WHERE li.library_id = ? AND li.is_missing = 0 ${filter}`,
+  ).bind(libId).all<{ id: string }>();
+  const ids = rows.results.map((r) => r.id);
+
+  let succeeded = 0;
+  let failed = 0;
+  const errors: Array<{ id: string; reason: string }> = [];
+  const chaptersFound: Array<{ id: string; chapters: number }> = [];
+  for (const id of ids) {
+    try {
+      const r = await reprobeItem(c.env, id);
+      succeeded++;
+      chaptersFound.push({ id, chapters: r.chapters });
+    } catch (e) {
+      failed++;
+      errors.push({ id, reason: (e as Error).message });
+    }
+  }
+  return c.json({ total: ids.length, succeeded, failed, chaptersFound, errors });
+});
+
+// Delete an item from D1. The underlying file on storage is left alone —
+// removing it from pCloud / S3 / etc. is a separate operation and we'd
+// rather not surprise a user with destructive cloud-side deletes here.
+// Cascading: library_items + book_metadata + audio_files + chapters +
+// listening_sessions + media_progress + bookmarks all get removed. R2 cover
+// is best-effort.
+adminRoutes.delete('/items/:itemId', async (c) => {
+  const itemId = c.req.param('itemId');
+  const item = await c.env.DB.prepare(
+    'SELECT id FROM library_items WHERE id = ?',
+  ).bind(itemId).first<{ id: string }>();
+  if (!item) return c.json({ error: 'Item not found' }, 404);
+  await c.env.DB.batch([
+    c.env.DB.prepare('DELETE FROM chapters WHERE library_item_id = ?').bind(itemId),
+    c.env.DB.prepare('DELETE FROM audio_files WHERE library_item_id = ?').bind(itemId),
+    c.env.DB.prepare('DELETE FROM book_metadata WHERE library_item_id = ?').bind(itemId),
+    c.env.DB.prepare('DELETE FROM media_progress WHERE library_item_id = ?').bind(itemId),
+    c.env.DB.prepare('DELETE FROM bookmarks WHERE library_item_id = ?').bind(itemId),
+    c.env.DB.prepare('DELETE FROM listening_sessions WHERE library_item_id = ?').bind(itemId),
+    c.env.DB.prepare('DELETE FROM library_items WHERE id = ?').bind(itemId),
+  ]);
+  try { await c.env.COVERS.delete(`covers/${itemId}`); } catch { /* non-fatal */ }
+  return c.body(null, 204);
 });
 
 // Warm the R2 cover cache for every item that doesn't already have one stored.

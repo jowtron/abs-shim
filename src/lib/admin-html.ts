@@ -48,6 +48,26 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     .warn { color: var(--warn); }
     pre { background: var(--bg); padding: 0.5rem; border-radius: 4px; overflow-x: auto; font-size: 0.85rem; border: 1px solid var(--border); }
     code { background: rgba(125,125,125,0.15); padding: 0.1em 0.3em; border-radius: 3px; }
+    .upload-area { margin-top: 0.5rem; padding: 0.6rem; background: var(--bg); border: 1px dashed var(--border); border-radius: 6px; display: none; }
+    .upload-area.open { display: block; }
+    .upload-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.5rem; }
+    .upload-row input[type=text] { flex: 1; min-width: 160px; }
+    .upload-item { padding: 0.4rem 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 4px; margin: 0.25rem 0; font-size: 0.85rem; }
+    .upload-item .name { font-weight: 500; word-break: break-all; }
+    .upload-item .progress-bar { display: block; height: 4px; background: var(--border); border-radius: 2px; margin-top: 0.3rem; overflow: hidden; }
+    .upload-item .progress-bar > span { display: block; height: 100%; background: var(--accent); width: 0%; transition: width 0.15s; }
+    .upload-item.ok { border-color: var(--ok); }
+    .upload-item.ok .progress-bar > span { background: var(--ok); }
+    .upload-item.err { border-color: var(--warn); }
+    .upload-item .status { color: var(--muted); margin-left: 0.5rem; }
+    .upload-item.ok .status { color: var(--ok); }
+    .upload-item.err .status { color: var(--warn); }
+    .books-list { margin-top: 0.5rem; padding: 0.5rem; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; }
+    .book-row { display: flex; gap: 0.5rem; align-items: center; padding: 0.35rem 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 4px; margin: 0.25rem 0; font-size: 0.85rem; flex-wrap: wrap; }
+    .book-row .title { font-weight: 500; flex: 1; min-width: 200px; word-break: break-word; }
+    .book-row .meta { color: var(--muted); font-size: 0.8rem; }
+    .book-row .no-chapters { color: var(--warn); }
+    .book-row button { font-size: 0.75rem; padding: 0.2rem 0.55rem; flex-shrink: 0; }
   </style>
 </head>
 <body>
@@ -331,12 +351,25 @@ function renderLibraries(status, libraries) {
     (foldersByLib[f.libraryId] = foldersByLib[f.libraryId] || []).push(f);
   }
 
+  const stats = status.stats || {};
   let html = '';
   for (const lib of libraries) {
     const folders = foldersByLib[lib.id] || [];
+    const s = stats[lib.id] || { bookCount: 0, missingCount: 0, totalDurationSeconds: 0, totalSizeBytes: 0 };
     html += '<div style="margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border);">';
     html += '<strong>' + escapeHtml(lib.name) + '</strong> ';
     html += '<span class="muted">· ' + escapeHtml(lib.id) + '</span><br>';
+    html += '<span class="muted" style="font-size:0.85rem;">' + s.bookCount + ' book' + (s.bookCount === 1 ? '' : 's');
+    if (s.totalDurationSeconds > 0) {
+      html += ' · ' + formatDuration(s.totalDurationSeconds);
+    }
+    if (s.totalSizeBytes > 0) {
+      html += ' · ' + formatBytes(s.totalSizeBytes);
+    }
+    if (s.missingCount > 0) {
+      html += ' · <span class="warn">' + s.missingCount + ' missing</span>';
+    }
+    html += '</span><br>';
 
     if (!folders.length) {
       html += '<p class="muted" style="margin: 0.5rem 0;">No storage backends connected yet.</p>';
@@ -355,16 +388,48 @@ function renderLibraries(status, libraries) {
       html += '</div>';
     }
 
+    const pcloudFolder = folders.find((f) => f.provider === 'pcloud_oauth');
+
+    // Primary actions row.
     html += '<div class="row" style="flex-wrap: wrap; gap: 0.5rem;">';
     html += '<button data-scan="' + escapeHtml(lib.id) + '">Scan now</button>';
     html += '<button class="secondary" data-add-path="' + escapeHtml(lib.id) + '">Add book by path</button>';
-    html += '<span class="muted" style="width:100%; margin-top:0.5rem">Add another storage backend:</span>';
+    if (pcloudFolder) {
+      html += '<button class="secondary" data-upload-toggle="' + escapeHtml(lib.id) + '">Upload audiobook…</button>';
+    }
+    html += '<button class="secondary" data-show-books="' + escapeHtml(lib.id) + '">Show books (' + s.bookCount + ')</button>';
+    html += '<button class="secondary" data-reprobe-missing="' + escapeHtml(lib.id) + '">Re-probe books missing chapters</button>';
+    html += '<button class="secondary" data-reprobe-all="' + escapeHtml(lib.id) + '">Re-probe all</button>';
+    html += '</div>';
+
+    // Hidden book list — populated lazily on first "Show books" click.
+    html += '<div id="books-list-' + escapeHtml(lib.id) + '" class="books-list" style="display:none">Loading…</div>';
+
+    // Inline upload widget — placed directly under the row that contains the
+    // toggle button so it visually belongs to "Upload audiobook…", not to the
+    // attach-backend row below.
+    if (pcloudFolder) {
+      html += '<div class="upload-area" id="upload-area-' + escapeHtml(lib.id) + '" data-folder="' + escapeHtml(pcloudFolder.id) + '">';
+      html += '<div class="upload-row">';
+      html += '<input type="file" multiple accept=".m4b,.m4a,.aac,.zip,.rar" data-upload-files="' + escapeHtml(lib.id) + '" />';
+      html += '<input type="text" placeholder="Optional subfolder, e.g. The Hobbit/" data-upload-subfolder="' + escapeHtml(lib.id) + '" />';
+      html += '<button data-upload-go="' + escapeHtml(lib.id) + '">Upload</button>';
+      html += '</div>';
+      html += '<div class="upload-list" id="upload-list-' + escapeHtml(lib.id) + '"></div>';
+      html += '</div>';
+    }
+
+    // Secondary actions: attach another backend.
+    html += '<div class="row" style="flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem;">';
+    html += '<span class="muted" style="width:100%">Add another storage backend:</span>';
     html += '<button class="secondary" data-attach-s3="' + escapeHtml(lib.id) + '">S3-compat (R2 / B2 / S3 / Wasabi)</button>';
     html += '<button class="secondary" data-attach-webdav="' + escapeHtml(lib.id) + '">WebDAV (NAS)</button>';
     if (status.profiles.some((p) => p.provider === 'pcloud')) {
       html += '<button class="secondary" data-attach-pcloud="' + escapeHtml(lib.id) + '">pCloud (OAuth)</button>';
     }
-    html += '</div></div>';
+    html += '</div>';
+
+    html += '</div>';
   }
   body.innerHTML = html;
 
@@ -469,6 +534,112 @@ function renderLibraries(status, libraries) {
     });
   });
 
+  body.querySelectorAll('[data-show-books]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const libId = btn.dataset.showBooks;
+      const list = document.getElementById('books-list-' + libId);
+      if (!list) return;
+      // Toggle: hide if already shown.
+      if (list.style.display !== 'none' && list.dataset.loaded === '1') {
+        list.style.display = 'none';
+        return;
+      }
+      list.style.display = 'block';
+      list.textContent = 'Loading…';
+      try {
+        const data = await api('/api/admin/libraries/' + libId + '/items');
+        renderBooksList(list, data.items || []);
+        list.dataset.loaded = '1';
+      } catch (e) {
+        list.textContent = 'Failed to load books: ' + e.message;
+      }
+    });
+  });
+
+  body.querySelectorAll('[data-reprobe-missing]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const libId = btn.dataset.reprobeMissing;
+      btn.disabled = true; btn.textContent = 'Re-probing…';
+      try {
+        const r = await api('/api/admin/libraries/' + libId + '/reprobe?onlyMissingChapters=1', { method: 'POST' });
+        document.getElementById('scan-card').style.display = 'block';
+        document.getElementById('scan-output').textContent = JSON.stringify(r, null, 2);
+        // If the books list is open, refresh it to show new chapter counts.
+        const list = document.getElementById('books-list-' + libId);
+        if (list && list.dataset.loaded === '1') {
+          const data = await api('/api/admin/libraries/' + libId + '/items');
+          renderBooksList(list, data.items || []);
+        }
+      } catch (e) {
+        showError('Re-probe failed: ' + e.message);
+      } finally {
+        btn.disabled = false; btn.textContent = 'Re-probe books missing chapters';
+      }
+    });
+  });
+
+  body.querySelectorAll('[data-reprobe-all]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const libId = btn.dataset.reprobeAll;
+      if (!confirm('Re-probe every book in this library? This re-reads each m4b\'s moov atom — for a 100-book library that\'s ~500 MB of pCloud bandwidth and several minutes of wall time.')) return;
+      btn.disabled = true; btn.textContent = 'Re-probing…';
+      try {
+        const r = await api('/api/admin/libraries/' + libId + '/reprobe', { method: 'POST' });
+        document.getElementById('scan-card').style.display = 'block';
+        document.getElementById('scan-output').textContent = JSON.stringify(r, null, 2);
+        const list = document.getElementById('books-list-' + libId);
+        if (list && list.dataset.loaded === '1') {
+          const data = await api('/api/admin/libraries/' + libId + '/items');
+          renderBooksList(list, data.items || []);
+        }
+      } catch (e) {
+        showError('Re-probe failed: ' + e.message);
+      } finally {
+        btn.disabled = false; btn.textContent = 'Re-probe all';
+      }
+    });
+  });
+
+  body.querySelectorAll('[data-upload-toggle]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const area = document.getElementById('upload-area-' + btn.dataset.uploadToggle);
+      if (area) area.classList.toggle('open');
+    });
+  });
+
+  body.querySelectorAll('[data-upload-go]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const libId = btn.dataset.uploadGo;
+      const area = document.getElementById('upload-area-' + libId);
+      const folderId = area && area.dataset.folder;
+      const fileInput = document.querySelector('[data-upload-files="' + libId + '"]');
+      const subfolderInput = document.querySelector('[data-upload-subfolder="' + libId + '"]');
+      if (!folderId || !fileInput || !fileInput.files || !fileInput.files.length) {
+        showError('Pick at least one file to upload.');
+        return;
+      }
+      const subfolder = (subfolderInput && subfolderInput.value || '').trim().replace(/^\/+|\/+$/g, '');
+      const listEl = document.getElementById('upload-list-' + libId);
+      btn.disabled = true;
+      try {
+        for (const file of fileInput.files) {
+          await uploadFile(folderId, file, subfolder, listEl);
+        }
+        const done = document.createElement('div');
+        done.className = 'muted';
+        done.style.cssText = 'margin-top:0.5rem; font-size:0.85rem';
+        done.textContent = 'Batch finished. Reload the page to refresh library counts.';
+        listEl.appendChild(done);
+      } finally {
+        btn.disabled = false;
+        fileInput.value = '';
+        // Deliberately no refresh() here — refresh re-renders the libraries
+        // pane and wipes this upload-list (and any error rows) before the
+        // user can read them. Manual reload picks up new counts.
+      }
+    });
+  });
+
   body.querySelectorAll('[data-attach-pcloud]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const libId = btn.dataset.attachPcloud;
@@ -491,6 +662,259 @@ function renderLibraries(status, libraries) {
       }
     });
   });
+}
+
+// ─── Upload pipeline ────────────────────────────────────────────────────────
+
+// Top-level dispatch: single audio file uploads as-is; .zip / .rar are
+// extracted in the browser and each contained audio file is uploaded.
+async function uploadFile(folderId, file, subfolder, listEl) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  if (ext === 'zip' || ext === 'rar') {
+    const row = appendUploadRow(listEl, file.name, 'Reading archive…');
+    let entries;
+    try {
+      entries = await extractAudioEntries(file, (status) => row.setStatus(status));
+    } catch (e) {
+      row.fail('Read failed: ' + e.message);
+      return;
+    }
+    if (!entries.length) {
+      row.fail('No audio files inside archive');
+      return;
+    }
+    row.complete(entries.length + ' audio file(s) found');
+    // entry.file here is a CompressedFile wrapper, not a real Blob. Extract
+    // each one just before its upload starts so we hold the decompressed
+    // bytes in memory for the minimum time possible.
+    for (const entry of entries) {
+      const relPath = joinPath(subfolder, entry.relPath);
+      const subRow = appendUploadRow(listEl, '↳ ' + entry.relPath, 'Extracting…');
+      let realFile;
+      try {
+        realFile = await entry.file.extract();
+      } catch (e) {
+        subRow.fail('Extract failed: ' + e.message);
+        continue;
+      }
+      await chunkedUploadOne(folderId, realFile, relPath, subRow);
+    }
+  } else if (ext === 'm4b' || ext === 'm4a' || ext === 'aac') {
+    const relPath = joinPath(subfolder, file.name);
+    const row = appendUploadRow(listEl, file.name, 'Queued');
+    await chunkedUploadOne(folderId, file, relPath, row);
+  } else {
+    appendUploadRow(listEl, file.name, '').fail('Unsupported file type: .' + ext);
+  }
+}
+
+function joinPath(subfolder, name) {
+  const sf = (subfolder || '').replace(/^\/+|\/+$/g, '');
+  return sf ? sf + '/' + name : name;
+}
+
+// Per-file chunked upload to pCloud via the Worker proxy. Each chunk is sized
+// by the server (init response); browser slices the Blob accordingly.
+async function chunkedUploadOne(folderId, blob, relPath, row) {
+  try {
+    row.setStatus('Initialising…');
+    const init = await api('/api/admin/storage/folder/' + folderId + '/upload/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ relPath }),
+    });
+    const uploadId = init.uploadId;
+    const chunkSize = init.chunkSize || (8 * 1024 * 1024);
+    let offset = 0;
+    while (offset < blob.size) {
+      const end = Math.min(offset + chunkSize, blob.size);
+      const chunk = blob.slice(offset, end);
+      const qs = new URLSearchParams({ uploadId: String(uploadId), offset: String(offset) });
+      const res = await fetch(
+        '/api/admin/storage/folder/' + folderId + '/upload/chunk?' + qs.toString(),
+        { method: 'POST', credentials: 'include', body: chunk },
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error('Chunk failed at offset ' + offset + ': HTTP ' + res.status + ' ' + text);
+      }
+      offset = end;
+      row.setProgress(offset, blob.size);
+    }
+    row.setStatus('Saving…');
+    const saved = await api('/api/admin/storage/folder/' + folderId + '/upload/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uploadId, relPath, registerAsBook: true }),
+    });
+    if (saved.itemId) {
+      row.complete('Saved & registered (' + saved.itemId + ')');
+    } else if (saved.registerError) {
+      row.complete('Saved to pCloud but NOT registered: ' + saved.registerError);
+    } else {
+      row.complete('Saved');
+    }
+  } catch (e) {
+    row.fail(e.message || String(e));
+  }
+}
+
+// Per-upload-row helper: renders a <div> with file name, progress bar, status
+// and returns an object exposing setProgress / setStatus / complete / fail.
+function appendUploadRow(listEl, name, initialStatus) {
+  const el = document.createElement('div');
+  el.className = 'upload-item';
+  el.innerHTML =
+    '<span class="name"></span><span class="status"></span>' +
+    '<div class="progress-bar"><span></span></div>';
+  el.querySelector('.name').textContent = name;
+  el.querySelector('.status').textContent = initialStatus ? ' · ' + initialStatus : '';
+  listEl.appendChild(el);
+  const bar = el.querySelector('.progress-bar > span');
+  const status = el.querySelector('.status');
+  return {
+    setProgress(uploaded, total) {
+      const pct = total ? Math.round((uploaded / total) * 100) : 0;
+      bar.style.width = pct + '%';
+      status.textContent = ' · ' + pct + '% (' + formatBytes(uploaded) + ' / ' + formatBytes(total) + ')';
+    },
+    setStatus(text) { status.textContent = ' · ' + text; },
+    complete(text) {
+      el.classList.add('ok');
+      bar.style.width = '100%';
+      status.textContent = ' · ' + (text || 'Done');
+    },
+    fail(text) {
+      el.classList.add('err');
+      status.textContent = ' · ' + (text || 'Failed');
+    },
+  };
+}
+
+function formatBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+function formatDuration(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
+
+// Render the books-list panel. Each row is title/author + chapter count +
+// duration + per-book actions (re-probe, remove).
+function renderBooksList(container, items) {
+  if (!items.length) {
+    container.innerHTML = '<p class="muted">No books in this library yet.</p>';
+    return;
+  }
+  let html = '';
+  for (const it of items) {
+    const chapCls = it.chapter_count === 0 ? ' no-chapters' : '';
+    html += '<div class="book-row" data-item-id="' + escapeHtml(it.id) + '">';
+    html += '<span class="title">' + escapeHtml(it.title || it.rel_path || '(untitled)');
+    if (it.author_name) html += ' <span class="meta">· ' + escapeHtml(it.author_name) + '</span>';
+    if (it.series_name) html += ' <span class="meta">· ' + escapeHtml(it.series_name) + '</span>';
+    html += '</span>';
+    html += '<span class="meta' + chapCls + '">' + it.chapter_count + ' chapters</span>';
+    html += '<span class="meta">' + formatDuration(it.duration_seconds) + '</span>';
+    html += '<span class="meta">' + formatBytes(it.size_bytes) + '</span>';
+    html += '<button class="secondary" data-reprobe-item="' + escapeHtml(it.id) + '">Re-probe</button>';
+    html += '<button class="danger" data-remove-item="' + escapeHtml(it.id) + '">Remove</button>';
+    html += '</div>';
+  }
+  container.innerHTML = html;
+
+  container.querySelectorAll('[data-reprobe-item]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true; btn.textContent = '…';
+      try {
+        const r = await api('/api/admin/items/' + btn.dataset.reprobeItem + '/reprobe', { method: 'POST' });
+        // Update the row inline so user sees the new chapter count immediately.
+        const row = btn.closest('.book-row');
+        const counterSpans = row.querySelectorAll('.meta');
+        counterSpans[counterSpans.length === 4 ? 1 : 0].textContent = r.chapters + ' chapters';
+        counterSpans[counterSpans.length === 4 ? 1 : 0].className = 'meta' + (r.chapters === 0 ? ' no-chapters' : '');
+      } catch (e) {
+        showError('Re-probe failed: ' + e.message);
+      } finally {
+        btn.disabled = false; btn.textContent = 'Re-probe';
+      }
+    });
+  });
+
+  container.querySelectorAll('[data-remove-item]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const row = btn.closest('.book-row');
+      const title = row.querySelector('.title').textContent.trim().split(' · ')[0];
+      if (!confirm('Remove "' + title + '" from the library?\\n\\nThe underlying file on pCloud/S3/etc. is NOT deleted — only the D1 entry. Re-uploading or running a scan will bring it back.')) return;
+      btn.disabled = true; btn.textContent = '…';
+      try {
+        await api('/api/admin/items/' + btn.dataset.removeItem, { method: 'DELETE' });
+        row.remove();
+      } catch (e) {
+        showError('Remove failed: ' + e.message);
+        btn.disabled = false; btn.textContent = 'Remove';
+      }
+    });
+  });
+}
+
+// ─── Archive extraction (lazy-loaded libarchive.js) ─────────────────────────
+
+// libarchive.js spawns a Web Worker that loads WASM. Workers refuse cross-
+// origin URLs even when CORS allows them, so we fetch the bundle from
+// jsdelivr and wrap it in a Blob URL on our own origin.
+//
+// Then there's a second wrinkle: v2.x of libarchive.js loads its WASM as a
+// separate file via new URL("libarchive.wasm", import.meta.url). Once the
+// worker is running from a Blob URL, that resolves to a relative path on our
+// origin that doesn't exist — extraction hangs forever at "Opening archive".
+// Fix: rewrite the literal "libarchive.wasm" in the worker source to the
+// absolute jsdelivr URL before wrapping in a Blob.
+let __libarchive = null;
+async function loadLibarchive() {
+  if (__libarchive) return __libarchive;
+  const VER = '2.0.2';
+  const baseUrl = 'https://cdn.jsdelivr.net/npm/libarchive.js@' + VER + '/dist/';
+  const wasmUrl = baseUrl + 'libarchive.wasm';
+  const workerRes = await fetch(baseUrl + 'worker-bundle.js');
+  if (!workerRes.ok) throw new Error('Failed to fetch libarchive worker: HTTP ' + workerRes.status);
+  let workerSrc = await workerRes.text();
+  workerSrc = workerSrc.replace(/"libarchive\.wasm"/g, JSON.stringify(wasmUrl));
+  const workerBlob = new Blob([workerSrc], { type: 'application/javascript' });
+  const workerUrl = URL.createObjectURL(workerBlob);
+  const mod = await import(baseUrl + 'libarchive.js');
+  mod.Archive.init({ workerUrl });
+  __libarchive = mod;
+  return mod;
+}
+
+// Open the archive, walk every entry, and return only those with audiobook
+// extensions. Returns [{ file: File, relPath: string }]. relPath preserves
+// the archive's internal directory structure so multi-disc books keep their
+// folder.
+async function extractAudioEntries(file, statusCb) {
+  statusCb && statusCb('Loading extractor…');
+  const { Archive } = await loadLibarchive();
+  statusCb && statusCb('Opening archive…');
+  const archive = await Archive.open(file);
+  statusCb && statusCb('Reading entries…');
+  // getFilesArray returns [{file: File, path: string}] where path is the
+  // directory (with trailing slash) and file.name is the filename.
+  const flat = await archive.getFilesArray();
+  const out = [];
+  for (const item of flat) {
+    const filename = item.file.name;
+    if (!/\.(m4b|m4a|aac)$/i.test(filename)) continue;
+    const dir = (item.path || '').replace(/^\/+|\/+$/g, '');
+    out.push({ file: item.file, relPath: dir ? dir + '/' + filename : filename });
+  }
+  return out;
 }
 
 refresh();

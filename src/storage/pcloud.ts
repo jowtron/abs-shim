@@ -105,17 +105,20 @@ export class PcloudOAuthAdapter implements StorageAdapter {
     params.set('nofiles', '0');
     const data = await this.call<PcloudListFolder>('listfolder', params);
     if (!data.metadata) return;
-    const root = data.metadata.path;
-    yield* this.walkContents(data.metadata, root);
+    // pCloud only sets `path` on the root entry of a recursive listfolder;
+    // nested contents entries are name-only. Build relPaths by accumulating
+    // names as we descend instead of trying to subtract the root.
+    yield* this.walkContents(data.metadata, '');
   }
 
-  private *walkContents(node: PcloudFolderEntry, rootPath: string): Generator<RemoteEntry> {
+  private *walkContents(node: PcloudFolderEntry, currentRel: string): Generator<RemoteEntry> {
     for (const child of node.contents ?? []) {
+      const childRel = currentRel ? `${currentRel}/${child.name}` : child.name;
       if (child.isfolder) {
-        yield* this.walkContents(child, rootPath);
+        yield* this.walkContents(child, childRel);
       } else if (isAudiobookFile(child.name)) {
         const entry: RemoteEntry = {
-          relPath: relPathFrom(rootPath, child.path),
+          relPath: childRel,
           isDir: false,
         };
         if (child.size != null) entry.sizeBytes = child.size;
@@ -156,14 +159,6 @@ export class PcloudOAuthAdapter implements StorageAdapter {
     }
     return data;
   }
-}
-
-// Compute a path relative to `rootPath`. Both inputs are absolute pCloud paths
-// (e.g. '/Audiobooks/The Hobbit/book.m4b' relative to '/Audiobooks').
-function relPathFrom(rootPath: string, absPath: string): string {
-  const root = rootPath.replace(/\/+$/, '');
-  if (!absPath.startsWith(root)) return absPath;
-  return absPath.slice(root.length).replace(/^\/+/, '');
 }
 
 // OAuth-flow helpers, kept here so they live next to the adapter that uses them.
@@ -233,4 +228,95 @@ export async function pcloudUserinfo(profile: PcloudProfile): Promise<{ email?: 
   if (!res.ok) return {};
   const data = await res.json().catch(() => ({})) as { email?: string };
   return data.email ? { email: data.email } : {};
+}
+
+// ─── Chunked upload ────────────────────────────────────────────────────────
+//
+// Workers have a 100 MB request-body limit on the Free plan (500 MB Paid).
+// Audiobook files routinely exceed both, so the browser uploads in chunks of
+// ~25 MB and the Worker streams each chunk straight to pCloud's upload_write.
+// No buffering on our side — `fetch(... body: requestBody)` pipes the bytes
+// through. pCloud's API:
+//   upload_create  → returns { uploadid }
+//   upload_write   → PUT raw bytes with ?uploadid=X&uploadoffset=Y
+//   upload_save    → saves the assembled bytes to a path, returns metadata
+// Reference: https://docs.pcloud.com/methods/fileops/
+
+export type PcloudUploadCreate = PcloudApiResult & { uploadid?: number };
+
+export async function pcloudUploadCreate(profile: PcloudProfile): Promise<number> {
+  const url = `https://${profile.apiHost}/upload_create`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${profile.accessToken}` },
+  });
+  if (!res.ok) {
+    throw new Error(`pCloud upload_create HTTP ${res.status}: ${await res.text().catch(() => '')}`);
+  }
+  const data = await res.json() as PcloudUploadCreate;
+  if (data.result !== 0 || !data.uploadid) {
+    throw new Error(`pCloud upload_create result=${data.result} ${data.error ?? ''}`);
+  }
+  return data.uploadid;
+}
+
+// Stream `body` to pCloud at the given offset. `body` can be a ReadableStream
+// (preferred — zero-copy from the inbound Worker request) or a Uint8Array.
+// `contentLength` is required when streaming because pCloud rejects chunked
+// transfer-encoding here.
+export async function pcloudUploadWrite(
+  profile: PcloudProfile,
+  args: { uploadId: number; offset: number; body: ReadableStream<Uint8Array> | Uint8Array; contentLength: number },
+): Promise<void> {
+  const params = new URLSearchParams();
+  params.set('uploadid', String(args.uploadId));
+  params.set('uploadoffset', String(args.offset));
+  const url = `https://${profile.apiHost}/upload_write?${params.toString()}`;
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${profile.accessToken}`,
+      'Content-Length': String(args.contentLength),
+      'Content-Type': 'application/octet-stream',
+    },
+    body: args.body,
+    // Required for streaming bodies in workerd/undici-style fetch.
+    duplex: 'half',
+  } as RequestInit & { duplex?: 'half' });
+  if (!res.ok) {
+    throw new Error(`pCloud upload_write HTTP ${res.status}: ${await res.text().catch(() => '')}`);
+  }
+  const data = await res.json() as PcloudApiResult;
+  if (data.result !== 0) {
+    throw new Error(`pCloud upload_write result=${data.result} ${data.error ?? ''}`);
+  }
+}
+
+export type PcloudSavedFile = PcloudApiResult & {
+  metadata?: { fileid: number; path: string; name: string; size: number };
+};
+
+// Finalize. `path` is the absolute pCloud path including filename, e.g.
+// "/Audiobooks/The Hobbit/hobbit.m4b". pCloud creates parent folders only if
+// `createparents=1` is set — we set it because upload-by-extraction will
+// frequently include nested subfolders the user has never created.
+export async function pcloudUploadSave(
+  profile: PcloudProfile,
+  args: { uploadId: number; path: string },
+): Promise<PcloudSavedFile> {
+  const params = new URLSearchParams();
+  params.set('uploadid', String(args.uploadId));
+  params.set('path', args.path);
+  params.set('createparents', '1');
+  const url = `https://${profile.apiHost}/upload_save?${params.toString()}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${profile.accessToken}` },
+  });
+  if (!res.ok) {
+    throw new Error(`pCloud upload_save HTTP ${res.status}: ${await res.text().catch(() => '')}`);
+  }
+  const data = await res.json() as PcloudSavedFile;
+  if (data.result !== 0) {
+    throw new Error(`pCloud upload_save result=${data.result} ${data.error ?? ''}`);
+  }
+  return data;
 }
