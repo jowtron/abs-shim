@@ -1,0 +1,107 @@
+# Release: apply D1 migrations and/or deploy the Worker.
+#
+# Manually-triggered: Actions tab → "Release" → "Run workflow".
+# Collaborators ship without needing direct Cloudflare account access
+# — the workflow reads a CLOUDFLARE_API_TOKEN secret. Token scope
+# needs D1:Edit AND Workers Scripts:Edit.
+#
+# Inputs let the runner pick which steps to run, so a deploy-only or
+# migrations-only release works the same way. When both are ticked,
+# migrations run FIRST — so the Worker is never deployed against a
+# schema it doesn't expect.
+#
+# This workflow replaces "manually run `wrangler deploy` from a dev
+# terminal". Prefer this so the order (migrate → deploy) is enforced
+# and the deploy is auditable in the Actions tab.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_migrations:
+        description: "Apply pending migrations/ files?"
+        type: boolean
+        default: true
+      deploy_worker:
+        description: "Deploy the Worker (typecheck + wrangler deploy)?"
+        type: boolean
+        default: true
+      sql_file:
+        description: "Optional path to a one-shot SQL file to execute (e.g. scripts/some-fix.sql). Leave empty to skip."
+        type: string
+        required: false
+        default: ""
+      confirm:
+        description: 'Type "yes" to confirm you want to hit REMOTE production.'
+        type: string
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.confirm == 'yes' }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Apply pending migrations
+        if: ${{ inputs.apply_migrations }}
+        run: npx wrangler d1 migrations apply abs-shim-db --remote
+
+      # Catch the silent-skip case where wrangler reports "no pending"
+      # while migration files on disk aren't actually applied. Fails
+      # loudly if the d1_migrations bookkeeping disagrees with disk.
+      - name: Verify all migrations applied
+        if: ${{ inputs.apply_migrations }}
+        run: |
+          APPLIED=$(npx wrangler d1 execute abs-shim-db --remote --json \
+            --command='SELECT COUNT(*) AS n FROM d1_migrations' \
+            | jq '.[0].results[0].n')
+          ON_DISK=$(ls migrations/*.sql 2>/dev/null | wc -l | tr -d ' ')
+          echo "Applied: $APPLIED  On-disk: $ON_DISK"
+          if [ "$APPLIED" -ne "$ON_DISK" ]; then
+            echo "::error::Migration bookkeeping mismatch — applied=$APPLIED but on-disk=$ON_DISK. Possible wrangler silent-skip. Investigate before relying on this run."
+            exit 1
+          fi
+
+      # D1 rejects raw BEGIN TRANSACTION / COMMIT statements (uses
+      # Durable Object transaction APIs instead). Strip them in case
+      # the SQL author included them — saves a retry round trip.
+      - name: Strip transaction wrappers from SQL file
+        if: ${{ inputs.sql_file != '' }}
+        run: sed -i '/^\(BEGIN TRANSACTION\|COMMIT\);[[:space:]]*$/d' "${{ inputs.sql_file }}"
+
+      - name: Execute one-shot SQL file
+        if: ${{ inputs.sql_file != '' }}
+        run: npx wrangler d1 execute abs-shim-db --remote --file="${{ inputs.sql_file }}"
+
+      - name: Show library_items + library_folders counts
+        if: ${{ inputs.apply_migrations || inputs.sql_file != '' }}
+        run: |
+          npx wrangler d1 execute abs-shim-db --remote \
+            --command="SELECT (SELECT COUNT(*) FROM library_items) AS items, (SELECT COUNT(*) FROM library_folders) AS folders"
+
+      # Strict TS check before we ship. The explicit success() is
+      # needed because the `if:` override drops GH Actions' default
+      # success-gating.
+      - name: Typecheck
+        if: ${{ inputs.deploy_worker && success() }}
+        run: npm run typecheck
+
+      - name: Deploy Worker
+        if: ${{ inputs.deploy_worker && success() }}
+        run: npx wrangler deploy
+
+      - name: Show deployed version
+        if: ${{ inputs.deploy_worker && success() }}
+        run: npx wrangler versions list 2>&1 | head -10
