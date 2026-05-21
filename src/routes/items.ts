@@ -4,19 +4,59 @@ import { requireAuth, type AuthVars } from '../auth/middleware';
 import { buildItemDetail } from '../lib/abs-shapes';
 import { buildItemBundle } from './library';
 import { probeM4b } from '../prober/m4b';
+import { probeMp3 } from '../prober/mp3';
+import { resolveItemIdFromUuid } from '../lib/ids';
 import { insertListeningSession } from '../db/sessions';
 import { getProgress, progressToAbs } from '../db/progress';
 import { resolveProbeUrl, streamAudio } from '../storage/resolve';
 
 export const itemRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
+// 1x1 transparent PNG used when a cover request resolves to no item — kills
+// the broken-image console spam from Pholia rendering /personalized shelves
+// against an empty library or a stale UUID.
+const PLACEHOLDER_PNG = Uint8Array.from(
+  atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII='),
+  (ch) => ch.charCodeAt(0),
+);
+function placeholderCover(): Response {
+  return new Response(PLACEHOLDER_PNG, {
+    status: 200,
+    headers: {
+      'Content-Type': 'image/png',
+      'Cache-Control': 'public, max-age=300',
+      'Content-Length': String(PLACEHOLDER_PNG.byteLength),
+    },
+  });
+}
+
 // Cover image — deliberately registered BEFORE the auth middleware so it's
 // public. ShelfPlayer and other clients don't always pass auth on image
 // requests; album art isn't sensitive content. Range-fetches the moov atom
 // and extracts the embedded `covr` atom, cached in the Workers Cache API.
 itemRoutes.get('/:id/cover', async (c) => {
-  const id = c.req.param('id');
+  const rawId = c.req.param('id');
   const cache = caches.default;
+
+  // Pholia's home view renders /personalized shelves and builds
+  // `/api/items/<entity.id>/cover` for every entity — including series and
+  // author cards, whose entity.id is a derivedId UUID. Resolve any UUID form
+  // (media-id, author-id, series-id) to a real library_items.id up front so
+  // R2/Workers-Cache key off the canonical id and we serve a representative
+  // book cover instead of 404ing.
+  let id = rawId;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawId)) {
+    const exists = await c.env.DB
+      .prepare('SELECT 1 AS x FROM library_items WHERE id = ? LIMIT 1')
+      .bind(rawId)
+      .first<{ x: number }>();
+    if (!exists) {
+      const mapped = await resolveItemIdFromUuid(c.env.DB, rawId);
+      if (mapped) id = mapped;
+      else return placeholderCover(); // unknown UUID — return transparent 1x1
+    }
+  }
+
   // Token-stripped cache key so different users share the same edge cache entry.
   const cacheKey = new Request(new URL(`/__cover_cache__/${id}`, c.req.url).toString(), { method: 'GET' });
 
@@ -25,7 +65,7 @@ itemRoutes.get('/:id/cover', async (c) => {
   if (edgeHit) return edgeHit;
 
   // Tier 2: R2 (account-wide, ~10ms hit). Survives Workers-Cache eviction
-  // and is shared across all CF POPs, so a cold POP only re-probes the m4b
+  // and is shared across all CF POPs, so a cold POP only re-probes
   // the very first time a cover is ever requested.
   const r2Key = `covers/${id}`;
   const r2Hit = await c.env.COVERS.get(r2Key);
@@ -40,9 +80,11 @@ itemRoutes.get('/:id/cover', async (c) => {
     return res;
   }
 
-  // Tier 3: probe upstream. The probeM4b call does a Range read of the moov
-  // atom and pulls the embedded covr blob — expensive (~50–500ms depending
-  // on the storage backend), so we want this to happen at most once per item.
+  // Tier 3: probe upstream. Range-reads the relevant header bytes and pulls
+  // the embedded cover — expensive (~50–500ms depending on the storage
+  // backend), so we want this to happen at most once per item. Dispatch by
+  // file extension: mp3 books have ID3v2 APIC frames, m4b/m4a/aac have a
+  // moov/udta/meta/ilst/covr atom.
   const bundle = await buildItemBundle(c.env, id);
   if (!bundle) return c.json({ error: 'Item not found' }, 404);
   const audio = bundle.audioFiles[0];
@@ -51,8 +93,16 @@ itemRoutes.get('/:id/cover', async (c) => {
   let cover;
   try {
     const probeUrl = await resolveProbeUrl(c.env, bundle.folder, audio);
-    const probe = await probeM4b(probeUrl.url);
-    cover = probe.cover;
+    const isMp3 = audio.format === 'mp3'
+      || audio.mime_type === 'audio/mpeg'
+      || /\.mp3$/i.test(audio.rel_path ?? audio.filedn_url);
+    if (isMp3) {
+      const probe = await probeMp3(probeUrl.url, audio.size_bytes || undefined);
+      cover = probe.cover;
+    } else {
+      const probe = await probeM4b(probeUrl.url);
+      cover = probe.cover;
+    }
   } catch (e) {
     return c.json({ error: 'Probe failed', detail: (e as Error).message }, 502);
   }

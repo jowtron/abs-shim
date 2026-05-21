@@ -2,6 +2,8 @@ import type { Env } from '../types';
 import { getAdapter, type FolderRow } from '../storage/factory';
 import { ListingNotSupportedError, type RemoteEntry } from '../storage/adapter';
 import { probeM4b } from '../prober/m4b';
+import { probeMp3, type Mp3Probe } from '../prober/mp3';
+import { invalidateIdMap } from '../lib/ids';
 
 // Scanner: walk a library's folder via its storage adapter, probe each new
 // audiobook file, and upsert library_items + book_metadata + audio_files +
@@ -76,29 +78,48 @@ export async function runScan(env: Env, libraryId: string): Promise<ScanReport> 
     ).bind(folder.id).all<{ rel_path: string }>();
     const known = new Set(existing.results.map((r) => r.rel_path));
 
+    // Group entries by parent directory. A single-file book at the folder
+    // root maps to a group keyed by the file path. A folder of mp3 chapter
+    // files maps every chapter to one group.
+    const groups = new Map<string, RemoteEntry[]>();
     for (const file of entries) {
-      // Group rule: a single audiobook lives at a directory containing one
-      // audio file (current MVP). Use the parent dir as the item rel_path; if
-      // the file is at the folder root, use the file path itself.
       const slash = file.relPath.lastIndexOf('/');
       const itemRel = slash > 0 ? file.relPath.slice(0, slash) : file.relPath;
+      const arr = groups.get(itemRel);
+      if (arr) arr.push(file);
+      else groups.set(itemRel, [file]);
+    }
+
+    for (const [itemRel, files] of groups) {
       if (known.has(itemRel)) {
-        report.skipped++;
+        report.skipped += files.length;
         continue;
       }
+      // Lex sort — "01 - chapter.mp3" naming is the de facto standard for
+      // multi-file audiobooks, and locale sort handles zero-padded numerics.
+      files.sort((a, b) => a.relPath.localeCompare(b.relPath));
 
       try {
-        const probe = await probeBook({
-          env, adapter, folder, file, itemRel,
-        });
-        if (probe === 'skipped') {
-          report.skipped++;
-        } else {
+        const allMp3 = files.every((f) => /\.mp3$/i.test(f.relPath));
+        if (allMp3) {
+          await probeMp3Book({ env, adapter, folder, itemRel, files });
           report.added++;
           known.add(itemRel);
+        } else if (files.length === 1) {
+          const f = files[0]!;
+          const out = await probeM4bBook({ env, adapter, folder, file: f, itemRel });
+          if (out === 'added') { report.added++; known.add(itemRel); }
+          else report.skipped++;
+        } else {
+          // Multi-file non-mp3 layouts (e.g. m4b split into chapter files)
+          // aren't yet supported by the prober. Flag and continue.
+          report.errors.push({
+            relPath: itemRel,
+            reason: `multi-file non-mp3 folder layout not supported (${files.length} files)`,
+          });
         }
       } catch (e) {
-        report.errors.push({ relPath: file.relPath, reason: (e as Error).message });
+        report.errors.push({ relPath: itemRel, reason: (e as Error).message });
       }
     }
   }
@@ -123,22 +144,37 @@ async function collectAudioFiles(adapter: Awaited<ReturnType<typeof getAdapter>>
     const entries = await adapter.listFolder(cur);
     for (const e of entries) {
       if (e.isDir) queue.push(e.relPath);
-      else if (/\.(m4b|m4a|aac)$/i.test(e.relPath)) out.push(e);
+      else if (/\.(m4b|m4a|aac|mp3)$/i.test(e.relPath)) out.push(e);
     }
   }
   return out;
 }
 
-// Probe one audio file and insert all the metadata rows. Returns 'skipped'
-// when we deliberately decline (e.g. unsupported multi-file layout — those
-// land in errors instead at the call site, but reserve the name).
-async function probeBook(args: {
+type SingleFileArgs = {
   env: Env;
   adapter: Awaited<ReturnType<typeof getAdapter>>;
   folder: FolderRow;
   file: RemoteEntry;
   itemRel: string;
-}): Promise<'added' | 'skipped'> {
+};
+
+// Single-file dispatcher. addBookByPath uses this; runScan dispatches by
+// extension itself so it can handle multi-file mp3 folders without round-
+// tripping through here.
+async function probeBook(args: SingleFileArgs): Promise<'added' | 'skipped'> {
+  if (/\.mp3$/i.test(args.file.relPath)) {
+    return probeMp3Book({
+      env: args.env, adapter: args.adapter, folder: args.folder,
+      itemRel: args.itemRel, files: [args.file],
+    });
+  }
+  return probeM4bBook(args);
+}
+
+// Probe one m4b/m4a/aac file and insert all the metadata rows. Returns
+// 'skipped' when we deliberately decline — currently never, but reserve the
+// name so callers can branch.
+async function probeM4bBook(args: SingleFileArgs): Promise<'added' | 'skipped'> {
   const { env, adapter, folder, file, itemRel } = args;
 
   // Get a probe URL — for OAuth providers this is short-lived, but the prober
@@ -228,6 +264,142 @@ async function probeBook(args: {
     }
   }
 
+  invalidateIdMap();
+  return 'added';
+}
+
+// Probe a multi-file mp3 audiobook (1..N chapter files in a directory). Each
+// file becomes one audio_files row + one chapters row, with cumulative start
+// offsets across the file list. Book-level metadata (title/author/cover) is
+// pulled from the FIRST file's ID3v2 tag, with the folder name as the title
+// fallback when TALB is missing.
+async function probeMp3Book(args: {
+  env: Env;
+  adapter: Awaited<ReturnType<typeof getAdapter>>;
+  folder: FolderRow;
+  itemRel: string;
+  files: RemoteEntry[];
+}): Promise<'added' | 'skipped'> {
+  const { env, adapter, folder, itemRel, files } = args;
+  if (!files.length) return 'skipped';
+
+  // Probe every file. We need duration per file (for cumulative offsets) and
+  // TIT2 per file (for chapter titles). Sequential to keep upstream-request
+  // load reasonable on free-tier hosts.
+  const probes: Mp3Probe[] = [];
+  for (const f of files) {
+    const probeUrl = await adapter.resolveProbeUrl(f.relPath, f.providerId ?? null);
+    probes.push(await probeMp3(probeUrl.url, f.sizeBytes));
+  }
+  const first = probes[0]!;
+
+  // Title: prefer first file's TALB (album = book title in audiobook tagging),
+  // then directory basename, then first file's TIT2 as a last resort.
+  const folderBase = itemRel.split('/').pop() ?? itemRel;
+  const title = first.tags['TALB'] ?? folderBase ?? first.tags['TIT2'] ?? 'Unknown';
+  const author = first.tags['TPE1'] ?? null;
+  // ABS treats the album field separately from the title; for an mp3 book the
+  // album IS the title, so leave book_metadata.series_name etc alone and write
+  // album = TALB only when it differs from the resolved title.
+  const album = first.tags['TALB'] && first.tags['TALB'] !== title
+    ? first.tags['TALB']
+    : null;
+  // Narrator: TCOM ("composer") is the common audiobook convention, with
+  // TXXX:NARRATOR a stricter alternative when present.
+  const narrator = first.tags['TXXX:NARRATOR'] ?? first.tags['TCOM'] ?? null;
+  const yearRaw = first.tags['TDRC'] ?? first.tags['TYER'] ?? null;
+  const year = yearRaw ? Number(yearRaw.slice(0, 4)) || null : null;
+
+  const itemId = `it-${crypto.randomUUID().slice(0, 12)}`;
+  const now = Date.now();
+  // is_file = 1 only when the "book" is literally a single file at the folder
+  // root (rare for mp3, but possible). Otherwise it's a directory.
+  const isFile = files.length === 1 && files[0]!.relPath === itemRel ? 1 : 0;
+  const ino = (Math.floor(Math.random() * 0xffffffff)).toString();
+
+  // Cumulative offset table for chapter start/end times.
+  let cum = 0;
+  const offsets: number[] = [];
+  for (const p of probes) {
+    offsets.push(cum);
+    cum += p.durationSeconds ?? 0;
+  }
+  const totalDuration = cum;
+
+  // PublicUrl provider URLs are stable, so resolve them once and cache;
+  // OAuth providers mint short-lived URLs per request, so leave filedn_url
+  // empty and let resolveStreamUrl rebuild at request time.
+  const stableUrls = adapter.provider === 'public_url'
+    ? await Promise.all(files.map((f) => adapter.resolveUrl(f.relPath).then((r) => r.url)))
+    : files.map(() => '');
+
+  const audioStmts = files.map((f, i) => {
+    const p = probes[i]!;
+    const audioId = `af-${crypto.randomUUID().slice(0, 12)}`;
+    const audioIno = (Math.floor(Math.random() * 0xffffffff)).toString();
+    return env.DB.prepare(
+      `INSERT INTO audio_files
+         (id, library_item_id, index_no, filedn_url, ino, duration_seconds, size_bytes,
+          mime_type, format, codec, bitrate, sample_rate, channels, added_at,
+          rel_path, provider_file_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'audio/mpeg', 'mp3', 'mp3', ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      audioId, itemId, i + 1, stableUrls[i] ?? '', audioIno,
+      p.durationSeconds ?? 0,
+      f.sizeBytes ?? 0,
+      p.bitrate ?? null, p.sampleRate ?? null, p.channels ?? null,
+      now, f.relPath, f.providerId ?? null,
+    );
+  });
+
+  // One chapter per file. Title = that file's TIT2, falling back to a
+  // sanitized filename. End = next chapter's start (== this file's start +
+  // duration); for the last file, end = totalDuration.
+  const chapterStmts = files.map((f, i) => {
+    const p = probes[i]!;
+    const start = offsets[i]!;
+    const end = i + 1 < probes.length ? offsets[i + 1]! : totalDuration;
+    const filename = f.relPath.split('/').pop() ?? f.relPath;
+    const titleFromName = filename.replace(/\.mp3$/i, '').replace(/^\d+\s*[-_.]?\s*/, '');
+    const chapterTitle = p.tags['TIT2'] ?? titleFromName;
+    return env.DB.prepare(
+      `INSERT INTO chapters (library_item_id, chapter_index, title, start_seconds, end_seconds)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).bind(itemId, i, chapterTitle, start, end);
+  });
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO library_items
+         (id, library_id, folder_id, ino, rel_path, is_file, media_type, is_missing, is_invalid, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'book', 0, 0, ?, ?)`,
+    ).bind(itemId, folder.library_id, folder.id, ino, itemRel, isFile, now, now),
+
+    env.DB.prepare(
+      `INSERT INTO book_metadata
+         (library_item_id, title, title_ignore_prefix, subtitle, author_name, narrator_name,
+          series_name, series_sequence, description, isbn, asin, language, publish_year,
+          publisher, genres, tags, explicit, abridged, cover_url)
+       VALUES (?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', 0, 0, NULL)`,
+    ).bind(itemId, title, sortKey(title), author, narrator, year, album),
+
+    ...audioStmts,
+    ...chapterStmts,
+  ]);
+
+  // Pre-warm the R2 cover cache from the first file's APIC frame, same as
+  // m4b. The on-demand cover handler will re-probe if this is missing.
+  if (first.cover) {
+    try {
+      await env.COVERS.put(`covers/${itemId}`, first.cover.bytes, {
+        httpMetadata: { contentType: first.cover.mimeType },
+      });
+    } catch {
+      // Non-fatal.
+    }
+  }
+
+  invalidateIdMap();
   return 'added';
 }
 

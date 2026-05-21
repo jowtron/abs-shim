@@ -9,6 +9,7 @@ import {
 import { runScan, addBookByPath, reprobeItem, type ScanReport } from '../scanner/scan';
 import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem } from '../db/library';
 import { probeM4b } from '../prober/m4b';
+import { probeMp3 } from '../prober/mp3';
 import { resolveProbeUrl } from '../storage/resolve';
 import type { OAuthProfileRow } from '../storage/factory';
 
@@ -627,11 +628,16 @@ adminRoutes.post('/covers/warm', async (c) => {
       if (!audio) { failed++; errors.push({ id, reason: 'no audio file' }); continue; }
 
       const probeUrl = await resolveProbeUrl(c.env, folder, audio);
-      const probe = await probeM4b(probeUrl.url);
-      if (!probe.cover) { failed++; errors.push({ id, reason: 'no embedded cover' }); continue; }
+      const isMp3 = audio.format === 'mp3'
+        || audio.mime_type === 'audio/mpeg'
+        || /\.mp3$/i.test(audio.rel_path ?? audio.filedn_url);
+      const cover = isMp3
+        ? (await probeMp3(probeUrl.url, audio.size_bytes || undefined)).cover
+        : (await probeM4b(probeUrl.url)).cover;
+      if (!cover) { failed++; errors.push({ id, reason: 'no embedded cover' }); continue; }
 
-      await c.env.COVERS.put(r2Key, probe.cover.bytes, {
-        httpMetadata: { contentType: probe.cover.mimeType },
+      await c.env.COVERS.put(r2Key, cover.bytes, {
+        httpMetadata: { contentType: cover.mimeType },
       });
       warmed++;
     } catch (e) {

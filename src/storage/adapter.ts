@@ -55,8 +55,9 @@ export class ListingNotSupportedError extends Error {
 }
 
 // File extensions we treat as audiobook media. m4b/m4a/aac all parse via the
-// same MP4 prober. mp3/opus arrive in phase 2.
-export const AUDIOBOOK_EXTENSIONS = ['m4b', 'm4a', 'aac'] as const;
+// MP4 prober; mp3 parses via the MP3 prober (folders-of-chapter-files).
+// opus/ogg/webm/flac arrive when probers for them land.
+export const AUDIOBOOK_EXTENSIONS = ['m4b', 'm4a', 'aac', 'mp3'] as const;
 
 export function isAudiobookFile(name: string): boolean {
   const dot = name.lastIndexOf('.');
