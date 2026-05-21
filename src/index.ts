@@ -13,6 +13,7 @@ import { insertRefreshToken } from './db/refresh';
 import { serverSettings, SERVER_VERSION } from './lib/server-settings';
 import { libraryRoutes } from './routes/library';
 import { itemRoutes } from './routes/items';
+import { authorRoutes } from './routes/authors';
 import { adminRoutes } from './routes/admin';
 import { listProgressByUser, getProgress, upsertProgress, progressToAbs } from './db/progress';
 import { listSessionsByUser } from './db/sessions';
@@ -372,6 +373,7 @@ app.get('/api/me/listening-sessions', requireAuth, async (c) => {
 
 app.route('/api/libraries', libraryRoutes);
 app.route('/api/items', itemRoutes);
+app.route('/api/authors', authorRoutes);
 app.route('/api/admin', adminRoutes);
 
 // Admin UI: a self-contained HTML page (see src/lib/admin-html.ts). Registered

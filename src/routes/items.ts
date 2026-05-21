@@ -10,25 +10,9 @@ import { insertListeningSession } from '../db/sessions';
 import { getProgress, progressToAbs } from '../db/progress';
 import { resolveProbeUrl, streamAudio } from '../storage/resolve';
 
-export const itemRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
+import { placeholderImage } from '../lib/placeholder';
 
-// 1x1 transparent PNG used when a cover request resolves to no item — kills
-// the broken-image console spam from Pholia rendering /personalized shelves
-// against an empty library or a stale UUID.
-const PLACEHOLDER_PNG = Uint8Array.from(
-  atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII='),
-  (ch) => ch.charCodeAt(0),
-);
-function placeholderCover(): Response {
-  return new Response(PLACEHOLDER_PNG, {
-    status: 200,
-    headers: {
-      'Content-Type': 'image/png',
-      'Cache-Control': 'public, max-age=300',
-      'Content-Length': String(PLACEHOLDER_PNG.byteLength),
-    },
-  });
-}
+export const itemRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
 // Cover image — deliberately registered BEFORE the auth middleware so it's
 // public. ShelfPlayer and other clients don't always pass auth on image
@@ -53,7 +37,7 @@ itemRoutes.get('/:id/cover', async (c) => {
     if (!exists) {
       const mapped = await resolveItemIdFromUuid(c.env.DB, rawId);
       if (mapped) id = mapped;
-      else return placeholderCover(); // unknown UUID — return transparent 1x1
+      else return placeholderImage(); // unknown UUID — return transparent 1x1
     }
   }
 

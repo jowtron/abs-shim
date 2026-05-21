@@ -142,14 +142,91 @@ libraryRoutes.get('/:id/authors', async (c) => {
   return c.json({ authors });
 });
 
-// Series and collections — return empty paged result for now. (We do have
-// series data inline in book_metadata; clients render series via the books'
-// metadata. Building a /series listing is a larger job and not required for
-// playback or browsing.)
+// Series listing: group books by series_name, return one entry per series
+// with `books[]` sorted by series_sequence. Pholia's Series tab reads
+// `results[].books[].id` to render each book card, so we MUST include the
+// books with at least an id + minified media metadata.
 libraryRoutes.get('/:id/series', async (c) => {
   const id = c.req.param('id');
   if (!(await getLibrary(c.env, id))) return c.json({ error: 'Library not found' }, 404);
-  return c.json(emptyPagedResult());
+
+  const items = await listItemsByLibrary(c.env, id);
+  const bundles = (await Promise.all(items.map(async (item) => {
+    const folder = await getFolderById(c.env, item.folder_id);
+    if (!folder) return null;
+    const [metadata, audioFiles, chapters] = await Promise.all([
+      getBookMetadata(c.env, item.id),
+      getAudioFiles(c.env, item.id),
+      getChapters(c.env, item.id),
+    ]);
+    return { item, folder, metadata, audioFiles, chapters };
+  }))).filter((b): b is NonNullable<typeof b> => b !== null);
+
+  // Group by series_name. A book with no series is excluded entirely.
+  const groups = new Map<string, typeof bundles>();
+  for (const b of bundles) {
+    if (!b.metadata?.series_name) continue;
+    const arr = groups.get(b.metadata.series_name) ?? [];
+    arr.push(b);
+    groups.set(b.metadata.series_name, arr);
+  }
+
+  const seriesArr = await Promise.all(Array.from(groups.entries()).map(async ([name, group]) => {
+    // Sort books within series by sequence: numeric ASC, NULL/non-numeric last.
+    const sortedBundles = [...group].sort((a, b) => {
+      const sa = parseFloat(a.metadata?.series_sequence ?? '');
+      const sb = parseFloat(b.metadata?.series_sequence ?? '');
+      const ba = Number.isFinite(sa), bb = Number.isFinite(sb);
+      if (ba && bb) return sa - sb;
+      if (ba) return -1;
+      if (bb) return 1;
+      return (a.metadata?.title ?? '').localeCompare(b.metadata?.title ?? '');
+    });
+    const books = await Promise.all(sortedBundles.map((bb) => buildItemMinified(bb)));
+    const totalDuration = sortedBundles.reduce(
+      (s, bb) => s + bb.audioFiles.reduce((t, a) => t + a.duration_seconds, 0),
+      0,
+    );
+    const addedAt = Math.min(...sortedBundles.map((bb) => bb.item.created_at));
+    return {
+      id: await derivedId(id, 'series', name),
+      name,
+      nameIgnorePrefix: name.replace(/^(The|A|An)\s+/i, ''),
+      description: null,
+      addedAt,
+      updatedAt: addedAt,
+      libraryId: id,
+      books,
+      numBooks: books.length,
+      totalDuration,
+    };
+  }));
+
+  // Sort + page. ABS defaults to sort=name asc; Pholia explicitly passes that.
+  const sort = c.req.query('sort') ?? 'name';
+  const desc = c.req.query('desc') === '1';
+  seriesArr.sort((a, b) => {
+    const cmp = sort === 'addedAt'
+      ? a.addedAt - b.addedAt
+      : a.nameIgnorePrefix.localeCompare(b.nameIgnorePrefix);
+    return desc ? -cmp : cmp;
+  });
+
+  const limit = Number(c.req.query('limit') ?? '0');
+  const page = Number(c.req.query('page') ?? '0');
+  const offset = limit > 0 ? page * limit : 0;
+  const results = limit > 0 ? seriesArr.slice(offset, offset + limit) : seriesArr;
+
+  return c.json({
+    results,
+    total: seriesArr.length,
+    limit,
+    page,
+    sortBy: sort,
+    sortDesc: desc,
+    minified: false,
+    include: c.req.query('include') ?? '',
+  });
 });
 
 libraryRoutes.get('/:id/collections', async (c) => {
