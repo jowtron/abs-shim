@@ -30,8 +30,13 @@ const app = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 app.use('*', logger());
 app.use('*', cors({
   origin: (origin) => origin ?? '*',
-  credentials: true,
-  allowHeaders: ['Authorization', 'Content-Type'],
+  // No `credentials: true`: reflecting arbitrary origins WITH credentials
+  // would let any web page ride the accessToken cookie. API clients all use
+  // Bearer / ?token=, which needs no credentialed CORS.
+  // Range is not CORS-safelisted — without it in allowHeaders, Safari blocks
+  // every cross-origin fetch() that sets a Range header (Pholia's download /
+  // auto-cache paths) at preflight, even though native <audio> loads work.
+  allowHeaders: ['Authorization', 'Content-Type', 'Range'],
   exposeHeaders: ['Content-Range', 'Accept-Ranges'],
 }));
 

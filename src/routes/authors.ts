@@ -25,6 +25,7 @@ authorRoutes.use('*', requireAuth);
 // shape; with ?include=items, attaches `libraryItems` (full ABS item shape
 // for every book this author appears on).
 authorRoutes.get('/:authorId', async (c) => {
+  const t0 = Date.now();
   const authorId = c.req.param('authorId');
   const include = (c.req.query('include') ?? '')
     .split(',').map((s) => s.trim()).filter(Boolean);
@@ -44,6 +45,7 @@ authorRoutes.get('/:authorId', async (c) => {
     for (const [name, itemIds] of itemsByAuthor) {
       const id = await derivedId(lib.id, 'author', name);
       if (id !== authorId) continue;
+      const t1 = Date.now();
 
       const base = {
         id: authorId,
@@ -56,15 +58,21 @@ authorRoutes.get('/:authorId', async (c) => {
         libraryId: lib.id,
         numBooks: itemIds.length,
       };
-      if (!include.includes('items')) return c.json(base);
+      if (!include.includes('items')) {
+        console.log(`[perf] /authors/${authorId} name=${name} books=${itemIds.length} include=none | resolve=${t1 - t0}ms total=${Date.now() - t0}ms`);
+        return c.json(base);
+      }
 
       const libraryItems = (await Promise.all(itemIds.map(async (iid) => {
         const bundle = await buildItemBundle(c.env, iid);
         return bundle ? await buildItemDetail(bundle) : null;
       }))).filter((x): x is NonNullable<typeof x> => x !== null);
+      const t2 = Date.now();
 
+      console.log(`[perf] /authors/${authorId} name=${name} books=${itemIds.length} include=items | resolve=${t1 - t0}ms items(N+1)=${t2 - t1}ms total=${t2 - t0}ms`);
       return c.json({ ...base, libraryItems });
     }
   }
+  console.log(`[perf] /authors/${authorId} NOT FOUND | total=${Date.now() - t0}ms`);
   return c.json({ error: 'Author not found' }, 404);
 });

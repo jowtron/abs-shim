@@ -68,7 +68,33 @@ async function rangeFetch(url: string, start: number, endInclusive: number): Pro
   if (res.status !== 206 && res.status !== 200) {
     throw new Error(`Range fetch failed: ${res.status} ${res.statusText}`);
   }
-  const buf = new Uint8Array(await res.arrayBuffer());
+  let buf: Uint8Array;
+  if (res.status === 200) {
+    // Upstream ignored Range and is sending the whole file — arrayBuffer()
+    // on a multi-hundred-MB audiobook would OOM the Worker (128 MB). Read
+    // only the requested window, then cancel the rest of the body.
+    const wanted = endInclusive - start + 1;
+    const reader = res.body!.getReader();
+    const out = new Uint8Array(wanted);
+    let pos = 0;      // absolute byte position in the 200 stream
+    let written = 0;  // bytes captured into the window
+    while (written < wanted) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunkStart = pos;
+      pos += value.length;
+      const from = Math.max(chunkStart, start);
+      const to = Math.min(pos, endInclusive + 1);
+      if (to > from) {
+        out.set(value.subarray(from - chunkStart, to - chunkStart), from - start);
+        written += to - from;
+      }
+    }
+    reader.cancel().catch(() => {});
+    buf = written === wanted ? out : out.subarray(0, written);
+  } else {
+    buf = new Uint8Array(await res.arrayBuffer());
+  }
   // Parse Content-Range to learn total file size if we got a 206.
   let totalSize: number | null = null;
   const cr = res.headers.get('Content-Range');
@@ -82,9 +108,14 @@ async function rangeFetch(url: string, start: number, endInclusive: number): Pro
   return { bytes: buf, totalSize };
 }
 
-// Locate the moov box by walking top-level boxes. Returns the moov bytes
-// (a Uint8Array containing only the moov atom payload, header stripped).
-export async function fetchMoov(url: string): Promise<{ moov: Uint8Array; headerType: string }> {
+// Locate the moov box by walking top-level boxes. Returns the moov payload
+// (header stripped) along with the absolute byte offset and total size
+// (including header) of the moov atom in the source file — callers cache
+// `[moovOffset, moovOffset + moovSize)` to R2 so iOS's seek-to-moov request
+// can be served without a pCloud round-trip.
+export async function fetchMoov(
+  url: string,
+): Promise<{ moov: Uint8Array; headerType: string; moovOffset: number; moovSize: number }> {
   // Step 1: read prefix.
   const { bytes: prefix, totalSize } = await rangeFetch(url, 0, PREFIX_BYTES - 1);
   let view = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
@@ -96,7 +127,12 @@ export async function fetchMoov(url: string): Promise<{ moov: Uint8Array; header
     const box = readBox(view, viewStart, cursor);
     if (!box) break;
     if (box.type === 'moov') {
-      return { moov: await readBoxFully(url, prefix, box), headerType: 'moov' };
+      return {
+        moov: await readBoxFully(url, prefix, box),
+        headerType: 'moov',
+        moovOffset: box.start,
+        moovSize: box.size,
+      };
     }
     // Bail if mdat is too big to step over within the prefix; in that case the
     // moov is likely AFTER mdat — handle below.
@@ -111,7 +147,12 @@ export async function fetchMoov(url: string): Promise<{ moov: Uint8Array; header
         const hview = new DataView(hdr.buffer, hdr.byteOffset, hdr.byteLength);
         const next = readBox(hview, nextStart, nextStart);
         if (next?.type === 'moov') {
-          return { moov: await readBoxFully(url, hdr, next, nextStart), headerType: 'moov' };
+          return {
+            moov: await readBoxFully(url, hdr, next, nextStart),
+            headerType: 'moov',
+            moovOffset: next.start,
+            moovSize: next.size,
+          };
         }
         // Otherwise abandon this approach and try tail scan.
       }
@@ -140,13 +181,24 @@ export async function fetchMoov(url: string): Promise<{ moov: Uint8Array; header
       if (probe?.type !== 'moov') continue;
       // Validate plausibility: size between 0x100 and 0x4000000.
       if (probe.size < 0x100 || probe.size > 0x4000000) continue;
+      const moovOffset = viewStart + i;
       // If the moov fits within tail bytes, slice it; otherwise fetch.
       const localStart = i + probe.headerSize;
       const localEnd = i + probe.size;
       if (localEnd <= tail.length) {
-        return { moov: tail.slice(localStart, localEnd), headerType: 'moov' };
+        return {
+          moov: tail.slice(localStart, localEnd),
+          headerType: 'moov',
+          moovOffset,
+          moovSize: probe.size,
+        };
       }
-      return { moov: await readBoxFully(url, tail, probe, viewStart), headerType: 'moov' };
+      return {
+        moov: await readBoxFully(url, tail, probe, viewStart),
+        headerType: 'moov',
+        moovOffset,
+        moovSize: probe.size,
+      };
     }
   }
   throw new Error('moov atom not found');
@@ -433,10 +485,15 @@ export type ProbeResult = {
   // the file has no chpl (some m4b's use only a QT chapter track instead —
   // that's a future addition).
   chapters: Array<{ start: number; title: string }>;
+  // Absolute byte offset + total size (header + payload) of the moov atom
+  // in the source file. Used by the streaming route to cache moov bytes in
+  // R2 for fast iOS seek-to-moov responses.
+  moovOffset: number;
+  moovSize: number;
 };
 
 export async function probeM4b(url: string): Promise<ProbeResult> {
-  const { moov } = await fetchMoov(url);
+  const { moov, moovOffset, moovSize } = await fetchMoov(url);
 
   // mvhd → duration / timescale
   const mvhd = findChild(moov, 'mvhd');
@@ -509,5 +566,5 @@ export async function probeM4b(url: string): Promise<ProbeResult> {
     }
   }
 
-  return { durationSeconds, timeScale, tags, cover, chapters };
+  return { durationSeconds, timeScale, tags, cover, chapters, moovOffset, moovSize };
 }

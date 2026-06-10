@@ -189,7 +189,10 @@ async function probeM4bBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
   const author = probe.tags['©ART'] ?? null;
   const album = probe.tags['©alb'] ?? null;
   const narrator = probe.tags['©wrt'] ?? null;
-  const year = probe.tags['©day'] ? Number(probe.tags['©day']!.slice(0, 4)) : null;
+  // Guard non-numeric ©day (e.g. "Unknown"): NaN fails D1 bind and aborts
+  // the whole insert batch for the book.
+  const yearNum = probe.tags['©day'] ? Number(probe.tags['©day']!.slice(0, 4)) : NaN;
+  const year = Number.isFinite(yearNum) ? yearNum : null;
 
   const itemId = `it-${crypto.randomUUID().slice(0, 12)}`;
   const audioId = `af-${crypto.randomUUID().slice(0, 12)}`;
@@ -237,8 +240,8 @@ async function probeM4bBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
       `INSERT INTO audio_files
          (id, library_item_id, index_no, filedn_url, ino, duration_seconds, size_bytes,
           mime_type, format, codec, bitrate, sample_rate, channels, added_at,
-          rel_path, provider_file_id)
-       VALUES (?, ?, 1, ?, ?, ?, ?, 'audio/mp4', 'mp4', 'aac', NULL, NULL, NULL, ?, ?, ?)`,
+          rel_path, provider_file_id, moov_offset, moov_size)
+       VALUES (?, ?, 1, ?, ?, ?, ?, 'audio/mp4', 'mp4', 'aac', NULL, NULL, NULL, ?, ?, ?, ?, ?)`,
     ).bind(
       audioId, itemId, stableUrl, audioIno,
       totalDuration,
@@ -246,6 +249,8 @@ async function probeM4bBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
       now,
       file.relPath,
       file.providerId ?? null,
+      probe.moovOffset,
+      probe.moovSize,
     ),
 
     ...chapterInserts,
@@ -262,6 +267,27 @@ async function probeM4bBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
     } catch {
       // Non-fatal: the on-demand handler will probe again on first request.
     }
+  }
+
+  // Pre-warm the R2 moov cache. One extra Range fetch (~1-2s, scan-time, no
+  // user waiting) trades for a guaranteed R2 hit on the first /play of this
+  // book — which is what lets iOS Safari survive its seek-to-moov on
+  // non-fast-start files without the cancel-retry stall loop.
+  try {
+    const last = probe.moovOffset + probe.moovSize - 1;
+    const moovRes = await fetch(probeUrl.url, {
+      headers: { Range: `bytes=${probe.moovOffset}-${last}` },
+    });
+    if (moovRes.status === 206 || moovRes.status === 200) {
+      const moovBytes = new Uint8Array(await moovRes.arrayBuffer());
+      if (moovBytes.byteLength === probe.moovSize) {
+        await env.COVERS.put(`moov/${audioId}`, moovBytes, {
+          httpMetadata: { contentType: 'application/octet-stream' },
+        });
+      }
+    }
+  } catch {
+    // Non-fatal: warmMoovCache will lazy-populate on first /play.
   }
 
   invalidateIdMap();
@@ -452,6 +478,11 @@ export async function reprobeItem(env: Env, itemId: string): Promise<{
       'UPDATE audio_files SET duration_seconds = ? WHERE id = ?',
     ).bind(probe.durationSeconds, audio.id));
   }
+  // Always refresh moov_offset/moov_size — they may have been NULL pre-0003,
+  // and the file may have been re-muxed since the original scan.
+  stmts.push(env.DB.prepare(
+    'UPDATE audio_files SET moov_offset = ?, moov_size = ? WHERE id = ?',
+  ).bind(probe.moovOffset, probe.moovSize, audio.id));
   await env.DB.batch(stmts);
 
   let coverRefreshed = false;
@@ -463,6 +494,23 @@ export async function reprobeItem(env: Env, itemId: string): Promise<{
       coverRefreshed = true;
     } catch { /* non-fatal */ }
   }
+
+  // Refresh the R2 moov cache — same rationale as in probeM4bBook, plus the
+  // file may have been re-muxed (different moov offset/size).
+  try {
+    const last = probe.moovOffset + probe.moovSize - 1;
+    const moovRes = await fetch(probeUrl.url, {
+      headers: { Range: `bytes=${probe.moovOffset}-${last}` },
+    });
+    if (moovRes.status === 206 || moovRes.status === 200) {
+      const moovBytes = new Uint8Array(await moovRes.arrayBuffer());
+      if (moovBytes.byteLength === probe.moovSize) {
+        await env.COVERS.put(`moov/${audio.id}`, moovBytes, {
+          httpMetadata: { contentType: 'application/octet-stream' },
+        });
+      }
+    }
+  } catch { /* non-fatal */ }
 
   return {
     itemId,

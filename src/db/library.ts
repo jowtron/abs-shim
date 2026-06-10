@@ -79,6 +79,11 @@ export type AudioFileRow = {
   // filedn_url instead) — see src/storage/resolve.ts.
   rel_path?: string | null;
   provider_file_id?: string | null;
+  // Added in migration 0003. Absolute byte offset + total size of the m4b's
+  // moov atom in the source file. NULL for rows scanned before 0003 (or for
+  // non-m4b files); the streaming route backfills on first /play.
+  moov_offset?: number | null;
+  moov_size?: number | null;
 };
 
 export type ChapterRow = {
@@ -162,4 +167,48 @@ export async function listAllBookMetadata(env: Env, libraryId: string): Promise<
      WHERE li.library_id = ?`,
   ).bind(libraryId).all<BookMetadataRow>();
   return r.results;
+}
+
+// Slim resolver for the /file/:fileId streaming route. Loads only the
+// audio_files row and the library_folders row we need to stream — skips the
+// book_metadata + chapters + libraryitem-shape work that buildItemBundle does
+// (which the streaming path never reads). Two D1 round-trips instead of five,
+// plus matches the existing fileId lookup semantics (try `ino` first, then
+// `index_no`, fall back to the first audio file for unknown identifiers).
+export async function getStreamingTarget(
+  env: Env,
+  itemId: string,
+  fileId: string,
+): Promise<{ audio: AudioFileRow; folder: LibraryFolderRow } | null> {
+  const item = await env.DB.prepare(
+    'SELECT folder_id FROM library_items WHERE id = ? LIMIT 1',
+  ).bind(itemId).first<{ folder_id: string }>();
+  if (!item) return null;
+
+  const numericFid = Number(fileId);
+  const numericLookup = Number.isFinite(numericFid) ? numericFid : -1;
+
+  // Lookup audio file (by ino preferred, then index_no) and folder in parallel.
+  let [audio, folder] = await Promise.all([
+    env.DB.prepare(
+      `SELECT * FROM audio_files
+       WHERE library_item_id = ? AND (ino = ? OR index_no = ?)
+       ORDER BY (ino = ?) DESC LIMIT 1`,
+    ).bind(itemId, fileId, numericLookup, fileId).first<AudioFileRow>(),
+    env.DB.prepare(
+      'SELECT * FROM library_folders WHERE id = ? LIMIT 1',
+    ).bind(item.folder_id).first<LibraryFolderRow>(),
+  ]);
+
+  // Preserve the existing route's "fall back to first audio file" behavior for
+  // clients that pass an unknown ino/index_no — costs one extra query, only on
+  // miss, which should be effectively never in practice.
+  if (!audio) {
+    audio = await env.DB.prepare(
+      'SELECT * FROM audio_files WHERE library_item_id = ? ORDER BY index_no ASC LIMIT 1',
+    ).bind(itemId).first<AudioFileRow>();
+  }
+
+  if (!audio || !folder) return null;
+  return { audio, folder };
 }

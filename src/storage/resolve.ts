@@ -72,7 +72,7 @@ export async function streamAudio(
   return Response.redirect(stream.url, 302);
 }
 
-function audioContentType(audio: AudioFileRow): string {
+export function audioContentType(audio: AudioFileRow): string {
   if (audio.mime_type && audio.mime_type !== 'application/octet-stream') {
     return audio.mime_type;
   }

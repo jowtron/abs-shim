@@ -51,6 +51,32 @@ type PcloudListFolder = PcloudApiResult & {
   metadata?: PcloudFolderEntry;
 };
 
+// Module-scope cache of resolved pCloud streaming URLs. Persists across
+// requests within a Worker isolate's lifetime (which is "many seconds, often
+// minutes" under steady traffic; aggressively evicted under idle).
+//
+// Why this is safe wrt pCloud's IP-binding: getfilelink URLs are bound to the
+// IP that *called* getfilelink — which is this Worker's egress IP. The cached
+// URL is fetched again by the same Worker, so the egress IP matches. Cache
+// scope is naturally per-isolate, which is per-POP, so we won't accidentally
+// reuse a URL across a different egress IP boundary.
+//
+// Why we keep the access token out of the key: cache keys live in memory only
+// and are never logged, but using the first 12 chars (enough to disambiguate
+// accounts in any realistic scenario) means the full token never appears as a
+// Map key. apiHost is included because EU/US pCloud accounts can have
+// overlapping fileids.
+type CachedStreamUrl = { url: string; expiresAt: number };
+const streamUrlCache = new Map<string, CachedStreamUrl>();
+// Safety margin under the pCloud `expires` timestamp. If pCloud says the URL
+// is valid until T, treat it as valid until T-60s — covers clock skew and the
+// occasional 6h-window race.
+const CACHE_SAFETY_MARGIN_MS = 60_000;
+
+function streamCacheKey(profile: PcloudProfile, fileIdentity: string): string {
+  return `${profile.apiHost}|${profile.accessToken.slice(0, 12)}|${fileIdentity}`;
+}
+
 export class PcloudOAuthAdapter implements StorageAdapter {
   readonly provider = 'pcloud_oauth';
 
@@ -60,6 +86,15 @@ export class PcloudOAuthAdapter implements StorageAdapter {
   ) {}
 
   async resolveUrl(relPath: string, providerFileId?: string | null): Promise<ResolvedUrl> {
+    const fileIdentity = providerFileId ?? this.absolutePath(relPath);
+    const key = streamCacheKey(this.profile, fileIdentity);
+    const now = Date.now();
+
+    const cached = streamUrlCache.get(key);
+    if (cached && cached.expiresAt > now + CACHE_SAFETY_MARGIN_MS) {
+      return cached;
+    }
+
     // Prefer fileid when we already know it (set by the scanner) — saves a
     // path lookup roundtrip per request. Fall back to path lookup otherwise.
     const params = new URLSearchParams();
@@ -79,8 +114,10 @@ export class PcloudOAuthAdapter implements StorageAdapter {
     }
     const url = `https://${data.hosts[0]}${data.path}`;
     // pCloud `expires` is RFC 2822; if missing, conservatively assume 1h.
-    const expiresAt = data.expires ? Date.parse(data.expires) : Date.now() + 60 * 60_000;
-    return { url, expiresAt };
+    const expiresAt = data.expires ? Date.parse(data.expires) : now + 60 * 60_000;
+    const entry: CachedStreamUrl = { url, expiresAt };
+    streamUrlCache.set(key, entry);
+    return entry;
   }
 
   resolveProbeUrl(relPath: string, providerFileId?: string | null): Promise<ResolvedUrl> {

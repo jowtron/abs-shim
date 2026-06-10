@@ -20,10 +20,11 @@ export type AccessClaims = {
 };
 
 function jwtSecret(env: Env): string {
-  // Dev fallback so `wrangler dev` works without a configured secret. In
-  // production we error if it's unset — never silently fall back.
+  // Never silently fall back to a guessable secret — anyone reading this
+  // repo could forge tokens for any user. `wrangler dev` reads JWT_SECRET
+  // from .dev.vars; set one there for local work.
   if (env.JWT_SECRET) return env.JWT_SECRET;
-  return 'dev-only-jwt-secret-change-me';
+  throw new Error('JWT_SECRET is not configured (wrangler secret put JWT_SECRET, or .dev.vars for local dev)');
 }
 
 export async function issueAccessToken(

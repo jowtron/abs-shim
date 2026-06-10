@@ -149,7 +149,7 @@ npx wrangler secret put PCLOUD_CLIENT_SECRET</pre>
     <div id="libraries-body" class="muted">Loading…</div>
   </div>
 
-  <div class="card">
+  <div id="cover-cache-card" class="card">
     <h2>Cover cache</h2>
     <p class="muted">Covers are probed from the m4b on first request and stored in R2 so subsequent loads (from any CF POP) are fast. Click below to pre-fetch every library item's cover now.</p>
     <div class="row">
@@ -185,12 +185,14 @@ function showLoginForm() {
   document.getElementById('login-card').style.display = 'block';
   document.getElementById('connections-card').style.display = 'none';
   document.getElementById('libraries-card').style.display = 'none';
+  document.getElementById('cover-cache-card').style.display = 'none';
 }
 
 function hideLoginForm() {
   document.getElementById('login-card').style.display = 'none';
   document.getElementById('connections-card').style.display = '';
   document.getElementById('libraries-card').style.display = '';
+  document.getElementById('cover-cache-card').style.display = '';
 }
 
 document.getElementById('warm-covers').addEventListener('click', async (e) => {

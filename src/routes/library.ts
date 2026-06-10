@@ -38,11 +38,15 @@ libraryRoutes.get('/:id', async (c) => {
 });
 
 libraryRoutes.get('/:id/personalized', async (c) => {
+  const t0 = Date.now();
   const id = c.req.param('id');
   const row = await getLibrary(c.env, id);
   if (!row) return c.json({ error: 'Library not found' }, 404);
+  const t1 = Date.now();
 
   const items = await listItemsByLibrary(c.env, id);
+  const t2 = Date.now();
+
   const bundles = (await Promise.all(items.map(async (item) => {
     const folder = await getFolderById(c.env, item.folder_id);
     if (!folder) return null;
@@ -53,8 +57,13 @@ libraryRoutes.get('/:id/personalized', async (c) => {
     ]);
     return { item, folder, metadata, audioFiles, chapters };
   }))).filter((b): b is NonNullable<typeof b> => b !== null);
+  const t3 = Date.now();
 
-  return c.json(await buildPersonalizedShelves({ libraryId: id, bundles }));
+  const shelves = await buildPersonalizedShelves({ libraryId: id, bundles });
+  const t4 = Date.now();
+
+  console.log(`[perf] /personalized lib=${id} items=${items.length} | getLibrary=${t1 - t0}ms listItems=${t2 - t1}ms bundles(N+1)=${t3 - t2}ms shelves=${t4 - t3}ms total=${t4 - t0}ms`);
+  return c.json(shelves);
 });
 
 libraryRoutes.get('/:id/items', async (c) => {
@@ -147,10 +156,12 @@ libraryRoutes.get('/:id/authors', async (c) => {
 // `results[].books[].id` to render each book card, so we MUST include the
 // books with at least an id + minified media metadata.
 libraryRoutes.get('/:id/series', async (c) => {
+  const t0 = Date.now();
   const id = c.req.param('id');
   if (!(await getLibrary(c.env, id))) return c.json({ error: 'Library not found' }, 404);
 
   const items = await listItemsByLibrary(c.env, id);
+  const t1 = Date.now();
   const bundles = (await Promise.all(items.map(async (item) => {
     const folder = await getFolderById(c.env, item.folder_id);
     if (!folder) return null;
@@ -161,6 +172,7 @@ libraryRoutes.get('/:id/series', async (c) => {
     ]);
     return { item, folder, metadata, audioFiles, chapters };
   }))).filter((b): b is NonNullable<typeof b> => b !== null);
+  const t2 = Date.now();
 
   // Group by series_name. A book with no series is excluded entirely.
   const groups = new Map<string, typeof bundles>();
@@ -216,7 +228,9 @@ libraryRoutes.get('/:id/series', async (c) => {
   const page = Number(c.req.query('page') ?? '0');
   const offset = limit > 0 ? page * limit : 0;
   const results = limit > 0 ? seriesArr.slice(offset, offset + limit) : seriesArr;
+  const t3 = Date.now();
 
+  console.log(`[perf] /series lib=${id} items=${items.length} series=${seriesArr.length} | listItems=${t1 - t0}ms bundles(N+1)=${t2 - t1}ms group+build=${t3 - t2}ms total=${t3 - t0}ms`);
   return c.json({
     results,
     total: seriesArr.length,

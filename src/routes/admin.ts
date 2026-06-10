@@ -89,7 +89,10 @@ adminRoutes.get('/storage/status', async (c) => {
       libraryName: f.library_name,
       provider: f.provider,
       profileId: f.profile_id,
-      config: safeJson(f.config_json),
+      // Redact stored credentials — the admin UI only displays config, it
+      // never needs to read secrets back, so don't round-trip them through
+      // every admin session.
+      config: redactSecrets(safeJson(f.config_json)),
       legacyBaseUrl: f.filedn_base_url,
     })),
     profiles: profiles.results,
@@ -681,4 +684,15 @@ function redirectUriFor(currentUrl: string): string {
 
 function safeJson(s: string): unknown {
   try { return JSON.parse(s); } catch { return {}; }
+}
+
+// Strip credential fields before sending folder config to the admin UI.
+const SECRET_CONFIG_KEYS = new Set(['secretAccessKey', 'password']);
+function redactSecrets(config: unknown): unknown {
+  if (!config || typeof config !== 'object') return config;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(config as Record<string, unknown>)) {
+    out[k] = SECRET_CONFIG_KEYS.has(k) ? '••••••' : v;
+  }
+  return out;
 }

@@ -60,7 +60,7 @@ Migrations in `migrations/`. Initial schema (0001) plus storage additions (0002)
 - Deployed to a Cloudflare Worker (URL configured in `wrangler.toml`).
 - D1 `abs-shim-db` seeded via `npm run db:seed:local`. Real folders are added at runtime through the `/admin` UI rather than committed to the seed file.
 - Storage: pluggable via StorageAdapter (filedn-public, pCloud OAuth, S3-compat, WebDAV). Multiple backends per library are supported.
-- Required wrangler secrets: `JWT_SECRET` (mandatory). Optional: `PCLOUD_CLIENT_ID`, `PCLOUD_CLIENT_SECRET` (only if using pCloud OAuth). S3 and WebDAV credentials are entered via the `/admin` UI and stored encrypted in D1.
+- Required wrangler secrets: `JWT_SECRET` (mandatory). Optional: `PCLOUD_CLIENT_ID`, `PCLOUD_CLIENT_SECRET` (only if using pCloud OAuth). S3 and WebDAV credentials are entered via the `/admin` UI and stored as plaintext JSON in D1 (`library_folders.config_json`); the `/api/admin/storage/status` response redacts them.
 - Bootstrap: hit `/init` once to create the root user. Verified working clients: bundled ABS web UI, Pholia, ShelfPlayer.
 
 ## Conventions
