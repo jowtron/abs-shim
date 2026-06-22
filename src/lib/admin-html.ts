@@ -16,7 +16,22 @@ export const ADMIN_HTML = String.raw`<!doctype html>
 <head>
   <meta charset="utf-8" />
   <title>ABS_shim · admin</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <!-- Installable as a home-screen web app from both /account and /admin (they
+       serve this same HTML). iOS uses apple-touch-icon + the apple-* metas;
+       Android/Chrome use the linked manifest. Icon files live in web/. -->
+  <link rel="icon" href="/favicon.ico" sizes="any" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="/icon-16.png" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="ABS Shim" />
+  <meta name="application-name" content="ABS Shim" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fafafa" />
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0f0f10" />
   <style>
     :root {
       color-scheme: light dark;
@@ -79,7 +94,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     Storage backends + library scans.
     <a href="/audiobookshelf" style="color: var(--accent)">Open ABS web UI</a>
     &nbsp;·&nbsp;
-    <a href="https://pholia.jderrick.app" target="_blank" rel="noopener" style="color: var(--accent)">Open Pholia ↗</a>
+    <a id="open-pholia" href="https://pholia.jderrick.app" target="_blank" rel="noopener" style="color: var(--accent)">Open Pholia ↗</a>
   </p>
 
   <div id="error-banner" class="card" style="display:none; border-color: var(--warn); color: var(--warn)"></div>
@@ -231,6 +246,40 @@ function hideLoginForm() {
 document.getElementById('signout').addEventListener('click', async () => {
   try { await fetch('/logout', { method: 'POST', credentials: 'include' }); } catch (e) {}
   showLoginForm();
+});
+
+// "Open Pholia" — hand the signed-in member straight into Pholia. The shim's
+// access token IS the ABS JWT Pholia authenticates with (Pholia talks to this
+// shim as its ABS server), so we mint a fresh one via /api/authorize and pass
+// it to Pholia in the URL *fragment* — fragments aren't sent to servers or
+// included in the Referer header, and Pholia strips it from the address bar on
+// arrival. The anchor's plain href stays as a no-JS / not-signed-in fallback.
+const PHOLIA_URL = 'https://pholia.jderrick.app';
+function b64url(obj) {
+  // UTF-8-safe base64url (usernames may be non-ASCII).
+  return btoa(unescape(encodeURIComponent(JSON.stringify(obj))))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+document.getElementById('open-pholia').addEventListener('click', (e) => {
+  e.preventDefault();
+  // Open the tab synchronously inside the click gesture so Safari doesn't treat
+  // the post-await navigation as a blocked popup.
+  const win = window.open('', '_blank');
+  fetch('/api/authorize', { method: 'POST', credentials: 'include' })
+    .then((res) => { if (!res.ok) throw new Error('not signed in'); return res.json(); })
+    .then((data) => {
+      const token = data && data.user && (data.user.accessToken || data.user.token);
+      if (!token) throw new Error('no token in authorize response');
+      const username = (data.user && data.user.username) || '';
+      const payload = b64url({ s: location.origin, u: username, t: token });
+      const target = PHOLIA_URL + '/#connect=' + payload;
+      if (win) win.location = target; else location.href = target;
+    })
+    .catch(() => {
+      // Couldn't mint a token (e.g. cookie expired) — fall back to plain Pholia
+      // and let the user sign in there manually.
+      if (win) win.location = PHOLIA_URL; else location.href = PHOLIA_URL;
+    });
 });
 
 document.getElementById('warm-covers').addEventListener('click', async (e) => {
