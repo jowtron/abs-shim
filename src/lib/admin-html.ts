@@ -202,6 +202,12 @@ npx wrangler secret put PCLOUD_CLIENT_SECRET</pre>
     <div id="pending-body" class="muted">Loading…</div>
   </div>
 
+  <div id="all-users-card" class="card" style="display:none">
+    <h2>All users</h2>
+    <p class="muted">Every account across all libraries (instance owner only). Each approved signup gets its own isolated library; "Servers" are the storage backends attached to that library. Lock an account to block its sign-in without deleting anything.</p>
+    <div id="all-users-body" class="muted">Loading…</div>
+  </div>
+
   <div id="scan-card" class="card" style="display:none">
     <h2>Last scan</h2>
     <pre id="scan-output"></pre>
@@ -231,6 +237,7 @@ function showLoginForm() {
   document.getElementById('libraries-card').style.display = 'none';
   document.getElementById('cover-cache-card').style.display = 'none';
   document.getElementById('members-card').style.display = 'none';
+  document.getElementById('all-users-card').style.display = 'none';
   document.getElementById('household-card').style.display = 'none';
   document.getElementById('signout').style.display = 'none';
 }
@@ -513,8 +520,10 @@ function renderHousehold(status) {
 
 function renderMembers(status) {
   const card = document.getElementById('members-card');
-  if (!status.isInstanceOwner) { card.style.display = 'none'; return; }
+  const usersCard = document.getElementById('all-users-card');
+  if (!status.isInstanceOwner) { card.style.display = 'none'; usersCard.style.display = 'none'; return; }
   card.style.display = '';
+  usersCard.style.display = '';
 
   // Signup mode selector.
   const sel = document.getElementById('signup-mode');
@@ -540,6 +549,7 @@ function renderMembers(status) {
   }
 
   loadPending();
+  loadAllUsers();
 }
 
 async function loadPending() {
@@ -597,6 +607,68 @@ async function loadPending() {
       }
     });
   });
+}
+
+// Instance-wide roster: every account across all libraries, with the library
+// (tenant) it belongs to and the storage backends ("servers") attached there.
+// Lock/unlock is a reversible sign-in block — see /api/admin/users/:id/lock.
+async function loadAllUsers() {
+  const body = document.getElementById('all-users-body');
+  let data;
+  try {
+    data = await api('/api/admin/users');
+  } catch (e) {
+    if (e instanceof UnauthorizedError) return;
+    body.innerHTML = '<p class="warn">Failed to load users: ' + escapeHtml(e.message) + '</p>';
+    return;
+  }
+  const users = data.users || [];
+  if (!users.length) { body.innerHTML = '<p class="muted">No users yet.</p>'; return; }
+
+  let html = '<table><thead><tr><th>User</th><th>Library</th><th>Servers</th><th>Books</th><th>Status</th><th></th></tr></thead><tbody>';
+  for (const u of users) {
+    const you = u.id === data.selfId ? ' <span class="muted">(you)</span>' : '';
+    const typeBadge = (u.type === 'root' || u.type === 'admin') ? ' <span class="muted">[' + escapeHtml(u.type) + ']</span>' : '';
+    const email = u.email ? '<br><span class="muted" style="font-size:0.8rem">' + escapeHtml(u.email) + '</span>' : '';
+    const lastSeen = u.lastSeen ? '<br><span class="muted" style="font-size:0.78rem">seen ' + new Date(u.lastSeen).toLocaleDateString() + '</span>' : '';
+    const role = u.role ? ' <span class="muted">· ' + escapeHtml(u.role) + '</span>' : '';
+    const lib = u.tenantName ? escapeHtml(u.tenantName) + role : '<span class="muted">none</span>';
+    const servers = (u.servers && u.servers.length)
+      ? u.servers.map((s) => escapeHtml(s.label)).join('<br>')
+      : '<span class="muted">—</span>';
+    let status;
+    if (u.isLocked) status = '<span class="warn">Locked</span>';
+    else if (u.signupStatus === 'pending') status = '<span class="warn">Pending</span>';
+    else status = '<span class="ok">Active</span>';
+
+    html += '<tr>';
+    html += '<td>' + escapeHtml(u.username) + you + typeBadge + email + lastSeen + '</td>';
+    html += '<td>' + lib + '</td>';
+    html += '<td style="font-size:0.85rem">' + servers + '</td>';
+    html += '<td>' + (u.bookCount || 0) + '</td>';
+    html += '<td>' + status + '</td>';
+    html += '<td style="white-space:nowrap">';
+    if (u.id !== data.selfId) {
+      if (u.isLocked) {
+        html += '<button class="secondary" data-unlock="' + escapeHtml(u.id) + '" style="font-size:0.78rem;padding:0.2rem 0.55rem">Unlock</button>';
+      } else {
+        html += '<button class="danger" data-lock="' + escapeHtml(u.id) + '" style="font-size:0.78rem;padding:0.2rem 0.55rem">Lock</button>';
+      }
+    }
+    html += '</td></tr>';
+  }
+  html += '</tbody></table>';
+  body.innerHTML = html;
+
+  body.querySelectorAll('[data-lock]').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!confirm('Lock this account? They will be unable to sign in or stream until you unlock them. No data is deleted.')) return;
+    try { await api('/api/admin/users/' + btn.dataset.lock + '/lock', { method: 'POST' }); loadAllUsers(); }
+    catch (e) { if (!(e instanceof UnauthorizedError)) showError('Lock failed: ' + e.message); }
+  }));
+  body.querySelectorAll('[data-unlock]').forEach((btn) => btn.addEventListener('click', async () => {
+    try { await api('/api/admin/users/' + btn.dataset.unlock + '/unlock', { method: 'POST' }); loadAllUsers(); }
+    catch (e) { if (!(e instanceof UnauthorizedError)) showError('Unlock failed: ' + e.message); }
+  }));
 }
 
 function renderLibraries(status, libraries) {

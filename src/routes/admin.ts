@@ -822,7 +822,126 @@ adminRoutes.post('/signup/mode', requireInstanceOwner, async (c) => {
   return c.json({ mode: body.mode });
 });
 
+// ─── All users (instance-wide roster) ────────────────────────────────────────
+//
+// The gap-filler for the instance owner. "Library members" only shows your OWN
+// tenant; "Members & signups" only shows PENDING requests — so an already-
+// approved user, living in their own isolated library, is invisible everywhere
+// else. This lists EVERY account (active, pending, or locked) with the library
+// (tenant) it belongs to and the storage backends ("servers") attached to that
+// library. Read-only apart from lock/unlock — a reversible disable: requireAuth
+// rejects is_locked = 1, so a locked user can't log in or stream, but no data
+// is deleted.
+
+type AllUsersRow = {
+  id: string; username: string; email: string | null; type: string;
+  is_active: number; is_locked: number; signup_status: string;
+  created_at: number; last_seen: number | null;
+  tenant_id: string | null; role: string | null; tenant_name: string | null;
+};
+
+adminRoutes.get('/users', requireInstanceOwner, async (c) => {
+  // One row per user via the default membership (is_default = 1) so a user in
+  // more than one tenant doesn't fan out into duplicate rows.
+  const users = await c.env.DB.prepare(
+    `SELECT u.id, u.username, u.email, u.type, u.is_active, u.is_locked,
+            u.signup_status, u.created_at, u.last_seen,
+            tm.tenant_id, tm.role, t.name AS tenant_name
+       FROM users u
+       LEFT JOIN tenant_members tm ON tm.user_id = u.id AND tm.is_default = 1
+       LEFT JOIN tenants t ON t.id = tm.tenant_id
+      ORDER BY u.created_at ASC`,
+  ).all<AllUsersRow>();
+
+  // Storage backends + book counts for every tenant, fetched once and grouped.
+  const folders = await c.env.DB.prepare(
+    `SELECT lf.tenant_id, lf.provider, lf.config_json, lf.filedn_base_url,
+            op.account_label AS profile_label
+       FROM library_folders lf
+       LEFT JOIN oauth_profiles op ON op.id = lf.profile_id`,
+  ).all<{ tenant_id: string; provider: string; config_json: string; filedn_base_url: string | null; profile_label: string | null }>();
+
+  const books = await c.env.DB.prepare(
+    `SELECT tenant_id, SUM(CASE WHEN is_missing = 0 THEN 1 ELSE 0 END) AS book_count
+       FROM library_items GROUP BY tenant_id`,
+  ).all<{ tenant_id: string; book_count: number }>();
+
+  const serversByTenant: Record<string, { provider: string; label: string }[]> = {};
+  for (const f of folders.results) {
+    const arr = serversByTenant[f.tenant_id] ?? (serversByTenant[f.tenant_id] = []);
+    arr.push({
+      provider: f.provider,
+      label: describeBackend(f.provider, safeJson(f.config_json), f.filedn_base_url, f.profile_label),
+    });
+  }
+  const bookByTenant: Record<string, number> = {};
+  for (const b of books.results) bookByTenant[b.tenant_id] = b.book_count ?? 0;
+
+  return c.json({
+    selfId: c.get('userId'),
+    users: users.results.map((u) => ({
+      id: u.id,
+      username: u.username,
+      email: u.email,
+      type: u.type,
+      isActive: u.is_active === 1,
+      isLocked: u.is_locked === 1,
+      signupStatus: u.signup_status,
+      createdAt: u.created_at,
+      lastSeen: u.last_seen,
+      tenantId: u.tenant_id,
+      tenantName: u.tenant_name,
+      role: u.role,
+      servers: u.tenant_id ? (serversByTenant[u.tenant_id] ?? []) : [],
+      bookCount: u.tenant_id ? (bookByTenant[u.tenant_id] ?? 0) : 0,
+    })),
+  });
+});
+
+// Lock / unlock an account (instance owner only). Locking is the reversible
+// "disable" — requireAuth bounces is_locked = 1 on the next request. You can't
+// lock yourself: that'd be a one-way foot-gun on the only root account.
+adminRoutes.post('/users/:id/lock', requireInstanceOwner, async (c) => {
+  const userId = c.req.param('id');
+  if (userId === c.get('userId')) return c.json({ error: 'You cannot lock your own account' }, 400);
+  const u = await c.env.DB.prepare('SELECT id FROM users WHERE id = ?').bind(userId).first<{ id: string }>();
+  if (!u) return c.json({ error: 'User not found' }, 404);
+  await c.env.DB.prepare('UPDATE users SET is_locked = 1 WHERE id = ?').bind(userId).run();
+  return c.json({ ok: true, isLocked: true });
+});
+
+adminRoutes.post('/users/:id/unlock', requireInstanceOwner, async (c) => {
+  const userId = c.req.param('id');
+  const u = await c.env.DB.prepare('SELECT id FROM users WHERE id = ?').bind(userId).first<{ id: string }>();
+  if (!u) return c.json({ error: 'User not found' }, 404);
+  await c.env.DB.prepare('UPDATE users SET is_locked = 0 WHERE id = ?').bind(userId).run();
+  return c.json({ ok: true, isLocked: false });
+});
+
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+// Short, secret-free label for a storage backend ("server") a tenant attached.
+// Only ever reads non-secret config (endpoint/bucket/baseUrl/host), so the
+// all-users roster never ships credentials just to render a row.
+function describeBackend(
+  provider: string,
+  config: unknown,
+  filednBaseUrl: string | null,
+  profileLabel: string | null,
+): string {
+  const cfg = (config && typeof config === 'object') ? config as Record<string, unknown> : {};
+  const host = (v: unknown): string => { try { return new URL(String(v)).host; } catch { return String(v ?? ''); } };
+  switch (provider) {
+    case 'public_url': {
+      const base = filednBaseUrl || cfg.baseUrl;
+      return base ? 'Public URL · ' + host(base) : 'Public URL';
+    }
+    case 'pcloud_oauth': return profileLabel ? 'pCloud · ' + profileLabel : 'pCloud';
+    case 's3': return 'S3 · ' + host(cfg.endpoint) + (cfg.bucket ? '/' + String(cfg.bucket) : '');
+    case 'webdav': return 'WebDAV · ' + host(cfg.baseUrl);
+    default: return provider;
+  }
+}
 
 type FolderWithLibName = {
   id: string;
