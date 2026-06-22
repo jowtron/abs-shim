@@ -50,7 +50,7 @@ export async function warmMoovCache(env: Env, folder: LibraryFolderRow, audio: A
     if (audio.moov_offset == null || audio.moov_size == null) return;
 
     // Skip the upstream fetch if R2 already has it.
-    const existing = await env.COVERS.head(`moov/${audio.id}`);
+    const existing = await env.COVERS.head(`moov/${audio.tenant_id}/${audio.id}`);
     if (existing && existing.size === audio.moov_size) return;
 
     const streamUrl = await resolveStreamUrl(env, folder, audio);
@@ -65,7 +65,7 @@ export async function warmMoovCache(env: Env, folder: LibraryFolderRow, audio: A
     const bytes = new Uint8Array(await upstream.arrayBuffer());
     if (bytes.byteLength !== audio.moov_size) return; // safety: don't cache a partial read
 
-    await env.COVERS.put(`moov/${audio.id}`, bytes, {
+    await env.COVERS.put(`moov/${audio.tenant_id}/${audio.id}`, bytes, {
       httpMetadata: { contentType: 'application/octet-stream' },
     });
   } catch {
@@ -116,7 +116,7 @@ export async function tryServeMoovRange(
   const responseEnd = Math.min(range.end, moovEnd);
   const sliceLen = responseEnd - range.start + 1;
 
-  const r2 = await env.COVERS.get(`moov/${audio.id}`, {
+  const r2 = await env.COVERS.get(`moov/${audio.tenant_id}/${audio.id}`, {
     range: { offset: sliceOffsetInR2, length: sliceLen },
   });
   if (!r2) return null;

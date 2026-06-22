@@ -1,7 +1,8 @@
 name = "abs-shim"
 main = "src/index.ts"
 compatibility_date = "2026-04-15"
-account_id = "a4b6a5d5b72da9f080658c867a189b18"
+account_id = "41a62277421a452c6499884fd17b3c8d"
+routes = [{ pattern = "abs-shim.jderrick.app", custom_domain = true }]
 
 # Pure-JS only on Worker side — no nodejs_compat shims.
 
@@ -19,7 +20,7 @@ enabled = true
 binding = "DB"
 database_name = "abs-shim-db"
 # database_id is filled in by `npm run db:create` (only required for remote deploys)
-database_id = "b8f5afec-443c-4e67-bff2-3b8995c16ce6"
+database_id = "7a45b32b-8839-42a1-b331-3509e86a3f4a"
 migrations_dir = "migrations"
 
 # Persistent cover cache. The cover endpoint probes the m4b's moov atom
@@ -33,9 +34,17 @@ bucket_name = "abs-shim-covers"
 name = "SESSION"
 class_name = "ListeningSessionDO"
 
+[[durable_objects.bindings]]
+name = "SIGNUP_LIMITER"
+class_name = "SignupRateLimitDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ListeningSessionDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["SignupRateLimitDO"]
 
 # Serve the official ABS web client (Nuxt static build extracted from the
 # advplyr/audiobookshelf docker image) for any path the Worker doesn't claim.

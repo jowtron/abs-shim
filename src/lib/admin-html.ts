@@ -71,12 +71,15 @@ export const ADMIN_HTML = String.raw`<!doctype html>
   </style>
 </head>
 <body>
-  <h1>ABS_shim · admin</h1>
+  <div class="row" style="justify-content: space-between; align-items: flex-start">
+    <h1>ABS_shim · admin</h1>
+    <button id="signout" class="secondary" style="display:none">Sign out</button>
+  </div>
   <p class="muted">
     Storage backends + library scans.
-    <a href="/" style="color: var(--accent)">Open ABS web UI</a>
+    <a href="/audiobookshelf" style="color: var(--accent)">Open ABS web UI</a>
     &nbsp;·&nbsp;
-    <a href="https://pholia.pages.dev" target="_blank" rel="noopener" style="color: var(--accent)">Open Pholia ↗</a>
+    <a href="https://pholia.jderrick.app" target="_blank" rel="noopener" style="color: var(--accent)">Open Pholia ↗</a>
   </p>
 
   <div id="error-banner" class="card" style="display:none; border-color: var(--warn); color: var(--warn)"></div>
@@ -158,6 +161,32 @@ npx wrangler secret put PCLOUD_CLIENT_SECRET</pre>
     </div>
   </div>
 
+  <div id="household-card" class="card" style="display:none">
+    <h2>Library members</h2>
+    <p class="muted">Everyone here shares the same libraries but keeps their own progress, bookmarks, and finished books.</p>
+    <div id="members-body" class="muted">Loading…</div>
+    <div id="invite-actions" class="row" style="margin-top:1rem; display:none">
+      <button id="create-invite" class="secondary">Invite someone…</button>
+      <span id="invite-status" class="muted"></span>
+    </div>
+    <div id="invites-body"></div>
+  </div>
+
+  <div id="members-card" class="card" style="display:none">
+    <h2>Members &amp; signups</h2>
+    <p class="muted">Instance owner only. Approve people who requested an account; each approval gets its own isolated library.</p>
+    <div class="row" style="margin: 0.75rem 0">
+      <label for="signup-mode" style="font-size:0.9rem">New signups:</label>
+      <select id="signup-mode">
+        <option value="approval">Open (require approval)</option>
+        <option value="closed">Closed</option>
+      </select>
+      <span id="signup-mode-status" class="muted"></span>
+    </div>
+    <h2 style="font-size:1rem">Pending approvals</h2>
+    <div id="pending-body" class="muted">Loading…</div>
+  </div>
+
   <div id="scan-card" class="card" style="display:none">
     <h2>Last scan</h2>
     <pre id="scan-output"></pre>
@@ -186,6 +215,9 @@ function showLoginForm() {
   document.getElementById('connections-card').style.display = 'none';
   document.getElementById('libraries-card').style.display = 'none';
   document.getElementById('cover-cache-card').style.display = 'none';
+  document.getElementById('members-card').style.display = 'none';
+  document.getElementById('household-card').style.display = 'none';
+  document.getElementById('signout').style.display = 'none';
 }
 
 function hideLoginForm() {
@@ -193,7 +225,13 @@ function hideLoginForm() {
   document.getElementById('connections-card').style.display = '';
   document.getElementById('libraries-card').style.display = '';
   document.getElementById('cover-cache-card').style.display = '';
+  document.getElementById('signout').style.display = '';
 }
+
+document.getElementById('signout').addEventListener('click', async () => {
+  try { await fetch('/logout', { method: 'POST', credentials: 'include' }); } catch (e) {}
+  showLoginForm();
+});
 
 document.getElementById('warm-covers').addEventListener('click', async (e) => {
   const btn = e.target;
@@ -294,6 +332,8 @@ async function refresh() {
   renderConnections(status);
   renderConnectActions(status);
   renderLibraries(status, libs.libraries || []);
+  renderHousehold(status);
+  renderMembers(status);
 
   // If we landed here from a successful OAuth callback, surface the freshly
   // created profile so the user can attach it without remembering its id.
@@ -337,6 +377,175 @@ function renderConnections(status) {
       if (!confirm('Disconnect this account? Libraries using it will stop working until reconnected.')) return;
       await api('/api/admin/storage/pcloud/disconnect/' + btn.dataset.disconnect, { method: 'POST' });
       refresh();
+    });
+  });
+}
+
+function renderHousehold(status) {
+  const card = document.getElementById('household-card');
+  card.style.display = '';
+  const isOwner = status.role === 'owner';
+  window.__myUserId = status.userId;
+
+  // Member roster.
+  api('/api/admin/members').then((data) => {
+    const members = (data && data.members) || [];
+    let html = '<table><thead><tr><th>Member</th><th>Role</th><th></th></tr></thead><tbody>';
+    for (const m of members) {
+      const you = m.userId === status.userId ? ' <span class="muted">(you)</span>' : '';
+      html += '<tr><td>' + escapeHtml(m.username) + you
+        + (m.email ? ' <span class="muted">&middot; ' + escapeHtml(m.email) + '</span>' : '') + '</td>';
+      html += '<td>' + escapeHtml(m.role) + '</td>';
+      html += '<td>';
+      if (isOwner && m.role !== 'owner' && m.userId !== status.userId) {
+        html += '<button class="danger" data-remove-member="' + escapeHtml(m.userId) + '" style="font-size:0.78rem;padding:0.2rem 0.55rem">Remove</button>';
+      }
+      html += '</td></tr>';
+    }
+    html += '</tbody></table>';
+    const body = document.getElementById('members-body');
+    body.innerHTML = html;
+    body.querySelectorAll('[data-remove-member]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Remove this member? They lose access to the shared library.')) return;
+        try { await api('/api/admin/members/' + btn.dataset.removeMember, { method: 'DELETE' }); renderHousehold(status); }
+        catch (err) { showError('Remove failed: ' + err.message); }
+      });
+    });
+  }).catch((e) => { if (!(e instanceof UnauthorizedError)) document.getElementById('members-body').innerHTML = '<p class="warn">' + escapeHtml(e.message) + '</p>'; });
+
+  // Owner-only: invite controls + open invites.
+  document.getElementById('invite-actions').style.display = isOwner ? '' : 'none';
+  document.getElementById('invites-body').innerHTML = '';
+  if (!isOwner) return;
+
+  const createBtn = document.getElementById('create-invite');
+  if (!createBtn.dataset.wired) {
+    createBtn.dataset.wired = '1';
+    createBtn.addEventListener('click', async () => {
+      const note = document.getElementById('invite-status');
+      note.textContent = 'Creating…';
+      try {
+        const inv = await api('/api/admin/invites', { method: 'POST' });
+        note.textContent = '';
+        await navigator.clipboard.writeText(inv.url).catch(() => {});
+        prompt('Share this single-use invite link (copied to clipboard):', inv.url);
+        renderHousehold(status);
+      } catch (err) { note.textContent = ''; showError('Could not create invite: ' + err.message); }
+    });
+  }
+
+  api('/api/admin/invites').then((data) => {
+    const invites = (data && data.invites) || [];
+    const ib = document.getElementById('invites-body');
+    if (!invites.length) { ib.innerHTML = '<p class="muted" style="margin-top:0.75rem">No open invites.</p>'; return; }
+    let html = '<p class="muted" style="margin-top:1rem">Open invites:</p><table><tbody>';
+    for (const i of invites) {
+      const exp = i.expiresAt ? new Date(i.expiresAt).toLocaleDateString() : 'never';
+      html += '<tr><td><code>' + escapeHtml(i.code.slice(0, 10)) + '…</code></td>'
+        + '<td class="muted">expires ' + exp + '</td>'
+        + '<td><button class="secondary" data-copy-invite="' + escapeHtml(i.code) + '" style="font-size:0.78rem;padding:0.2rem 0.55rem">Copy link</button> '
+        + '<button class="danger" data-revoke-invite="' + escapeHtml(i.code) + '" style="font-size:0.78rem;padding:0.2rem 0.55rem">Revoke</button></td></tr>';
+    }
+    html += '</tbody></table>';
+    ib.innerHTML = html;
+    ib.querySelectorAll('[data-copy-invite]').forEach((btn) => btn.addEventListener('click', () => {
+      const url = location.origin + '/signup?invite=' + btn.dataset.copyInvite;
+      navigator.clipboard.writeText(url).catch(() => {});
+      prompt('Invite link (copied):', url);
+    }));
+    ib.querySelectorAll('[data-revoke-invite]').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!confirm('Revoke this invite link?')) return;
+      try { await api('/api/admin/invites/' + btn.dataset.revokeInvite, { method: 'DELETE' }); renderHousehold(status); }
+      catch (err) { showError('Revoke failed: ' + err.message); }
+    }));
+  }).catch(() => {});
+}
+
+function renderMembers(status) {
+  const card = document.getElementById('members-card');
+  if (!status.isInstanceOwner) { card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  // Signup mode selector.
+  const sel = document.getElementById('signup-mode');
+  if (status.signupMode) sel.value = status.signupMode;
+  if (!sel.dataset.wired) {
+    sel.dataset.wired = '1';
+    sel.addEventListener('change', async () => {
+      const note = document.getElementById('signup-mode-status');
+      note.textContent = 'Saving…';
+      try {
+        await api('/api/admin/signup/mode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: sel.value }),
+        });
+        note.textContent = '✓ saved';
+        setTimeout(() => { note.textContent = ''; }, 1500);
+      } catch (err) {
+        note.textContent = '';
+        showError('Could not change signup mode: ' + err.message);
+      }
+    });
+  }
+
+  loadPending();
+}
+
+async function loadPending() {
+  const body = document.getElementById('pending-body');
+  let data;
+  try {
+    data = await api('/api/admin/signup/pending');
+  } catch (e) {
+    if (e instanceof UnauthorizedError) return;
+    body.innerHTML = '<p class="warn">Failed to load pending signups: ' + escapeHtml(e.message) + '</p>';
+    return;
+  }
+  const pending = data.pending || [];
+  if (!pending.length) {
+    body.innerHTML = '<p class="muted">No accounts awaiting approval.</p>';
+    return;
+  }
+  let html = '<table><thead><tr><th>Username</th><th>Email</th><th>Requested</th><th></th></tr></thead><tbody>';
+  for (const p of pending) {
+    html += '<tr>';
+    html += '<td>' + escapeHtml(p.username) + '</td>';
+    html += '<td>' + escapeHtml(p.email || '—') + '</td>';
+    html += '<td>' + new Date(p.created_at).toLocaleString() + '</td>';
+    html += '<td style="white-space:nowrap">'
+      + '<button data-approve="' + escapeHtml(p.id) + '" style="font-size:0.8rem; padding:0.2rem 0.6rem">Approve</button> '
+      + '<button class="danger" data-reject="' + escapeHtml(p.id) + '" style="font-size:0.8rem; padding:0.2rem 0.6rem">Reject</button>'
+      + '</td>';
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  body.innerHTML = html;
+
+  body.querySelectorAll('[data-approve]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        await api('/api/admin/users/' + btn.dataset.approve + '/approve', { method: 'POST' });
+        loadPending();
+      } catch (err) {
+        btn.disabled = false;
+        showError('Approve failed: ' + err.message);
+      }
+    });
+  });
+  body.querySelectorAll('[data-reject]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('Reject and delete this signup request?')) return;
+      btn.disabled = true;
+      try {
+        await api('/api/admin/users/' + btn.dataset.reject + '/reject', { method: 'POST' });
+        loadPending();
+      } catch (err) {
+        btn.disabled = false;
+        showError('Reject failed: ' + err.message);
+      }
     });
   });
 }

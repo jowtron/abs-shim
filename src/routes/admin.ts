@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { createMiddleware } from 'hono/factory';
 import type { Env } from '../types';
 import { requireAuth, type AuthVars } from '../auth/middleware';
 import {
@@ -12,37 +13,69 @@ import { probeM4b } from '../prober/m4b';
 import { probeMp3 } from '../prober/mp3';
 import { resolveProbeUrl } from '../storage/resolve';
 import type { OAuthProfileRow } from '../storage/factory';
+import { redactSecrets, safeJson } from '../lib/redact';
+import { getSignupMode, setSetting } from '../db/settings';
+import { createInvite, listOpenInvites, deleteInvite } from '../db/invites';
+import { listTenantMembers, removeMember } from '../db/tenants';
 
-// All admin routes are gated by requireAuth + requireRoot. Mount at /api/admin
-// from index.ts. The admin UI itself lives at /admin and is served via the
-// ASSETS binding from the web-admin/ folder.
+// Mounted at /api/admin from index.ts. The admin UI itself lives at /admin and
+// is served as an inline HTML page (src/lib/admin-html.ts).
+//
+// Auth model (Phase 3): the storage/library management endpoints are open to
+// ANY authenticated, active member — they're all tenant-scoped (every query
+// filters by c.get('tenantId')), so a member only ever sees and mutates their
+// own tenant's data. A small set of *instance-wide* operations (approving
+// signups, the signup-mode switch) stay restricted to the instance owner via
+// requireInstanceOwner. Cross-tenant visibility lives at /ops, not here.
 
 export const adminRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
 adminRoutes.use('*', requireAuth);
-adminRoutes.use('*', async (c, next) => {
-  const u = c.get('user');
-  if (u.type !== 'root' && u.type !== 'admin') {
-    return c.json({ error: 'Forbidden' }, 403);
-  }
-  return next();
-});
+
+// Gate for instance-wide (not tenant-scoped) operations. 'root'/'admin' are the
+// instance-owner account types — distinct from a per-tenant 'owner' role, which
+// only confers authority within that tenant.
+const requireInstanceOwner = createMiddleware<{ Bindings: Env; Variables: AuthVars }>(
+  async (c, next) => {
+    const u = c.get('user');
+    if (u.type !== 'root' && u.type !== 'admin') {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    return next();
+  },
+);
+
+// Gate for managing one's own tenant (invite/remove members). The per-tenant
+// 'owner' role — distinct from the instance owner above.
+const requireTenantOwner = createMiddleware<{ Bindings: Env; Variables: AuthVars }>(
+  async (c, next) => {
+    if (c.get('tenantRole') !== 'owner') {
+      return c.json({ error: 'Only the tenant owner can do this' }, 403);
+    }
+    return next();
+  },
+);
 
 // ─── Storage status ─────────────────────────────────────────────────────────
 
 adminRoutes.get('/storage/status', async (c) => {
+  const tenantId = c.get('tenantId');
+  const u = c.get('user');
+  const isInstanceOwner = u.type === 'root' || u.type === 'admin';
   const folders = await c.env.DB.prepare(
     `SELECT lf.*, l.name AS library_name
        FROM library_folders lf
        JOIN libraries l ON l.id = lf.library_id
+      WHERE lf.tenant_id = ?
        ORDER BY lf.added_at ASC`,
-  ).all<FolderWithLibName>();
+  ).bind(tenantId).all<FolderWithLibName>();
 
   const profiles = await c.env.DB.prepare(
     `SELECT id, provider, account_label, api_host, created_at, last_verified_at
        FROM oauth_profiles
+      WHERE tenant_id = ?
        ORDER BY created_at ASC`,
-  ).all<ProfileSummary>();
+  ).bind(tenantId).all<ProfileSummary>();
 
   // Per-library stats. Two queries because counting books requires DISTINCT
   // over library_items, whereas duration/size sums across audio_files (a book
@@ -53,8 +86,9 @@ adminRoutes.get('/storage/status', async (c) => {
             SUM(CASE WHEN is_missing = 0 THEN 1 ELSE 0 END) AS book_count,
             SUM(CASE WHEN is_missing = 1 THEN 1 ELSE 0 END) AS missing_count
        FROM library_items
+      WHERE tenant_id = ?
        GROUP BY library_id`,
-  ).all<{ library_id: string; book_count: number; missing_count: number }>();
+  ).bind(tenantId).all<{ library_id: string; book_count: number; missing_count: number }>();
 
   const sums = await c.env.DB.prepare(
     `SELECT li.library_id AS library_id,
@@ -62,9 +96,9 @@ adminRoutes.get('/storage/status', async (c) => {
             COALESCE(SUM(af.size_bytes), 0) AS total_size_bytes
        FROM library_items li
        JOIN audio_files af ON af.library_item_id = li.id
-      WHERE li.is_missing = 0
+      WHERE li.is_missing = 0 AND li.tenant_id = ?
       GROUP BY li.library_id`,
-  ).all<{ library_id: string; total_duration_seconds: number; total_size_bytes: number }>();
+  ).bind(tenantId).all<{ library_id: string; total_duration_seconds: number; total_size_bytes: number }>();
 
   const stats: Record<string, { bookCount: number; missingCount: number; totalDurationSeconds: number; totalSizeBytes: number }> = {};
   for (const r of counts.results) {
@@ -103,7 +137,63 @@ adminRoutes.get('/storage/status', async (c) => {
     secrets: {
       pcloudConfigured: Boolean(c.env.PCLOUD_CLIENT_ID && c.env.PCLOUD_CLIENT_SECRET),
     },
+    // Per-tenant role + instance-owner flag, so the admin page can reveal the
+    // owner-only "Members & signups" panel. signupMode is only meaningful (and
+    // only loaded) for the instance owner.
+    role: c.get('tenantRole'),
+    isInstanceOwner,
+    userId: u.id,
+    signupMode: isInstanceOwner ? await getSignupMode(c.env) : null,
   });
+});
+
+// ─── Tenant members & invites (the "household / family" sharing model) ────────
+//
+// Members of one tenant share the same libraries but keep their own progress,
+// bookmarks, and finished state (media_progress is user-scoped). Any member can
+// VIEW the roster + open invites; only the tenant owner can invite or remove.
+
+adminRoutes.get('/members', async (c) => {
+  return c.json({ members: await listTenantMembers(c.env, c.get('tenantId')) });
+});
+
+adminRoutes.get('/invites', async (c) => {
+  const invites = await listOpenInvites(c.env, c.get('tenantId'));
+  return c.json({
+    invites: invites.map((i) => ({ code: i.code, role: i.role, expiresAt: i.expires_at, createdAt: i.created_at })),
+  });
+});
+
+// Create an invite for THIS tenant. Returns a ready-to-share signup link.
+adminRoutes.post('/invites', requireTenantOwner, async (c) => {
+  const invite = await createInvite(c.env, {
+    tenantId: c.get('tenantId'),
+    role: 'member',
+    createdBy: c.get('userId'),
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // 7 days
+  });
+  const origin = new URL(c.req.url).origin;
+  return c.json({ code: invite.code, url: `${origin}/signup?invite=${invite.code}`, expiresAt: invite.expires_at });
+});
+
+adminRoutes.delete('/invites/:code', requireTenantOwner, async (c) => {
+  const ok = await deleteInvite(c.env, c.req.param('code'), c.get('tenantId'));
+  if (!ok) return c.json({ error: 'Invite not found' }, 404);
+  return c.body(null, 204);
+});
+
+// Remove a member from this tenant. Owner-only; can't remove yourself or another
+// owner (transfer/ownership changes are out of scope for now).
+adminRoutes.delete('/members/:userId', requireTenantOwner, async (c) => {
+  const tenantId = c.get('tenantId');
+  const target = c.req.param('userId');
+  if (target === c.get('userId')) return c.json({ error: 'You cannot remove yourself' }, 400);
+  const members = await listTenantMembers(c.env, tenantId);
+  const m = members.find((x) => x.userId === target);
+  if (!m) return c.json({ error: 'Not a member of this tenant' }, 404);
+  if (m.role === 'owner') return c.json({ error: 'Cannot remove an owner' }, 400);
+  await removeMember(c.env, tenantId, target);
+  return c.body(null, 204);
 });
 
 // ─── pCloud OAuth flow ──────────────────────────────────────────────────────
@@ -169,9 +259,9 @@ adminRoutes.get('/storage/pcloud/callback', async (c) => {
   const now = Date.now();
   await c.env.DB.prepare(
     `INSERT INTO oauth_profiles
-       (id, provider, access_token, refresh_token, api_host, account_label, scope, created_at, last_verified_at)
-     VALUES (?, 'pcloud', ?, NULL, ?, ?, NULL, ?, ?)`,
-  ).bind(profileId, tok.access_token, apiHost, accountLabel, now, now).run();
+       (id, tenant_id, provider, access_token, refresh_token, api_host, account_label, scope, created_at, last_verified_at)
+     VALUES (?, ?, 'pcloud', ?, NULL, ?, ?, NULL, ?, ?)`,
+  ).bind(profileId, c.get('tenantId'), tok.access_token, apiHost, accountLabel, now, now).run();
 
   const target = stateRow.redirect_target ?? '/admin/';
   // Encode the freshly-created profile_id into the redirect so the admin UI
@@ -186,9 +276,10 @@ adminRoutes.get('/storage/pcloud/callback', async (c) => {
 // will fail at first use.
 adminRoutes.post('/storage/pcloud/disconnect/:profileId', async (c) => {
   const profileId = c.req.param('profileId');
+  const tenantId = c.get('tenantId');
   await c.env.DB.batch([
-    c.env.DB.prepare('UPDATE library_folders SET profile_id = NULL WHERE profile_id = ?').bind(profileId),
-    c.env.DB.prepare('DELETE FROM oauth_profiles WHERE id = ?').bind(profileId),
+    c.env.DB.prepare('UPDATE library_folders SET profile_id = NULL WHERE profile_id = ? AND tenant_id = ?').bind(profileId, tenantId),
+    c.env.DB.prepare('DELETE FROM oauth_profiles WHERE id = ? AND tenant_id = ?').bind(profileId, tenantId),
   ]);
   return c.body(null, 204);
 });
@@ -207,14 +298,15 @@ adminRoutes.post('/storage/folder/pcloud', async (c) => {
   if (!libraryId || !profileId) {
     return c.json({ error: 'libraryId and profileId required' }, 400);
   }
-  const lib = await getLibrary(c.env, libraryId);
+  const tenantId = c.get('tenantId');
+  const lib = await getLibrary(c.env, libraryId, tenantId);
   if (!lib) return c.json({ error: 'Library not found' }, 404);
   const profile = await c.env.DB.prepare(
-    `SELECT id FROM oauth_profiles WHERE id = ? AND provider = 'pcloud'`,
-  ).bind(profileId).first<{ id: string }>();
+    `SELECT id FROM oauth_profiles WHERE id = ? AND provider = 'pcloud' AND tenant_id = ?`,
+  ).bind(profileId, tenantId).first<{ id: string }>();
   if (!profile) return c.json({ error: 'Profile not found' }, 404);
 
-  const folders = await listFolders(c.env, libraryId);
+  const folders = await listFolders(c.env, libraryId, tenantId);
   const config = JSON.stringify({ rootPath });
   const now = Date.now();
 
@@ -223,9 +315,9 @@ adminRoutes.post('/storage/folder/pcloud', async (c) => {
     const id = crypto.randomUUID();
     await c.env.DB.prepare(
       `INSERT INTO library_folders
-         (id, library_id, filedn_base_url, added_at, provider, config_json, profile_id)
-       VALUES (?, ?, '', ?, 'pcloud_oauth', ?, ?)`,
-    ).bind(id, libraryId, now, config, profileId).run();
+         (id, library_id, tenant_id, filedn_base_url, added_at, provider, config_json, profile_id)
+       VALUES (?, ?, ?, '', ?, 'pcloud_oauth', ?, ?)`,
+    ).bind(id, libraryId, tenantId, now, config, profileId).run();
     return c.json({ folderId: id });
   }
 
@@ -254,9 +346,10 @@ adminRoutes.post('/storage/folder/s3', async (c) => {
   if (!libraryId || !endpoint || !bucket || !accessKeyId || !secretAccessKey) {
     return c.json({ error: 'libraryId, endpoint, bucket, accessKeyId, secretAccessKey required' }, 400);
   }
-  if (!await getLibrary(c.env, libraryId)) return c.json({ error: 'Library not found' }, 404);
+  const tenantId = c.get('tenantId');
+  if (!await getLibrary(c.env, libraryId, tenantId)) return c.json({ error: 'Library not found' }, 404);
   const config = JSON.stringify({ endpoint, bucket, region, prefix, accessKeyId, secretAccessKey });
-  return upsertFolderProvider(c.env, libraryId, 's3', config, null);
+  return upsertFolderProvider(c.env, libraryId, tenantId, 's3', config, null);
 });
 
 // Configure a library_folders row to point at a WebDAV server.
@@ -271,23 +364,24 @@ adminRoutes.post('/storage/folder/webdav', async (c) => {
   if (!libraryId || !baseUrl || !username) {
     return c.json({ error: 'libraryId, baseUrl, username required' }, 400);
   }
-  if (!await getLibrary(c.env, libraryId)) return c.json({ error: 'Library not found' }, 404);
+  const tenantId = c.get('tenantId');
+  if (!await getLibrary(c.env, libraryId, tenantId)) return c.json({ error: 'Library not found' }, 404);
   const config = JSON.stringify({ baseUrl, username, password, rootPath });
-  return upsertFolderProvider(c.env, libraryId, 'webdav', config, null);
+  return upsertFolderProvider(c.env, libraryId, tenantId, 'webdav', config, null);
 });
 
 // Always insert a new folder row. Multi-backend per library is intentional —
 // libraries can pull from R2 + NAS + pCloud simultaneously, with each book
 // pinned to the folder it actually lives in via library_items.folder_id.
 // To swap a backend, add the new one and remove the old one explicitly.
-async function upsertFolderProvider(env: Env, libraryId: string, provider: string, configJson: string, profileId: string | null): Promise<Response> {
+async function upsertFolderProvider(env: Env, libraryId: string, tenantId: string, provider: string, configJson: string, profileId: string | null): Promise<Response> {
   const id = crypto.randomUUID();
   const now = Date.now();
   await env.DB.prepare(
     `INSERT INTO library_folders
-       (id, library_id, filedn_base_url, added_at, provider, config_json, profile_id)
-     VALUES (?, ?, '', ?, ?, ?, ?)`,
-  ).bind(id, libraryId, now, provider, configJson, profileId).run();
+       (id, library_id, tenant_id, filedn_base_url, added_at, provider, config_json, profile_id)
+     VALUES (?, ?, ?, '', ?, ?, ?, ?)`,
+  ).bind(id, libraryId, tenantId, now, provider, configJson, profileId).run();
   return new Response(JSON.stringify({ folderId: id }), {
     status: 200, headers: { 'Content-Type': 'application/json' },
   });
@@ -298,16 +392,22 @@ async function upsertFolderProvider(env: Env, libraryId: string, provider: strin
 // because losing user progress on a misclick is worse than the inconvenience).
 adminRoutes.delete('/storage/folder/:id', async (c) => {
   const folderId = c.req.param('id');
+  const tenantId = c.get('tenantId');
+  // Confirm the folder belongs to this tenant before touching it.
+  const owned = await c.env.DB.prepare(
+    `SELECT id FROM library_folders WHERE id = ? AND tenant_id = ?`,
+  ).bind(folderId, tenantId).first<{ id: string }>();
+  if (!owned) return c.json({ error: 'Folder not found' }, 404);
   const refs = await c.env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM library_items WHERE folder_id = ?`,
-  ).bind(folderId).first<{ n: number }>();
+    `SELECT COUNT(*) AS n FROM library_items WHERE folder_id = ? AND tenant_id = ?`,
+  ).bind(folderId, tenantId).first<{ n: number }>();
   if ((refs?.n ?? 0) > 0) {
     return c.json({
       error: 'Folder still has items',
       detail: `${refs!.n} library_item(s) reference this folder. Delete or migrate them first.`,
     }, 409);
   }
-  await c.env.DB.prepare('DELETE FROM library_folders WHERE id = ?').bind(folderId).run();
+  await c.env.DB.prepare('DELETE FROM library_folders WHERE id = ? AND tenant_id = ?').bind(folderId, tenantId).run();
   return c.body(null, 204);
 });
 
@@ -318,12 +418,13 @@ adminRoutes.delete('/storage/folder/:id', async (c) => {
 // queue later — for personal-library sizes (≤ a few hundred books) the wall
 // clock is fine inside one Worker invocation.
 adminRoutes.post('/libraries/:id/scan', async (c) => {
+  const tenantId = c.get('tenantId');
   const id = c.req.param('id');
-  const lib = await getLibrary(c.env, id);
+  const lib = await getLibrary(c.env, id, tenantId);
   if (!lib) return c.json({ error: 'Library not found' }, 404);
   let report: ScanReport;
   try {
-    report = await runScan(c.env, id);
+    report = await runScan(c.env, id, tenantId);
   } catch (e) {
     return c.json({ error: 'Scan failed', detail: (e as Error).message }, 502);
   }
@@ -346,7 +447,7 @@ adminRoutes.post('/books/add-by-path', async (c) => {
     return c.json({ error: 'libraryId and relPath required' }, 400);
   }
   try {
-    const result = await addBookByPath(c.env, libraryId, relPath);
+    const result = await addBookByPath(c.env, libraryId, relPath, c.get('tenantId'));
     return c.json(result);
   } catch (e) {
     return c.json({ error: 'Add failed', detail: (e as Error).message }, 502);
@@ -368,19 +469,19 @@ adminRoutes.post('/books/add-by-path', async (c) => {
 
 // Load a pCloud-OAuth folder + its profile. Returns the same Response shape
 // as a Hono handler when the lookup fails so callers can `return` directly.
-async function loadPcloudFolder(env: Env, folderId: string): Promise<
+async function loadPcloudFolder(env: Env, folderId: string, tenantId: string): Promise<
   { ok: true; folder: NonNullable<Awaited<ReturnType<typeof getFolderById>>>; profile: PcloudProfile; rootPath: string }
   | { ok: false; status: number; error: string }
 > {
-  const folder = await getFolderById(env, folderId);
+  const folder = await getFolderById(env, folderId, tenantId);
   if (!folder) return { ok: false, status: 404, error: 'Folder not found' };
   if (folder.provider !== 'pcloud_oauth') {
     return { ok: false, status: 400, error: 'Upload is only supported on pcloud_oauth folders' };
   }
   if (!folder.profile_id) return { ok: false, status: 400, error: 'Folder has no profile_id' };
   const profileRow = await env.DB.prepare(
-    'SELECT * FROM oauth_profiles WHERE id = ?',
-  ).bind(folder.profile_id).first<OAuthProfileRow>();
+    'SELECT * FROM oauth_profiles WHERE id = ? AND tenant_id = ?',
+  ).bind(folder.profile_id, tenantId).first<OAuthProfileRow>();
   if (!profileRow) return { ok: false, status: 404, error: 'pCloud profile missing' };
   const apiHost = profileRow.api_host ?? 'api.pcloud.com';
   const profile: PcloudProfile = { accessToken: profileRow.access_token, apiHost };
@@ -413,7 +514,7 @@ function joinPcloudPath(rootPath: string, relPath: string): string {
 // Worker streams the body through (see /chunk below) so we don't hold this
 // in memory.
 adminRoutes.post('/storage/folder/:folderId/upload/init', async (c) => {
-  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'));
+  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
   if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
   const uploadId = await pcloudUploadCreate(loaded.profile);
   return c.json({ uploadId, chunkSize: 25 * 1024 * 1024 });
@@ -431,7 +532,7 @@ adminRoutes.post('/storage/folder/:folderId/upload/init', async (c) => {
 // clock for each chunk on slow uplinks, and Worker memory stays low so we
 // can use large chunks without trouble.
 adminRoutes.post('/storage/folder/:folderId/upload/chunk', async (c) => {
-  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'));
+  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
   if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
   const uploadId = Number(c.req.query('uploadId') ?? '');
   const offset = Number(c.req.query('offset') ?? '');
@@ -455,7 +556,7 @@ adminRoutes.post('/storage/folder/:folderId/upload/chunk', async (c) => {
 //
 // Body: { uploadId: number, relPath: string, registerAsBook?: boolean }
 adminRoutes.post('/storage/folder/:folderId/upload/save', async (c) => {
-  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'));
+  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
   if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const uploadId = Number(body['uploadId'] ?? '');
@@ -485,7 +586,7 @@ adminRoutes.post('/storage/folder/:folderId/upload/save', async (c) => {
       // uploads end up with size=0 in the library).
       const hints: { sizeBytes?: number } = {};
       if (saved.metadata?.size != null) hints.sizeBytes = saved.metadata.size;
-      const result = await addBookByPath(c.env, loaded.folder.library_id, relPath, hints);
+      const result = await addBookByPath(c.env, loaded.folder.library_id, relPath, c.get('tenantId'), hints);
       if (result.itemId) itemId = result.itemId;
       if (!result.added && result.reason) registerError = result.reason;
     } catch (e) {
@@ -520,9 +621,9 @@ adminRoutes.get('/libraries/:libId/items', async (c) => {
             (SELECT COALESCE(SUM(af.size_bytes), 0) FROM audio_files af WHERE af.library_item_id = li.id) AS size_bytes
        FROM library_items li
        LEFT JOIN book_metadata bm ON bm.library_item_id = li.id
-      WHERE li.library_id = ?
+      WHERE li.library_id = ? AND li.tenant_id = ?
       ORDER BY bm.title COLLATE NOCASE ASC`,
-  ).bind(c.req.param('libId')).all<{
+  ).bind(c.req.param('libId'), c.get('tenantId')).all<{
     id: string;
     rel_path: string;
     is_missing: number;
@@ -539,7 +640,7 @@ adminRoutes.get('/libraries/:libId/items', async (c) => {
 // Re-probe a single item. Useful when chapters or duration came in wrong.
 adminRoutes.post('/items/:itemId/reprobe', async (c) => {
   try {
-    const result = await reprobeItem(c.env, c.req.param('itemId'));
+    const result = await reprobeItem(c.env, c.req.param('itemId'), c.get('tenantId'));
     return c.json(result);
   } catch (e) {
     return c.json({ error: 'Re-probe failed', detail: (e as Error).message }, 502);
@@ -556,10 +657,11 @@ adminRoutes.post('/libraries/:libId/reprobe', async (c) => {
   const filter = onlyMissing
     ? `AND NOT EXISTS (SELECT 1 FROM chapters ch WHERE ch.library_item_id = li.id)`
     : '';
+  const tenantId = c.get('tenantId');
   const rows = await c.env.DB.prepare(
     `SELECT li.id FROM library_items li
-      WHERE li.library_id = ? AND li.is_missing = 0 ${filter}`,
-  ).bind(libId).all<{ id: string }>();
+      WHERE li.library_id = ? AND li.tenant_id = ? AND li.is_missing = 0 ${filter}`,
+  ).bind(libId, tenantId).all<{ id: string }>();
   const ids = rows.results.map((r) => r.id);
 
   let succeeded = 0;
@@ -568,7 +670,7 @@ adminRoutes.post('/libraries/:libId/reprobe', async (c) => {
   const chaptersFound: Array<{ id: string; chapters: number }> = [];
   for (const id of ids) {
     try {
-      const r = await reprobeItem(c.env, id);
+      const r = await reprobeItem(c.env, id, tenantId);
       succeeded++;
       chaptersFound.push({ id, chapters: r.chapters });
     } catch (e) {
@@ -588,8 +690,8 @@ adminRoutes.post('/libraries/:libId/reprobe', async (c) => {
 adminRoutes.delete('/items/:itemId', async (c) => {
   const itemId = c.req.param('itemId');
   const item = await c.env.DB.prepare(
-    'SELECT id FROM library_items WHERE id = ?',
-  ).bind(itemId).first<{ id: string }>();
+    'SELECT id FROM library_items WHERE id = ? AND tenant_id = ?',
+  ).bind(itemId, c.get('tenantId')).first<{ id: string }>();
   if (!item) return c.json({ error: 'Item not found' }, 404);
   await c.env.DB.batch([
     c.env.DB.prepare('DELETE FROM chapters WHERE library_item_id = ?').bind(itemId),
@@ -610,8 +712,8 @@ adminRoutes.delete('/items/:itemId', async (c) => {
 // evict and re-probe. Idempotent: existing R2 keys are skipped.
 adminRoutes.post('/covers/warm', async (c) => {
   const rows = await c.env.DB.prepare(
-    'SELECT id FROM library_items WHERE is_missing = 0',
-  ).all<{ id: string }>();
+    'SELECT id FROM library_items WHERE is_missing = 0 AND tenant_id = ?',
+  ).bind(c.get('tenantId')).all<{ id: string }>();
   const ids = (rows.results ?? []).map((r) => r.id);
 
   let warmed = 0, skipped = 0, failed = 0;
@@ -623,11 +725,11 @@ adminRoutes.post('/covers/warm', async (c) => {
     if (head) { skipped++; continue; }
 
     try {
-      const item = await getItem(c.env, id);
+      const item = await getItem(c.env, id, c.get('tenantId'));
       if (!item) { failed++; errors.push({ id, reason: 'item not found' }); continue; }
-      const folder = await getFolderById(c.env, item.folder_id);
+      const folder = await getFolderById(c.env, item.folder_id, c.get('tenantId'));
       if (!folder) { failed++; errors.push({ id, reason: 'folder missing' }); continue; }
-      const audio = (await getAudioFiles(c.env, id))[0];
+      const audio = (await getAudioFiles(c.env, id, c.get('tenantId')))[0];
       if (!audio) { failed++; errors.push({ id, reason: 'no audio file' }); continue; }
 
       const probeUrl = await resolveProbeUrl(c.env, folder, audio);
@@ -649,6 +751,75 @@ adminRoutes.post('/covers/warm', async (c) => {
     }
   }
   return c.json({ totalItems: ids.length, warmed, skipped, failed, errors });
+});
+
+// ─── Signups & membership (instance owner only) ──────────────────────────────
+//
+// Approving a pending signup provisions a brand-new tenant for that user, so it
+// is an instance-wide action — gated by requireInstanceOwner (account type
+// root/admin), NOT the per-tenant owner role.
+
+// List accounts awaiting approval, oldest first.
+adminRoutes.get('/signup/pending', requireInstanceOwner, async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT id, username, email, created_at
+       FROM users
+      WHERE signup_status = 'pending' AND is_active = 0
+      ORDER BY created_at ASC`,
+  ).all<{ id: string; username: string; email: string | null; created_at: number }>();
+  return c.json({ pending: rows.results });
+});
+
+// Approve a pending signup: activate the user and provision their own tenant
+// (they become its owner). Idempotency-guarded on signup_status so a double
+// click can't mint two tenants.
+adminRoutes.post('/users/:id/approve', requireInstanceOwner, async (c) => {
+  const userId = c.req.param('id');
+  const u = await c.env.DB.prepare(
+    `SELECT id, username, signup_status FROM users WHERE id = ?`,
+  ).bind(userId).first<{ id: string; username: string; signup_status: string }>();
+  if (!u) return c.json({ error: 'User not found' }, 404);
+  if (u.signup_status !== 'pending') return c.json({ error: 'User is not pending approval' }, 409);
+
+  const now = Date.now();
+  const tenantId = `tnt_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE users SET is_active = 1, signup_status = 'active' WHERE id = ?`).bind(userId),
+    c.env.DB.prepare(
+      `INSERT INTO tenants (id, name, owner_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+    ).bind(tenantId, `${u.username}'s library`, userId, now, now),
+    c.env.DB.prepare(
+      `INSERT INTO tenant_members (tenant_id, user_id, role, is_default, created_at) VALUES (?, ?, 'owner', 1, ?)`,
+    ).bind(tenantId, userId, now),
+  ]);
+  return c.json({ ok: true, tenantId });
+});
+
+// Reject a pending signup: hard-delete the row. Safe to delete outright — a
+// pending user owns no tenant/content yet, so there's nothing to cascade.
+adminRoutes.post('/users/:id/reject', requireInstanceOwner, async (c) => {
+  const userId = c.req.param('id');
+  const u = await c.env.DB.prepare(
+    `SELECT signup_status FROM users WHERE id = ?`,
+  ).bind(userId).first<{ signup_status: string }>();
+  if (!u) return c.json({ error: 'User not found' }, 404);
+  if (u.signup_status !== 'pending') return c.json({ error: 'User is not pending approval' }, 409);
+  await c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
+  return c.body(null, 204);
+});
+
+// Read / set the instance signup mode ('approval' | 'closed').
+adminRoutes.get('/signup/mode', requireInstanceOwner, async (c) => {
+  return c.json({ mode: await getSignupMode(c.env) });
+});
+
+adminRoutes.post('/signup/mode', requireInstanceOwner, async (c) => {
+  const body = await c.req.json().catch(() => ({})) as { mode?: string };
+  if (body.mode !== 'approval' && body.mode !== 'closed') {
+    return c.json({ error: "mode must be 'approval' or 'closed'" }, 400);
+  }
+  await setSetting(c.env, 'signup_mode', body.mode);
+  return c.json({ mode: body.mode });
 });
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -682,17 +853,3 @@ function redirectUriFor(currentUrl: string): string {
   return u.toString();
 }
 
-function safeJson(s: string): unknown {
-  try { return JSON.parse(s); } catch { return {}; }
-}
-
-// Strip credential fields before sending folder config to the admin UI.
-const SECRET_CONFIG_KEYS = new Set(['secretAccessKey', 'password']);
-function redactSecrets(config: unknown): unknown {
-  if (!config || typeof config !== 'object') return config;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(config as Record<string, unknown>)) {
-    out[k] = SECRET_CONFIG_KEYS.has(k) ? '••••••' : v;
-  }
-  return out;
-}

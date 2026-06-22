@@ -23,6 +23,7 @@ export type FolderRow = {
   provider: string;
   config_json: string;
   profile_id: string | null;
+  tenant_id: string; // migration 0004
 };
 
 export type OAuthProfileRow = {

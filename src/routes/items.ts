@@ -39,10 +39,16 @@ itemRoutes.get('/:id/cover', async (c) => {
       .first<{ x: number }>();
     if (!exists) {
       const mapped = await resolveItemIdFromUuid(c.env.DB, rawId);
-      if (mapped) id = mapped;
+      if (mapped) id = mapped.itemId;
       else return placeholderImage(); // unknown UUID — return transparent 1x1
     }
   }
+
+  // Cover R2/edge keys are intentionally NOT tenant-prefixed: library_items.id
+  // is globally unique (no cross-tenant collision), covers are non-sensitive
+  // book artwork, and this route is public + cache-hot — prefixing would force
+  // a D1 tenant lookup on every cached-cover hit. Audio/moov caches (which hold
+  // actual content) ARE tenant-prefixed; see byte-cache.ts / moov-cache.ts.
 
   // Token-stripped cache key so different users share the same edge cache entry.
   const cacheKey = new Request(new URL(`/__cover_cache__/${id}`, c.req.url).toString(), { method: 'GET' });
@@ -72,7 +78,13 @@ itemRoutes.get('/:id/cover', async (c) => {
   // backend), so we want this to happen at most once per item. Dispatch by
   // file extension: mp3 books have ID3v2 APIC frames, m4b/m4a/aac have a
   // moov/udta/meta/ilst/covr atom.
-  const bundle = await buildItemBundle(c.env, id);
+  // Public route — discover the item's own tenant (only on this cache-miss
+  // probe path, never on the hot Tier 1/2 cache hits above) so buildItemBundle
+  // can run tenant-scoped.
+  const trow = await c.env.DB.prepare('SELECT tenant_id FROM library_items WHERE id = ? LIMIT 1')
+    .bind(id).first<{ tenant_id: string }>();
+  if (!trow) return c.json({ error: 'Item not found' }, 404);
+  const bundle = await buildItemBundle(c.env, id, trow.tenant_id);
   if (!bundle) return c.json({ error: 'Item not found' }, 404);
   const audio = bundle.audioFiles[0];
   if (!audio) return c.json({ error: 'No audio file' }, 404);
@@ -119,7 +131,7 @@ itemRoutes.use('*', requireAuth);
 
 itemRoutes.get('/:id', async (c) => {
   const userRow = c.get('user');
-  const bundle = await buildItemBundle(c.env, c.req.param('id'));
+  const bundle = await buildItemBundle(c.env, c.req.param('id'), c.get('tenantId'));
   if (!bundle) return c.json({ error: 'Item not found' }, 404);
   // Stock ABS gates `userMediaProgress` on ?include=progress, but Plappa and
   // some other clients don't pass that flag — they just expect it to be there.
@@ -140,7 +152,7 @@ itemRoutes.get('/:id', async (c) => {
 // Skipping the pCloud round-trip on HEAD drops it from ~800ms to ~30ms, which
 // matters because iOS's stall-detection timer kills slow probes mid-flight.
 itemRoutes.get('/:id/file/:fileId', async (c) => {
-  const target = await getStreamingTarget(c.env, c.req.param('id'), c.req.param('fileId'));
+  const target = await getStreamingTarget(c.env, c.req.param('id'), c.req.param('fileId'), c.get('tenantId'));
   if (!target) return c.json({ error: 'Item or audio file not found' }, 404);
 
   // Only short-circuit HEAD when D1 actually knows the size — size_bytes can
@@ -218,7 +230,7 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
 // served by /api/items/:id/file/:ino above.
 itemRoutes.post('/:id/play', async (c) => {
   const userRow = c.get('user');
-  const bundle = await buildItemBundle(c.env, c.req.param('id'));
+  const bundle = await buildItemBundle(c.env, c.req.param('id'), c.get('tenantId'));
   if (!bundle) return c.json({ error: 'Item not found' }, 404);
 
   const body = await c.req.json().catch(() => ({}));

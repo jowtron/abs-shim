@@ -9,6 +9,9 @@ export type UserRow = {
   google_sub: string | null;
   is_active: number;
   is_locked: number;
+  // 'active' | 'pending' — set to 'pending' for self-serve signups awaiting
+  // owner approval (is_active stays 0 until then). See src/routes/signup.ts.
+  signup_status: string;
   permissions: string;
   libraries_accessible: string;
   item_tags_selected: string;
@@ -45,12 +48,12 @@ export async function insertUser(env: Env, row: UserRow): Promise<void> {
   await env.DB.prepare(
     `INSERT INTO users (
        id, username, email, type, password_hash, google_sub,
-       is_active, is_locked, permissions, libraries_accessible,
+       is_active, is_locked, signup_status, permissions, libraries_accessible,
        item_tags_selected, created_at, last_seen
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).bind(
     row.id, row.username, row.email, row.type, row.password_hash, row.google_sub,
-    row.is_active, row.is_locked, row.permissions, row.libraries_accessible,
+    row.is_active, row.is_locked, row.signup_status, row.permissions, row.libraries_accessible,
     row.item_tags_selected, row.created_at, row.last_seen,
   ).run();
 }

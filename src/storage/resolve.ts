@@ -94,6 +94,7 @@ function asFolderRow(folder: LibraryFolderRow): FolderRow {
   return {
     id: f.id,
     library_id: f.library_id,
+    tenant_id: f.tenant_id,
     filedn_base_url: f.filedn_base_url,
     added_at: f.added_at,
     provider: f.provider ?? 'public_url',

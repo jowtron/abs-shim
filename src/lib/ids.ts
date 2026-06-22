@@ -39,7 +39,15 @@ export async function derivedId(...parts: string[]): Promise<string> {
 // item is used as the cover source — for an author UUID, we pick that
 // author's first-added book; for a series UUID, we pick the series's first
 // book by series_sequence (or first-added if no sequence).
-type IdMap = Map<string, string>; // uuid -> item_id
+// uuid -> { itemId, tenantId }. The map stays GLOBAL across tenants (not
+// per-tenant) on purpose: its ONLY consumer is the PUBLIC, unauthenticated
+// cover route (ShelfPlayer doesn't auth image requests), which has no user
+// tenant to scope by. Covers are non-sensitive book artwork and item ids are
+// globally-unique, so a global resolution is safe. We carry the resolved
+// item's tenantId alongside so the cover route can tenant-PREFIX its R2 /
+// edge-cache keys (storage hygiene + per-tenant cache separation).
+type Resolved = { itemId: string; tenantId: string };
+type IdMap = Map<string, Resolved>;
 let cache: IdMap | null = null;
 
 async function buildMap(db: D1Database): Promise<IdMap> {
@@ -47,10 +55,10 @@ async function buildMap(db: D1Database): Promise<IdMap> {
 
   // media-id mapping: every item has a 1:1 derivedId(item.id, 'media').
   const items = await db
-    .prepare('SELECT id FROM library_items')
-    .all<{ id: string }>();
+    .prepare('SELECT id, tenant_id FROM library_items')
+    .all<{ id: string; tenant_id: string }>();
   for (const r of items.results) {
-    m.set(await derivedId(r.id, 'media'), r.id);
+    m.set(await derivedId(r.id, 'media'), { itemId: r.id, tenantId: r.tenant_id });
   }
 
   // author + series: derived against library.id, so we need each item's
@@ -58,7 +66,7 @@ async function buildMap(db: D1Database): Promise<IdMap> {
   // earliest-sequence (NULLS LAST) book for a series.
   const meta = await db
     .prepare(`
-      SELECT li.id AS item_id, li.library_id, li.created_at,
+      SELECT li.id AS item_id, li.library_id, li.tenant_id, li.created_at,
              bm.author_name, bm.series_name, bm.series_sequence
       FROM library_items li
       LEFT JOIN book_metadata bm ON bm.library_item_id = li.id
@@ -67,6 +75,7 @@ async function buildMap(db: D1Database): Promise<IdMap> {
     .all<{
       item_id: string;
       library_id: string;
+      tenant_id: string;
       created_at: number;
       author_name: string | null;
       series_name: string | null;
@@ -75,7 +84,7 @@ async function buildMap(db: D1Database): Promise<IdMap> {
 
   // First-seen wins (because we ORDERed by created_at ASC, oldest first).
   const seenAuthor = new Set<string>();
-  const seenSeries = new Map<string, { seq: number; item: string }>();
+  const seenSeries = new Map<string, { seq: number; item: string; tenantId: string }>();
 
   for (const row of meta.results) {
     if (row.author_name) {
@@ -83,7 +92,7 @@ async function buildMap(db: D1Database): Promise<IdMap> {
         const key = `${row.library_id}|author|${a}`;
         if (seenAuthor.has(key)) continue;
         seenAuthor.add(key);
-        m.set(await derivedId(row.library_id, 'author', a), row.item_id);
+        m.set(await derivedId(row.library_id, 'author', a), { itemId: row.item_id, tenantId: row.tenant_id });
       }
     }
     if (row.series_name) {
@@ -91,29 +100,26 @@ async function buildMap(db: D1Database): Promise<IdMap> {
       const key = `${row.library_id}|series|${row.series_name}`;
       const prev = seenSeries.get(key);
       if (!prev || seq < prev.seq) {
-        seenSeries.set(key, { seq, item: row.item_id });
+        seenSeries.set(key, { seq, item: row.item_id, tenantId: row.tenant_id });
       }
     }
   }
   for (const [key, val] of seenSeries) {
     const [libraryId, , name] = key.split('|') as [string, string, string];
-    m.set(await derivedId(libraryId, 'series', name), val.item);
+    m.set(await derivedId(libraryId, 'series', name), { itemId: val.item, tenantId: val.tenantId });
   }
 
   return m;
 }
 
-// Resolve any UUID-shaped id the cover route receives to a concrete
-// library_items.id. Returns null if no derivation matches — caller should
-// treat that as "no cover available". Cached at module scope across
-// invocations of the same Worker instance; stale entries are tolerable
-// since they only affect representative-cover choice (an item-rename or
-// metadata edit would invalidate it, but the cache resets on every cold
-// start anyway).
+// Resolve any UUID-shaped id the cover route receives to a concrete item +
+// its tenant. Returns null if no derivation matches — caller treats that as
+// "no cover available". Cached at module scope; stale entries only affect
+// representative-cover choice and reset on cold start / scan.
 export async function resolveItemIdFromUuid(
   db: D1Database,
   uuid: string,
-): Promise<string | null> {
+): Promise<Resolved | null> {
   if (!cache) cache = await buildMap(db);
   return cache.get(uuid) ?? null;
 }

@@ -33,11 +33,11 @@ export type ScanReport = {
   durationMs: number;
 };
 
-export async function runScan(env: Env, libraryId: string): Promise<ScanReport> {
+export async function runScan(env: Env, libraryId: string, tenantId: string): Promise<ScanReport> {
   const started = Date.now();
   const folders = await env.DB.prepare(
-    `SELECT * FROM library_folders WHERE library_id = ? ORDER BY added_at ASC`,
-  ).bind(libraryId).all<FolderRow>();
+    `SELECT * FROM library_folders WHERE library_id = ? AND tenant_id = ? ORDER BY added_at ASC`,
+  ).bind(libraryId, tenantId).all<FolderRow>();
 
   const report: ScanReport = {
     libraryId,
@@ -224,26 +224,26 @@ async function probeM4bBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO library_items
-         (id, library_id, folder_id, ino, rel_path, is_file, media_type, is_missing, is_invalid, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'book', 0, 0, ?, ?)`,
-    ).bind(itemId, folder.library_id, folder.id, ino, itemRel, isFile, now, now),
+         (id, library_id, folder_id, tenant_id, ino, rel_path, is_file, media_type, is_missing, is_invalid, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'book', 0, 0, ?, ?)`,
+    ).bind(itemId, folder.library_id, folder.id, folder.tenant_id, ino, itemRel, isFile, now, now),
 
     env.DB.prepare(
       `INSERT INTO book_metadata
-         (library_item_id, title, title_ignore_prefix, subtitle, author_name, narrator_name,
+         (library_item_id, tenant_id, title, title_ignore_prefix, subtitle, author_name, narrator_name,
           series_name, series_sequence, description, isbn, asin, language, publish_year,
           publisher, genres, tags, explicit, abridged, cover_url)
-       VALUES (?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', 0, 0, NULL)`,
-    ).bind(itemId, title, sortKey(title), author, narrator, year, album),
+       VALUES (?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', 0, 0, NULL)`,
+    ).bind(itemId, folder.tenant_id, title, sortKey(title), author, narrator, year, album),
 
     env.DB.prepare(
       `INSERT INTO audio_files
-         (id, library_item_id, index_no, filedn_url, ino, duration_seconds, size_bytes,
+         (id, library_item_id, tenant_id, index_no, filedn_url, ino, duration_seconds, size_bytes,
           mime_type, format, codec, bitrate, sample_rate, channels, added_at,
           rel_path, provider_file_id, moov_offset, moov_size)
-       VALUES (?, ?, 1, ?, ?, ?, ?, 'audio/mp4', 'mp4', 'aac', NULL, NULL, NULL, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, 1, ?, ?, ?, ?, 'audio/mp4', 'mp4', 'aac', NULL, NULL, NULL, ?, ?, ?, ?, ?)`,
     ).bind(
-      audioId, itemId, stableUrl, audioIno,
+      audioId, itemId, folder.tenant_id, stableUrl, audioIno,
       totalDuration,
       file.sizeBytes ?? 0,
       now,
@@ -281,7 +281,7 @@ async function probeM4bBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
     if (moovRes.status === 206 || moovRes.status === 200) {
       const moovBytes = new Uint8Array(await moovRes.arrayBuffer());
       if (moovBytes.byteLength === probe.moovSize) {
-        await env.COVERS.put(`moov/${audioId}`, moovBytes, {
+        await env.COVERS.put(`moov/${folder.tenant_id}/${audioId}`, moovBytes, {
           httpMetadata: { contentType: 'application/octet-stream' },
         });
       }
@@ -365,12 +365,12 @@ async function probeMp3Book(args: {
     const audioIno = (Math.floor(Math.random() * 0xffffffff)).toString();
     return env.DB.prepare(
       `INSERT INTO audio_files
-         (id, library_item_id, index_no, filedn_url, ino, duration_seconds, size_bytes,
+         (id, library_item_id, tenant_id, index_no, filedn_url, ino, duration_seconds, size_bytes,
           mime_type, format, codec, bitrate, sample_rate, channels, added_at,
           rel_path, provider_file_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'audio/mpeg', 'mp3', 'mp3', ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'audio/mpeg', 'mp3', 'mp3', ?, ?, ?, ?, ?, ?)`,
     ).bind(
-      audioId, itemId, i + 1, stableUrls[i] ?? '', audioIno,
+      audioId, itemId, folder.tenant_id, i + 1, stableUrls[i] ?? '', audioIno,
       p.durationSeconds ?? 0,
       f.sizeBytes ?? 0,
       p.bitrate ?? null, p.sampleRate ?? null, p.channels ?? null,
@@ -397,17 +397,17 @@ async function probeMp3Book(args: {
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO library_items
-         (id, library_id, folder_id, ino, rel_path, is_file, media_type, is_missing, is_invalid, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'book', 0, 0, ?, ?)`,
-    ).bind(itemId, folder.library_id, folder.id, ino, itemRel, isFile, now, now),
+         (id, library_id, folder_id, tenant_id, ino, rel_path, is_file, media_type, is_missing, is_invalid, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'book', 0, 0, ?, ?)`,
+    ).bind(itemId, folder.library_id, folder.id, folder.tenant_id, ino, itemRel, isFile, now, now),
 
     env.DB.prepare(
       `INSERT INTO book_metadata
-         (library_item_id, title, title_ignore_prefix, subtitle, author_name, narrator_name,
+         (library_item_id, tenant_id, title, title_ignore_prefix, subtitle, author_name, narrator_name,
           series_name, series_sequence, description, isbn, asin, language, publish_year,
           publisher, genres, tags, explicit, abridged, cover_url)
-       VALUES (?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', 0, 0, NULL)`,
-    ).bind(itemId, title, sortKey(title), author, narrator, year, album),
+       VALUES (?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', 0, 0, NULL)`,
+    ).bind(itemId, folder.tenant_id, title, sortKey(title), author, narrator, year, album),
 
     ...audioStmts,
     ...chapterStmts,
@@ -434,19 +434,19 @@ async function probeMp3Book(args: {
 // Other metadata (title/author/etc) is deliberately NOT overwritten — those
 // rows can be edited (or will be once a metadata-edit UI exists) and we
 // don't want a re-probe to clobber human edits.
-export async function reprobeItem(env: Env, itemId: string): Promise<{
+export async function reprobeItem(env: Env, itemId: string, tenantId: string): Promise<{
   itemId: string;
   chapters: number;
   durationSeconds: number | null;
   coverRefreshed: boolean;
 }> {
   const item = await env.DB.prepare(
-    'SELECT * FROM library_items WHERE id = ?',
-  ).bind(itemId).first<{ id: string; folder_id: string; rel_path: string }>();
+    'SELECT * FROM library_items WHERE id = ? AND tenant_id = ?',
+  ).bind(itemId, tenantId).first<{ id: string; folder_id: string; rel_path: string }>();
   if (!item) throw new Error('Item not found');
   const folder = await env.DB.prepare(
-    'SELECT * FROM library_folders WHERE id = ?',
-  ).bind(item.folder_id).first<FolderRow>();
+    'SELECT * FROM library_folders WHERE id = ? AND tenant_id = ?',
+  ).bind(item.folder_id, tenantId).first<FolderRow>();
   if (!folder) throw new Error('Folder not found');
   const audio = await env.DB.prepare(
     'SELECT * FROM audio_files WHERE library_item_id = ? ORDER BY index_no ASC LIMIT 1',
@@ -505,7 +505,7 @@ export async function reprobeItem(env: Env, itemId: string): Promise<{
     if (moovRes.status === 206 || moovRes.status === 200) {
       const moovBytes = new Uint8Array(await moovRes.arrayBuffer());
       if (moovBytes.byteLength === probe.moovSize) {
-        await env.COVERS.put(`moov/${audio.id}`, moovBytes, {
+        await env.COVERS.put(`moov/${tenantId}/${audio.id}`, moovBytes, {
           httpMetadata: { contentType: 'application/octet-stream' },
         });
       }
@@ -532,11 +532,12 @@ export async function addBookByPath(
   env: Env,
   libraryId: string,
   relPath: string,
+  tenantId: string,
   hints?: { sizeBytes?: number },
 ): Promise<{ added: boolean; itemId?: string; reason?: string }> {
   const folderRow = await env.DB.prepare(
-    `SELECT * FROM library_folders WHERE library_id = ? ORDER BY added_at ASC LIMIT 1`,
-  ).bind(libraryId).first<FolderRow>();
+    `SELECT * FROM library_folders WHERE library_id = ? AND tenant_id = ? ORDER BY added_at ASC LIMIT 1`,
+  ).bind(libraryId, tenantId).first<FolderRow>();
   if (!folderRow) return { added: false, reason: 'No folder configured for library' };
 
   // Idempotency: skip if a row already covers this path (item dir or file).

@@ -2,11 +2,18 @@ import { createMiddleware } from 'hono/factory';
 import type { Env } from '../types';
 import { verifyAccessToken, type AccessClaims } from './tokens';
 import { findUserById, type UserRow } from '../db/users';
+import { getActiveMembership, type TenantRole } from '../db/tenants';
 
 export type AuthVars = {
   userId: string;
   user: UserRow;
   claims: AccessClaims;
+  // The tenant this request acts within, resolved from the user's membership.
+  // Every tenant-scoped query reads this via c.get('tenantId'). Resolved here
+  // (not from the JWT) so a membership change / tenant switch takes effect
+  // without re-issuing the 30-day access token.
+  tenantId: string;
+  tenantRole: TenantRole;
 };
 
 // Requires a valid access token. We accept it from any of:
@@ -29,9 +36,16 @@ export const requireAuth = createMiddleware<{ Bindings: Env; Variables: AuthVars
       return c.json({ error: 'Unauthorized' }, 401);
     }
 
+    // Resolve the active tenant from membership. `?tenant=` lets a multi-tenant
+    // user switch context for a single request (validated against membership).
+    const membership = await getActiveMembership(c.env, user.id, c.req.query('tenant'));
+    if (!membership) return c.json({ error: 'No tenant membership' }, 403);
+
     c.set('userId', user.id);
     c.set('user', user);
     c.set('claims', claims);
+    c.set('tenantId', membership.tenantId);
+    c.set('tenantRole', membership.role);
     await next();
   },
 );

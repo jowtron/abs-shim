@@ -26,12 +26,13 @@ authorRoutes.use('*', requireAuth);
 // for every book this author appears on).
 authorRoutes.get('/:authorId', async (c) => {
   const t0 = Date.now();
+  const tenantId = c.get('tenantId');
   const authorId = c.req.param('authorId');
   const include = (c.req.query('include') ?? '')
     .split(',').map((s) => s.trim()).filter(Boolean);
 
-  for (const lib of await listLibraries(c.env)) {
-    const metadata = await listAllBookMetadata(c.env, lib.id);
+  for (const lib of await listLibraries(c.env, tenantId)) {
+    const metadata = await listAllBookMetadata(c.env, lib.id, tenantId);
     // For each unique author name in this library, the books they appear on.
     const itemsByAuthor = new Map<string, string[]>();
     for (const m of metadata) {
@@ -64,7 +65,7 @@ authorRoutes.get('/:authorId', async (c) => {
       }
 
       const libraryItems = (await Promise.all(itemIds.map(async (iid) => {
-        const bundle = await buildItemBundle(c.env, iid);
+        const bundle = await buildItemBundle(c.env, iid, tenantId);
         return bundle ? await buildItemDetail(bundle) : null;
       }))).filter((x): x is NonNullable<typeof x> => x !== null);
       const t2 = Date.now();

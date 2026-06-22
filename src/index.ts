@@ -15,15 +15,24 @@ import { libraryRoutes } from './routes/library';
 import { itemRoutes } from './routes/items';
 import { authorRoutes } from './routes/authors';
 import { adminRoutes } from './routes/admin';
+import { signupRoutes } from './routes/signup';
+import { renderSignupHtml } from './lib/signup-html';
 import { listProgressByUser, getProgress, upsertProgress, progressToAbs } from './db/progress';
 import { listSessionsByUser } from './db/sessions';
 import { streamAudio } from './storage/resolve';
-import { getFolderById } from './db/library';
+import { getFolderById, getFolderByIdUnscoped } from './db/library';
 import { ADMIN_HTML } from './lib/admin-html';
+import { LANDING_HTML } from './lib/landing-html';
+import { OPS_HTML } from './lib/ops-html';
+import { opsRoutes } from './routes/ops';
+import { requireOpsAccess } from './ops/access';
 import { verifyProxyUrl } from './storage/proxy-url';
 import { getAdapter } from './storage/factory';
 import type { LibraryFolderRow } from './db/library';
 import { WebDAVAdapter } from './storage/webdav';
+
+// Durable Object classes must be re-exported from the Worker entrypoint.
+export { SignupRateLimitDO } from './do/signup-limiter';
 
 const app = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
@@ -93,19 +102,23 @@ app.get('/metadata/items/:id/cover.jpg', async (c) => {
 // no auth required (anyone with the session id gets the file). Look up the
 // session, find its item's audio file, and 302 via the storage adapter.
 app.get('/public/session/:id/track/:trackIndex', async (c) => {
+  // Public, authorized by knowledge of the unguessable session UUID. We still
+  // carry the session's tenant through to the audio + folder lookups so a
+  // session can never stream another tenant's content (integrity check — both
+  // rows are tenant-stamped post-0004).
   const session = await c.env.DB.prepare(
-    `SELECT s.library_item_id, li.folder_id
+    `SELECT s.library_item_id, li.folder_id, li.tenant_id
        FROM listening_sessions s
        JOIN library_items li ON li.id = s.library_item_id
       WHERE s.id = ?`,
-  ).bind(c.req.param('id')).first<{ library_item_id: string; folder_id: string }>();
+  ).bind(c.req.param('id')).first<{ library_item_id: string; folder_id: string; tenant_id: string }>();
   if (!session?.library_item_id) return c.json({ error: 'Session not found' }, 404);
   const idx = Number(c.req.param('trackIndex'));
   const audio = await c.env.DB.prepare(
-    `SELECT * FROM audio_files WHERE library_item_id = ? AND index_no = ?`,
-  ).bind(session.library_item_id, idx).first<import('./db/library').AudioFileRow>();
+    `SELECT * FROM audio_files WHERE library_item_id = ? AND index_no = ? AND tenant_id = ?`,
+  ).bind(session.library_item_id, idx, session.tenant_id).first<import('./db/library').AudioFileRow>();
   if (!audio) return c.json({ error: 'Track not found' }, 404);
-  const folder = await getFolderById(c.env, session.folder_id);
+  const folder = await getFolderById(c.env, session.folder_id, session.tenant_id);
   if (!folder) return c.json({ error: 'Folder not found' }, 404);
   return streamAudio(c.env, folder, audio, c.req.raw);
 });
@@ -134,12 +147,27 @@ app.post('/init', async (c) => {
     google_sub: null,
     is_active: 1,
     is_locked: 0,
+    signup_status: 'active',
     permissions: JSON.stringify(ROOT_PERMISSIONS),
     libraries_accessible: '[]',
     item_tags_selected: '[]',
     created_at: Date.now(),
     last_seen: null,
   });
+
+  // Bootstrap a default tenant owned by this root user, and make them a member,
+  // so requireAuth's tenant resolution succeeds. Mirrors migration 0004's
+  // backfill for the fresh-install path.
+  const now = Date.now();
+  const tenantId = `tnt_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      'INSERT INTO tenants (id, name, owner_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+    ).bind(tenantId, 'Default', id, now, now),
+    c.env.DB.prepare(
+      'INSERT INTO tenant_members (tenant_id, user_id, role, is_default, created_at) VALUES (?, ?, ?, 1, ?)',
+    ).bind(tenantId, id, 'owner', now),
+  ]);
   return c.text('OK');
 });
 
@@ -150,11 +178,23 @@ app.post('/login', async (c) => {
   }
 
   const row = await findUserByUsername(c.env, body.username);
-  if (!row || row.password_hash === null || row.is_active !== 1 || row.is_locked === 1) {
+  if (!row || row.password_hash === null) {
     return c.json({ error: 'Invalid credentials' }, 401);
   }
   if (!(await verifyPassword(body.password, row.password_hash))) {
     return c.json({ error: 'Invalid credentials' }, 401);
+  }
+  // Account-state gates run AFTER password verification so a pending/locked
+  // message is only ever shown to someone who already proved the password —
+  // i.e. it can't be used to enumerate which usernames exist.
+  if (row.is_locked === 1) {
+    return c.json({ error: 'This account is locked.' }, 403);
+  }
+  if (row.is_active !== 1) {
+    if (row.signup_status === 'pending') {
+      return c.json({ error: 'Your account is awaiting approval.' }, 403);
+    }
+    return c.json({ error: 'This account is inactive.' }, 403);
   }
 
   const access = await issueAccessToken(c.env, { id: row.id, username: row.username });
@@ -187,6 +227,17 @@ app.post('/login', async (c) => {
     ereaderDevices: [] as unknown[],
     Source: 'cloudflare-shim',
   });
+});
+
+// Logout. The bundled Nuxt UI POSTs `/logout` then routes to /login on
+// success. Without this route the request fell through to the SPA asset
+// handler (HTML 200) and — critically — never cleared the `accessToken`
+// cookie, so the cookie kept re-authenticating the user and sign-out
+// silently did nothing. Expire the cookie and hand back the JSON shape the
+// client expects (`redirect_url` null → it does its own /login redirect).
+app.post('/logout', (c) => {
+  c.header('Set-Cookie', 'accessToken=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax', { append: true });
+  return c.json({ redirect_url: null });
 });
 
 // Token re-validation heartbeat. ABS clients call this on app focus.
@@ -381,10 +432,27 @@ app.route('/api/items', itemRoutes);
 app.route('/api/authors', authorRoutes);
 app.route('/api/admin', adminRoutes);
 
+// Public self-serve signup (approval-gated). The API lives under /api/signup;
+// the form page is served at /signup. See src/routes/signup.ts.
+app.route('/api/signup', signupRoutes);
+app.get('/signup', (c) => c.html(renderSignupHtml(c.env.TURNSTILE_SITE_KEY)));
+app.get('/signup/', (c) => c.html(renderSignupHtml(c.env.TURNSTILE_SITE_KEY)));
+
+// Internal ops dashboard — gated by Cloudflare Access (NOT user auth). Both the
+// page and its API live under the Access application; requireOpsAccess verifies
+// the signed Cf-Access-Jwt-Assertion as defense-in-depth. See src/ops/access.ts.
+app.route('/api/ops', opsRoutes);
+app.get('/ops', requireOpsAccess, (c) => c.html(OPS_HTML));
+app.get('/ops/', requireOpsAccess, (c) => c.html(OPS_HTML));
+
 // Admin UI: a self-contained HTML page (see src/lib/admin-html.ts). Registered
 // before the SPA notFound fallback so the Nuxt index.html doesn't hijack it.
 app.get('/admin', (c) => c.html(ADMIN_HTML));
 app.get('/admin/', (c) => c.html(ADMIN_HTML));
+// Friendly user-facing alias for the same management page. /admin stays as an
+// alias; the signup "Sign in" link points here.
+app.get('/account', (c) => c.html(ADMIN_HTML));
+app.get('/account/', (c) => c.html(ADMIN_HTML));
 
 // Proxy stream route — for adapters that can't 302 (WebDAV today, possibly
 // other backends later). The URL is HMAC-signed by the adapter's resolveUrl;
@@ -403,7 +471,9 @@ app.get('/public/proxy/:folderId/*', async (c) => {
   const ok = await verifyProxyUrl({ env: c.env, folderId, relPath, exp, sig });
   if (!ok) return c.json({ error: 'Invalid or expired signature' }, 403);
 
-  const folder = await getFolderById(c.env, folderId);
+  // Authorization here is the HMAC signature (minted by the adapter for this
+  // exact folder), not a user tenant — so the folder lookup is unscoped.
+  const folder = await getFolderByIdUnscoped(c.env, folderId);
   if (!folder) return c.json({ error: 'Folder not found' }, 404);
 
   const adapter = await getAdapter(c.env, folder as unknown as Parameters<typeof getAdapter>[1], c.req.url);
@@ -609,6 +679,18 @@ export class ListeningSessionDO {
 export default {
   fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> | Response {
     const u = new URL(req.url);
+    // Marketing/landing page at the true site root. Checked BEFORE the
+    // `/audiobookshelf` prefix-strip below, so the bundled Nuxt SPA (which is
+    // hard-bound to the `/audiobookshelf/` base) keeps owning that path while
+    // `/` is the branded landing page the portfolio scrapes.
+    if (u.pathname === '/' && (req.method === 'GET' || req.method === 'HEAD')) {
+      return new Response(LANDING_HTML, {
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'public, max-age=300',
+        },
+      });
+    }
     let mutated = false;
     // Plappa concatenates `serverUrl + /api/...`; if the user pasted a URL
     // with a trailing slash it produces `//api/...`. Workerd auto-redirects

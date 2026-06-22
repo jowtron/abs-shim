@@ -16,22 +16,24 @@ export const libraryRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 libraryRoutes.use('*', requireAuth);
 
 libraryRoutes.get('/', async (c) => {
-  const rows = await listLibraries(c.env);
+  const tenantId = c.get('tenantId');
+  const rows = await listLibraries(c.env, tenantId);
   const libraries = await Promise.all(rows.map(async (row) => {
-    const folders = await listFolders(c.env, row.id);
+    const folders = await listFolders(c.env, row.id, tenantId);
     return buildLibrary(row, folders);
   }));
   return c.json({ libraries });
 });
 
 libraryRoutes.get('/:id', async (c) => {
-  const row = await getLibrary(c.env, c.req.param('id'));
+  const tenantId = c.get('tenantId');
+  const row = await getLibrary(c.env, c.req.param('id'), tenantId);
   if (!row) return c.json({ error: 'Library not found' }, 404);
-  const folders = await listFolders(c.env, row.id);
+  const folders = await listFolders(c.env, row.id, tenantId);
 
   const include = (c.req.query('include') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   if (include.includes('filterdata')) {
-    const metadata = await listAllBookMetadata(c.env, row.id);
+    const metadata = await listAllBookMetadata(c.env, row.id, tenantId);
     return c.json(await buildFilterData({ libraryRow: row, folders, metadata }));
   }
   return c.json(buildLibrary(row, folders));
@@ -39,20 +41,21 @@ libraryRoutes.get('/:id', async (c) => {
 
 libraryRoutes.get('/:id/personalized', async (c) => {
   const t0 = Date.now();
+  const tenantId = c.get('tenantId');
   const id = c.req.param('id');
-  const row = await getLibrary(c.env, id);
+  const row = await getLibrary(c.env, id, tenantId);
   if (!row) return c.json({ error: 'Library not found' }, 404);
   const t1 = Date.now();
 
-  const items = await listItemsByLibrary(c.env, id);
+  const items = await listItemsByLibrary(c.env, id, tenantId);
   const t2 = Date.now();
 
   const bundles = (await Promise.all(items.map(async (item) => {
-    const folder = await getFolderById(c.env, item.folder_id);
+    const folder = await getFolderById(c.env, item.folder_id, tenantId);
     if (!folder) return null;
     const [metadata, audioFiles, chapters] = await Promise.all([
-      getBookMetadata(c.env, item.id),
-      getAudioFiles(c.env, item.id),
+      getBookMetadata(c.env, item.id, tenantId),
+      getAudioFiles(c.env, item.id, tenantId),
       getChapters(c.env, item.id),
     ]);
     return { item, folder, metadata, audioFiles, chapters };
@@ -67,23 +70,24 @@ libraryRoutes.get('/:id/personalized', async (c) => {
 });
 
 libraryRoutes.get('/:id/items', async (c) => {
+  const tenantId = c.get('tenantId');
   const id = c.req.param('id');
-  const row = await getLibrary(c.env, id);
+  const row = await getLibrary(c.env, id, tenantId);
   if (!row) return c.json({ error: 'Library not found' }, 404);
 
   const limit = Number(c.req.query('limit') ?? '0');
   const page = Number(c.req.query('page') ?? '0');
   const offset = limit > 0 ? page * limit : 0;
 
-  const items = await listItemsByLibrary(c.env, id, { limit, offset });
-  const total = await countItemsByLibrary(c.env, id);
+  const items = await listItemsByLibrary(c.env, id, tenantId, { limit, offset });
+  const total = await countItemsByLibrary(c.env, id, tenantId);
 
   const results = await Promise.all(items.map(async (item) => {
-    const folder = await getFolderById(c.env, item.folder_id);
+    const folder = await getFolderById(c.env, item.folder_id, tenantId);
     if (!folder) throw new Error(`folder ${item.folder_id} missing`);
     const [metadata, audioFiles, chapters] = await Promise.all([
-      getBookMetadata(c.env, item.id),
-      getAudioFiles(c.env, item.id),
+      getBookMetadata(c.env, item.id, tenantId),
+      getAudioFiles(c.env, item.id, tenantId),
       getChapters(c.env, item.id),
     ]);
     return buildItemMinified({ item, folder, metadata, audioFiles, chapters });
@@ -123,9 +127,10 @@ libraryRoutes.get('/:id/search', async (c) => {
 
 // Authors aggregated across the library's books. Sorted by name.
 libraryRoutes.get('/:id/authors', async (c) => {
+  const tenantId = c.get('tenantId');
   const id = c.req.param('id');
-  if (!(await getLibrary(c.env, id))) return c.json({ error: 'Library not found' }, 404);
-  const metadata = await listAllBookMetadata(c.env, id);
+  if (!(await getLibrary(c.env, id, tenantId))) return c.json({ error: 'Library not found' }, 404);
+  const metadata = await listAllBookMetadata(c.env, id, tenantId);
   const counts = new Map<string, number>();
   for (const m of metadata) {
     if (!m.author_name) continue;
@@ -157,17 +162,18 @@ libraryRoutes.get('/:id/authors', async (c) => {
 // books with at least an id + minified media metadata.
 libraryRoutes.get('/:id/series', async (c) => {
   const t0 = Date.now();
+  const tenantId = c.get('tenantId');
   const id = c.req.param('id');
-  if (!(await getLibrary(c.env, id))) return c.json({ error: 'Library not found' }, 404);
+  if (!(await getLibrary(c.env, id, tenantId))) return c.json({ error: 'Library not found' }, 404);
 
-  const items = await listItemsByLibrary(c.env, id);
+  const items = await listItemsByLibrary(c.env, id, tenantId);
   const t1 = Date.now();
   const bundles = (await Promise.all(items.map(async (item) => {
-    const folder = await getFolderById(c.env, item.folder_id);
+    const folder = await getFolderById(c.env, item.folder_id, tenantId);
     if (!folder) return null;
     const [metadata, audioFiles, chapters] = await Promise.all([
-      getBookMetadata(c.env, item.id),
-      getAudioFiles(c.env, item.id),
+      getBookMetadata(c.env, item.id, tenantId),
+      getAudioFiles(c.env, item.id, tenantId),
       getChapters(c.env, item.id),
     ]);
     return { item, folder, metadata, audioFiles, chapters };
@@ -244,8 +250,9 @@ libraryRoutes.get('/:id/series', async (c) => {
 });
 
 libraryRoutes.get('/:id/collections', async (c) => {
+  const tenantId = c.get('tenantId');
   const id = c.req.param('id');
-  if (!(await getLibrary(c.env, id))) return c.json({ error: 'Library not found' }, 404);
+  if (!(await getLibrary(c.env, id, tenantId))) return c.json({ error: 'Library not found' }, 404);
   return c.json(emptyPagedResult());
 });
 
@@ -268,14 +275,14 @@ function nameLF(name: string): string {
   return `${last}, ${parts.join(' ')}`;
 }
 
-export async function buildItemBundle(env: Env, itemId: string) {
-  const item = await getItem(env, itemId);
+export async function buildItemBundle(env: Env, itemId: string, tenantId: string) {
+  const item = await getItem(env, itemId, tenantId);
   if (!item) return null;
-  const folder = await getFolderById(env, item.folder_id);
+  const folder = await getFolderById(env, item.folder_id, tenantId);
   if (!folder) return null;
   const [metadata, audioFiles, chapters] = await Promise.all([
-    getBookMetadata(env, item.id),
-    getAudioFiles(env, item.id),
+    getBookMetadata(env, item.id, tenantId),
+    getAudioFiles(env, item.id, tenantId),
     getChapters(env, item.id),
   ]);
   return { item, folder, metadata, audioFiles, chapters };

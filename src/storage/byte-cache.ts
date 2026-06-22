@@ -30,8 +30,10 @@ import { parseRange } from './moov-cache';
 
 const CHUNK_SIZE = 4 * 1024 * 1024;
 
-function chunkKey(audioId: string, chunkIndex: number): string {
-  return `audio/${audioId}/${chunkIndex}`;
+// Tenant-prefixed so one tenant's cached audio chunks can never be served for
+// another tenant's audio id (defense-in-depth; ids are already unique).
+function chunkKey(tenantId: string, audioId: string, chunkIndex: number): string {
+  return `audio/${tenantId}/${audioId}/${chunkIndex}`;
 }
 
 // Convert a (start byte) → (chunk index, chunk-start byte, chunk-end byte).
@@ -73,7 +75,7 @@ export async function tryServeByteRange(
   if (!range) return null;
 
   const startChunk = chunkBoundsFor(range.start, audio.size_bytes);
-  const startHead = await env.COVERS.head(chunkKey(audio.id, startChunk.idx));
+  const startHead = await env.COVERS.head(chunkKey(audio.tenant_id, audio.id, startChunk.idx));
   if (!startHead) return null;
 
   const responseLength = range.end - range.start + 1;
@@ -113,7 +115,7 @@ export async function tryServeByteRange(
           const chunk = chunkBoundsFor(cursor, audio.size_bytes);
           const offsetInChunk = cursor - chunk.start;
           const sliceLen = Math.min(range.end, chunk.end) - cursor + 1;
-          const r2 = await env.COVERS.get(chunkKey(audio.id, chunk.idx), {
+          const r2 = await env.COVERS.get(chunkKey(audio.tenant_id, audio.id, chunk.idx), {
             range: { offset: offsetInChunk, length: sliceLen },
           });
           if (r2) {
@@ -178,7 +180,7 @@ export async function warmByteChunk(
   if (byteOffset < 0 || byteOffset >= audio.size_bytes) return;
 
   const chunk = chunkBoundsFor(byteOffset, audio.size_bytes);
-  const key = chunkKey(audio.id, chunk.idx);
+  const key = chunkKey(audio.tenant_id, audio.id, chunk.idx);
 
   try {
     const existing = await env.COVERS.head(key);
@@ -302,7 +304,7 @@ async function accumulateChunks(
 
   const flush = async () => {
     if (buf && bufOffset === bufLen) {
-      const key = chunkKey(audio.id, bufChunkIdx);
+      const key = chunkKey(audio.tenant_id, audio.id, bufChunkIdx);
       try {
         const existing = await env.COVERS.head(key);
         if (!existing) {
