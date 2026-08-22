@@ -21,6 +21,7 @@ export type AbbResult = {
   format: string | null;    // 'm4b' | 'mp3' | …
   bitrate: string | null;
   sizeBytes: number | null;
+  posted: string | null;    // "24 Dec 2025" — ABB's upload date, verbatim
 };
 
 export type AbbCookie = { cookie: string; expiresAt: number };
@@ -103,11 +104,14 @@ function parseResults(html: string): AbbResult[] {
     const cat = /Category:\s*([\s\S]*?)\s*Language:\s*(\w+)/.exec(infoText);
     const fmt = /(Format:\s*.*?File Size:\s*[\d.]+\s*\w+)/.exec(infoText);
     const info = fmt ? fmt[1]!.trim() : '';
+    // "Posted: 24 Dec 2025" sits right before "Format:" in the same <p>.
+    const posted = /Posted:\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})/.exec(infoText)?.[1] ?? null;
     out.push({
       title, url, cover,
       category: cat ? cat[1]!.trim() : '',
       language: cat ? cat[2]! : '',
       info,
+      posted,
       ...parseInfo(info),
     });
   }

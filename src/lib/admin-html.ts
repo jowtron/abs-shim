@@ -72,6 +72,12 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     .spinner { display: inline-block; width: 0.8em; height: 0.8em; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: -0.1em; margin-right: 0.4em; }
     @keyframes spin { to { transform: rotate(360deg); } }
     .abb-cover { width: 44px; height: 44px; object-fit: cover; border-radius: 4px; background: var(--border); display: block; }
+    /* Search field with an inline × clear button (hidden while empty). */
+    .search-wrap { position: relative; flex: 1; min-width: 160px; display: flex; }
+    .search-wrap input[type=text] { flex: 1; min-width: 0; padding-right: 1.9rem; }
+    .search-clear { position: absolute; right: 0.15rem; top: 50%; transform: translateY(-50%); width: 1.6rem; height: 1.6rem; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--muted); font-size: 1.1rem; line-height: 1; cursor: pointer; display: none; }
+    .search-clear:hover { background: rgba(125,125,125,0.2); color: inherit; }
+    .search-wrap.has-value .search-clear { display: block; }
     .abb-progress-row td { padding: 0 0 0.5rem 0; }
     #abb-results td { vertical-align: middle; }
     #abb-results .abb-title { font-weight: 500; }
@@ -143,7 +149,10 @@ export const ADMIN_HTML = String.raw`<!doctype html>
       <div id="abb-settings-status" class="muted" style="font-size:0.85rem"></div>
     </details>
     <div class="upload-row" style="margin-top:0.75rem">
-      <input type="text" id="abb-q" placeholder="Search AudioBookBay… (title, author)" />
+      <span class="search-wrap">
+        <input type="text" id="abb-q" placeholder="Search AudioBookBay… (title, author)" />
+        <button type="button" class="search-clear" id="abb-clear" aria-label="Clear search" title="Clear">×</button>
+      </span>
       <select id="abb-target"></select>
       <button id="abb-search">Search</button>
     </div>
@@ -1095,6 +1104,7 @@ function renderAbb(status, libraries) {
     if (f.provider !== 'pcloud_oauth') continue;
     const opt = document.createElement('option');
     opt.value = f.id;
+    opt.dataset.libraryId = f.libraryId;
     opt.textContent = (f.libraryName || libName[f.libraryId] || f.libraryId) + ' → pCloud ' + ((f.config && f.config.rootPath) || '/');
     target.appendChild(opt);
   }
@@ -1107,7 +1117,23 @@ function renderAbb(status, libraries) {
   document.getElementById('abb-save').addEventListener('click', abbSaveSettings);
   document.getElementById('abb-test').addEventListener('click', abbTestSettings);
   document.getElementById('abb-search').addEventListener('click', abbDoSearch);
-  document.getElementById('abb-q').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') abbDoSearch(); });
+  const q = document.getElementById('abb-q');
+  const clear = document.getElementById('abb-clear');
+  const syncClear = () => q.parentElement.classList.toggle('has-value', q.value.length > 0);
+  q.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') abbDoSearch(); });
+  q.addEventListener('input', syncClear);
+  clear.addEventListener('click', () => {
+    q.value = '';
+    syncClear();
+    document.getElementById('abb-results').innerHTML = '';
+    q.focus();
+  });
+  syncClear();
+}
+
+function abbLibraryIdForFolder(folderId) {
+  const opt = [...document.getElementById('abb-target').options].find((o) => o.value === folderId);
+  return opt ? opt.dataset.libraryId : null;
 }
 
 async function abbLoadSettings() {
@@ -1193,7 +1219,7 @@ async function abbDoSearch() {
     const tb = document.createElement('tbody');
     for (const res of r.results) {
       const tr = document.createElement('tr');
-      const fmt = [res.format ? res.format.toUpperCase() : null, res.bitrate, res.sizeBytes ? formatBytes(res.sizeBytes) : null, res.language].filter(Boolean).join(' · ');
+      const fmt = [res.format ? res.format.toUpperCase() : null, res.bitrate, res.sizeBytes ? formatBytes(res.sizeBytes) : null, res.language, res.posted ? 'Posted ' + res.posted : null].filter(Boolean).join(' · ');
       tr.innerHTML = '<td style="width:44px"></td><td></td><td style="width:1%; white-space:nowrap"></td>';
       if (res.cover && /^https?:/.test(res.cover)) {
         const img = document.createElement('img');
@@ -1299,7 +1325,23 @@ async function abbGrab(res, folderId, listEl) {
       }
     }
     await Promise.all(fetches);
-    row.complete('Done');
+    // /fetch-url/finish only registers single m4b/m4a/aac files. An mp3
+    // release is N chapter files that must land before they can be probed
+    // as one book, so nothing registers them until a scan runs — do that
+    // here rather than making the user find "Scan now".
+    const libId = abbLibraryIdForFolder(folderId);
+    if (libId) {
+      row.setStatus('Scanning library…');
+      try {
+        const report = await api('/api/admin/libraries/' + libId + '/scan', { method: 'POST' });
+        row.complete('Done — scan added ' + (report.added || 0) + ' new book(s)');
+        refresh().catch(() => {});
+      } catch (e) {
+        row.complete('Done, but the library scan failed: ' + e.message + ' — use "Scan now"');
+      }
+    } else {
+      row.complete('Done');
+    }
     return true;
   } catch (e) {
     row.fail(e.message || String(e));
