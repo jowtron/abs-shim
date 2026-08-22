@@ -9,6 +9,8 @@ export type Env = {
   COVERS: R2Bucket; // Persistent cover cache — see src/routes/items.ts.
   // Secrets (set via `wrangler secret put`):
   JWT_SECRET?: string;
+  // AES-256-GCM key (base64, 32 bytes) for per-tenant secrets in D1 — see src/lib/secret-box.ts.
+  SETTINGS_KEY?: string;
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
   PCLOUD_CLIENT_ID?: string;

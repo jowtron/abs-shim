@@ -1120,6 +1120,9 @@ async function abbLoadSettings() {
     if (!s.canEdit) {
       for (const id of ['abb-user', 'abb-pass', 'abb-rd', 'abb-save']) document.getElementById(id).disabled = true;
       st.textContent = 'Only the tenant owner can change these accounts.';
+    } else if (s.encryptionConfigured === false) {
+      document.getElementById('abb-settings').open = true;
+      st.textContent = 'The server has no SETTINGS_KEY secret, so credentials can\'t be stored. Run: openssl rand -base64 32 | npx wrangler secret put SETTINGS_KEY';
     } else if (!s.rdTokenSet) {
       document.getElementById('abb-settings').open = true;
       st.textContent = 'Add a Real-Debrid API token to grab releases. The AudioBookBay login is optional (needed only for member-only pages).';

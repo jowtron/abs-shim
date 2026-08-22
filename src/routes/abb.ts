@@ -3,6 +3,7 @@ import type { Env } from '../types';
 import { requireAuth, type AuthVars } from '../auth/middleware';
 import { getTenantSetting, setTenantSetting, deleteTenantSetting } from '../db/settings';
 import { abbLogin, abbSearch, abbMagnet, type AbbCookie } from '../lib/abb';
+import { sealSecret, openSecret, secretsConfigured } from '../lib/secret-box';
 import {
   rdUser, rdInfo, rdAddMagnet, rdSelectFiles, rdDelete, rdUnrestrict, rdWaitForFiles,
   audioFiles, extOf, AUDIO_EXT, ARCHIVE_EXT, RD_FAILED,
@@ -30,17 +31,19 @@ const K = { user: 'abb_username', pass: 'abb_password', rd: 'rd_token', cookie: 
 
 type Creds = { abbUsername: string | null; abbPassword: string | null; rdToken: string | null };
 
+// Password, token and session cookie are encrypted at rest (secret-box);
+// the username is not a secret and stays readable.
 async function loadCreds(env: Env, tenantId: string): Promise<Creds> {
   const [abbUsername, abbPassword, rdToken] = await Promise.all([
     getTenantSetting(env, tenantId, K.user),
-    getTenantSetting(env, tenantId, K.pass),
-    getTenantSetting(env, tenantId, K.rd),
+    getTenantSetting(env, tenantId, K.pass).then((v) => openSecret(env, v)),
+    getTenantSetting(env, tenantId, K.rd).then((v) => openSecret(env, v)),
   ]);
   return { abbUsername, abbPassword, rdToken };
 }
 
 async function requireRd(env: Env, tenantId: string): Promise<string> {
-  const t = await getTenantSetting(env, tenantId, K.rd);
+  const t = await openSecret(env, await getTenantSetting(env, tenantId, K.rd));
   if (!t) throw new Error('Real-Debrid API token not set — add it under AudioBookBay settings');
   return t;
 }
@@ -50,7 +53,7 @@ async function requireRd(env: Env, tenantId: string): Promise<string> {
 // anonymously, only member-only detail pages need it.
 async function abbCookie(env: Env, tenantId: string, force = false): Promise<string | null> {
   if (!force) {
-    const raw = await getTenantSetting(env, tenantId, K.cookie);
+    const raw = await openSecret(env, await getTenantSetting(env, tenantId, K.cookie));
     if (raw) {
       try {
         const c = JSON.parse(raw) as AbbCookie;
@@ -61,7 +64,7 @@ async function abbCookie(env: Env, tenantId: string, force = false): Promise<str
   const { abbUsername, abbPassword } = await loadCreds(env, tenantId);
   if (!abbUsername || !abbPassword) return null;
   const c = await abbLogin(abbUsername, abbPassword);
-  await setTenantSetting(env, tenantId, K.cookie, JSON.stringify(c));
+  await setTenantSetting(env, tenantId, K.cookie, await sealSecret(env, JSON.stringify(c)));
   return c.cookie;
 }
 
@@ -80,6 +83,7 @@ abbRoutes.get('/settings', async (c) => {
     abbPasswordSet: !!creds.abbPassword,
     rdTokenSet: !!creds.rdToken,
     canEdit: c.get('tenantRole') === 'owner',
+    encryptionConfigured: secretsConfigured(c.env),
   });
 });
 
@@ -93,14 +97,17 @@ abbRoutes.put('/settings', async (c) => {
   const abbPassword = String(body['abbPassword'] ?? '');
   const rdToken = String(body['rdToken'] ?? '').trim();
   const clear = Array.isArray(body['clear']) ? (body['clear'] as unknown[]).map(String) : [];
+  if ((abbPassword || rdToken) && !secretsConfigured(c.env)) {
+    return c.json({ error: 'Server has no SETTINGS_KEY secret, so credentials can\'t be stored encrypted. Run: openssl rand -base64 32 | npx wrangler secret put SETTINGS_KEY' }, 503);
+  }
   if (clear.includes('abb')) {
     await Promise.all([K.user, K.pass, K.cookie].map((k) => deleteTenantSetting(c.env, tenantId, k)));
   }
   if (clear.includes('rd')) await deleteTenantSetting(c.env, tenantId, K.rd);
   if (abbUsername) await setTenantSetting(c.env, tenantId, K.user, abbUsername);
-  if (abbPassword) await setTenantSetting(c.env, tenantId, K.pass, abbPassword);
+  if (abbPassword) await setTenantSetting(c.env, tenantId, K.pass, await sealSecret(c.env, abbPassword));
   if (abbUsername || abbPassword) await deleteTenantSetting(c.env, tenantId, K.cookie);
-  if (rdToken) await setTenantSetting(c.env, tenantId, K.rd, rdToken);
+  if (rdToken) await setTenantSetting(c.env, tenantId, K.rd, await sealSecret(c.env, rdToken));
   return c.json({ ok: true });
 });
 
