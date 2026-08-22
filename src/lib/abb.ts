@@ -14,6 +14,7 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 export type AbbResult = {
   title: string;
   url: string;
+  cover: string | null;     // post thumbnail (ibb.co / Amazon), http(s) only
   category: string;
   language: string;
   info: string;
@@ -91,14 +92,19 @@ function parseResults(html: string): AbbResult[] {
     const block = m[1]!;
     const t = /<div class="postTitle"><h2><a href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/.exec(block);
     if (!t) continue;
-    const url = new URL(t[1]!, ABB_BASE).href;
+    // Scraped hrefs end up in <a href> in the admin UI and Pholia — refuse
+    // anything that isn't http(s) so a hostile page can't plant javascript:.
+    const url = safeHttpUrl(t[1]!);
+    if (!url) continue;
     const title = decodeEntities(t[2]!.trim());
+    const img = /<img[^>]+src="([^"]+)"/i.exec(block);
+    const cover = img ? safeHttpUrl(img[1]!) : null;
     const infoText = decodeEntities(block.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ');
     const cat = /Category:\s*([\s\S]*?)\s*Language:\s*(\w+)/.exec(infoText);
     const fmt = /(Format:\s*.*?File Size:\s*[\d.]+\s*\w+)/.exec(infoText);
     const info = fmt ? fmt[1]!.trim() : '';
     out.push({
-      title, url,
+      title, url, cover,
       category: cat ? cat[1]!.trim() : '',
       language: cat ? cat[2]! : '',
       info,
@@ -146,6 +152,15 @@ export async function abbMagnet(pageUrl: string, cookie: string | null): Promise
     + '&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A80'
     + '&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce';
   return { url: pageUrl, title, infoHash: hash.toLowerCase(), magnet };
+}
+
+function safeHttpUrl(raw: string): string | null {
+  try {
+    const u = new URL(decodeEntities(raw), ABB_BASE);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null;
+  } catch {
+    return null;
+  }
 }
 
 function htmlTitle(html: string): string {

@@ -69,6 +69,23 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     .upload-row input[type=text] { flex: 1; min-width: 160px; }
     .upload-item { padding: 0.4rem 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 4px; margin: 0.25rem 0; font-size: 0.85rem; }
     .upload-item .name { font-weight: 500; word-break: break-all; }
+    .spinner { display: inline-block; width: 0.8em; height: 0.8em; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: -0.1em; margin-right: 0.4em; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .abb-cover { width: 44px; height: 44px; object-fit: cover; border-radius: 4px; background: var(--border); display: block; }
+    .abb-progress-row td { padding: 0 0 0.5rem 0; }
+    #abb-results td { vertical-align: middle; }
+    #abb-results .abb-title { font-weight: 500; }
+    #abb-results .abb-sub { color: var(--muted); font-size: 0.8rem; }
+    /* Mobile: cards scroll sideways instead of overflowing the viewport. */
+    .card { min-width: 0; overflow-x: auto; }
+    code { overflow-wrap: anywhere; }
+    input, select { max-width: 100%; box-sizing: border-box; }
+    .upload-row input[type=text], .upload-row input[type=password] { min-width: 0; }
+    @media (max-width: 600px) {
+      body { padding: 0.75rem; }
+      .card { padding: 0.75rem; }
+      th, td { padding: 0.35rem 0.4rem; font-size: 0.85rem; }
+    }
     .upload-item .progress-bar { display: block; height: 4px; background: var(--border); border-radius: 2px; margin-top: 0.3rem; overflow: hidden; }
     .upload-item .progress-bar > span { display: block; height: 100%; background: var(--accent); width: 0%; transition: width 0.15s; }
     .upload-item.ok { border-color: var(--ok); }
@@ -107,6 +124,30 @@ export const ADMIN_HTML = String.raw`<!doctype html>
       <input id="login-password" placeholder="password" type="password" autocomplete="current-password" required />
       <button type="submit">Sign in</button>
     </form>
+  </div>
+
+  <div id="abb-card" class="card">
+    <h2>AudioBookBay → Real-Debrid</h2>
+    <p class="muted" style="margin-top:0">Search AudioBookBay, send a release to Real-Debrid, and have pCloud fetch the finished files straight into a library. Multi-file releases are added one file at a time so nothing arrives as a rar.</p>
+    <details id="abb-settings">
+      <summary>Accounts</summary>
+      <div class="upload-row" style="margin-top:0.5rem">
+        <input type="text" id="abb-user" placeholder="AudioBookBay username" autocomplete="off" />
+        <input type="password" id="abb-pass" placeholder="AudioBookBay password" autocomplete="new-password" />
+      </div>
+      <div class="upload-row">
+        <input type="password" id="abb-rd" placeholder="Real-Debrid API token (real-debrid.com/apitoken)" autocomplete="new-password" />
+        <button id="abb-save">Save</button>
+        <button class="secondary" id="abb-test">Test</button>
+      </div>
+      <div id="abb-settings-status" class="muted" style="font-size:0.85rem"></div>
+    </details>
+    <div class="upload-row" style="margin-top:0.75rem">
+      <input type="text" id="abb-q" placeholder="Search AudioBookBay… (title, author)" />
+      <select id="abb-target"></select>
+      <button id="abb-search">Search</button>
+    </div>
+    <div id="abb-results"></div>
   </div>
 
   <div id="connections-card" class="card">
@@ -165,31 +206,6 @@ npx wrangler secret put PCLOUD_CLIENT_SECRET</pre>
   <div id="libraries-card" class="card">
     <h2>Libraries</h2>
     <div id="libraries-body" class="muted">Loading…</div>
-  </div>
-
-  <div id="abb-card" class="card">
-    <h2>AudioBookBay → Real-Debrid</h2>
-    <p class="muted" style="margin-top:0">Search AudioBookBay, send a release to Real-Debrid, and have pCloud fetch the finished files straight into a library. Multi-file releases are added one file at a time so nothing arrives as a rar.</p>
-    <details id="abb-settings">
-      <summary>Accounts</summary>
-      <div class="upload-row" style="margin-top:0.5rem">
-        <input type="text" id="abb-user" placeholder="AudioBookBay username" autocomplete="off" />
-        <input type="password" id="abb-pass" placeholder="AudioBookBay password" autocomplete="new-password" />
-      </div>
-      <div class="upload-row">
-        <input type="password" id="abb-rd" placeholder="Real-Debrid API token (real-debrid.com/apitoken)" autocomplete="new-password" />
-        <button id="abb-save">Save</button>
-        <button class="secondary" id="abb-test">Test</button>
-      </div>
-      <div id="abb-settings-status" class="muted" style="font-size:0.85rem"></div>
-    </details>
-    <div class="upload-row" style="margin-top:0.75rem">
-      <input type="text" id="abb-q" placeholder="Search AudioBookBay… (title, author)" />
-      <select id="abb-target"></select>
-      <button id="abb-search">Search</button>
-    </div>
-    <div id="abb-results"></div>
-    <div class="upload-list" id="abb-jobs"></div>
   </div>
 
   <div id="cover-cache-card" class="card">
@@ -1171,27 +1187,41 @@ async function abbDoSearch() {
     }
     out.innerHTML = '';
     const table = document.createElement('table');
-    table.innerHTML = '<thead><tr><th>Title</th><th>Format</th><th>Size</th><th>Lang</th><th></th></tr></thead>';
     const tb = document.createElement('tbody');
     for (const res of r.results) {
       const tr = document.createElement('tr');
-      const fmt = (res.format ? res.format.toUpperCase() : '?') + (res.bitrate ? ' · ' + res.bitrate : '');
-      tr.innerHTML = '<td></td><td></td><td></td><td></td><td></td>';
-      tr.children[0].innerHTML = '<a target="_blank" rel="noopener"></a>';
-      tr.children[0].firstChild.href = res.url;
-      tr.children[0].firstChild.textContent = res.title;
-      tr.children[1].textContent = fmt;
-      tr.children[2].textContent = res.sizeBytes ? formatBytes(res.sizeBytes) : '';
-      tr.children[3].textContent = res.language || '';
+      const fmt = [res.format ? res.format.toUpperCase() : null, res.bitrate, res.sizeBytes ? formatBytes(res.sizeBytes) : null, res.language].filter(Boolean).join(' · ');
+      tr.innerHTML = '<td style="width:44px"></td><td></td><td style="width:1%; white-space:nowrap"></td>';
+      if (res.cover && /^https?:/.test(res.cover)) {
+        const img = document.createElement('img');
+        img.className = 'abb-cover'; img.alt = ''; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
+        img.src = res.cover;
+        img.addEventListener('error', () => { img.style.visibility = 'hidden'; });
+        tr.children[0].appendChild(img);
+      }
+      tr.children[1].innerHTML = '<a class="abb-title" target="_blank" rel="noopener"></a><div class="abb-sub"></div>';
+      tr.children[1].firstChild.href = res.url;
+      tr.children[1].firstChild.textContent = res.title;
+      tr.children[1].lastChild.textContent = fmt;
       const b = document.createElement('button');
       b.textContent = 'Grab';
+      // Progress renders in a row directly under this result, not at the
+      // bottom of the list, so it's obvious which grab is which.
+      const prow = document.createElement('tr');
+      prow.className = 'abb-progress-row';
+      prow.style.display = 'none';
+      prow.innerHTML = '<td colspan="3"><div class="upload-list"></div></td>';
       b.addEventListener('click', () => {
         b.disabled = true;
-        abbGrab(res, document.getElementById('abb-target').value, document.getElementById('abb-jobs'))
-          .finally(() => { b.disabled = false; });
+        b.innerHTML = '<span class="spinner"></span>Grabbing…';
+        prow.style.display = '';
+        abbGrab(res, document.getElementById('abb-target').value, prow.firstChild.firstChild)
+          .then((ok) => { b.textContent = ok ? 'Done ✓' : 'Retry'; b.disabled = !!ok; })
+          .catch(() => { b.textContent = 'Retry'; b.disabled = false; });
       });
-      tr.children[4].appendChild(b);
+      tr.children[2].appendChild(b);
       tb.appendChild(tr);
+      tb.appendChild(prow);
     }
     table.appendChild(tb);
     out.appendChild(table);
@@ -1204,7 +1234,7 @@ async function abbDoSearch() {
 
 // Resolve → add torrent(s) → poll → pCloud fetch each file → delete torrent.
 async function abbGrab(res, folderId, listEl) {
-  if (!folderId) { showError('Pick a target library first.'); return; }
+  if (!folderId) { showError('Pick a target library first.'); return false; }
   const row = appendUploadRow(listEl, res.title, 'Resolving on AudioBookBay…');
   try {
     const m = await api('/api/admin/abb/resolve', {
@@ -1267,8 +1297,10 @@ async function abbGrab(res, folderId, listEl) {
     }
     await Promise.all(fetches);
     row.complete('Done');
+    return true;
   } catch (e) {
     row.fail(e.message || String(e));
+    return false;
   }
 }
 
