@@ -6,6 +6,7 @@ import {
   exchangePcloudCode, pcloudAuthorizeUrl, pcloudUserinfo,
   apiHostFromLocationId, type PcloudProfile,
   pcloudUploadCreate, pcloudUploadWrite, pcloudUploadSave,
+  pcloudEnsureFolder, pcloudStat, pcloudDownloadFileAsync,
 } from '../storage/pcloud';
 import { runScan, addBookByPath, reprobeItem, type ScanReport } from '../scanner/scan';
 import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem } from '../db/library';
@@ -601,6 +602,234 @@ adminRoutes.post('/storage/folder/:folderId/upload/save', async (c) => {
   if (itemId) out.itemId = itemId;
   if (registerError) out.registerError = registerError;
   return c.json(out);
+});
+
+// ─── pCloud fetch-from-URL ──────────────────────────────────────────────────
+//
+// "Paste a download link" flow. pCloud's own servers pull the file
+// (downloadfileasync), so nothing streams through the Worker and the file
+// size doesn't matter. Three stateless calls from the browser:
+//   start    → validates, HEADs the source for Content-Length, ensures the
+//              target folder exists, queues the job
+//   progress → stat()s the target path; "finished" when its size reaches
+//              the source's Content-Length (or, when the source didn't say,
+//              when the size stops changing between two polls)
+//   finish   → registers the landed file with addBookByPath
+// Stateless on purpose — no D1 table for jobs; if the admin tab closes
+// mid-download the file still lands and "Add book by path" recovers it.
+//
+// Why stat-based: pCloud documents uploadprogress?progresshash for these
+// jobs, but live it returns 1900 "Upload not found" for the entire download
+// (see src/storage/pcloud.ts). Why size-compare: we don't know whether pCloud
+// writes the file atomically or grows it in place, and registering a
+// half-written m4b would probe garbage. Matching Content-Length is safe
+// either way.
+//
+// Constraint worth knowing: the URL must be a *direct* download that
+// pCloud's fetcher can GET without cookies/JS. Google Drive share pages,
+// MEGA etc. hand back HTML; some hosts (w3.org, observed) refuse pCloud's
+// fetcher outright — pCloud reports success and the file simply never
+// appears. The HEAD probe in /start catches the HTML case; the
+// never-appears case surfaces as a client-side timeout.
+
+function splitRelPath(relPath: string): { dir: string; name: string } {
+  const idx = relPath.lastIndexOf('/');
+  return idx === -1
+    ? { dir: '', name: relPath }
+    : { dir: relPath.slice(0, idx), name: relPath.slice(idx + 1) };
+}
+
+// Learn what the source serves before asking pCloud to fetch it. HEAD first;
+// some hosts reject HEAD, so fall back to a 1-byte ranged GET and read the
+// total off Content-Range. Any failure here is non-fatal (size unknown) —
+// pCloud may still succeed where we didn't — except an HTML body, which
+// means this is a landing page and not a file.
+async function probeSourceUrl(url: string): Promise<{ size?: number; contentType?: string; error?: string }> {
+  const out: { size?: number; contentType?: string; error?: string } = {};
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 8000);
+  try {
+    let res = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: ac.signal });
+    let size = Number(res.headers.get('content-length') ?? '');
+    if (!res.ok || !Number.isFinite(size) || size <= 0) {
+      res = await fetch(url, { method: 'GET', redirect: 'follow', signal: ac.signal, headers: { Range: 'bytes=0-0' } });
+      const m = /\/(\d+)\s*$/.exec(res.headers.get('content-range') ?? '');
+      size = m ? Number(m[1]) : Number(res.headers.get('content-length') ?? '');
+      await res.body?.cancel().catch(() => undefined);
+    }
+    const ct = (res.headers.get('content-type') ?? '').toLowerCase();
+    if (ct) out.contentType = ct;
+    if (/^text\/html/.test(ct)) {
+      out.error = 'That URL serves a web page (text/html), not a file — it needs to be a direct download link';
+      return out;
+    }
+    if (res.ok && Number.isFinite(size) && size > 0) out.size = size;
+  } catch {
+    // Unreachable from the Worker isn't proof pCloud can't fetch it; carry on with size unknown.
+  } finally {
+    clearTimeout(timer);
+  }
+  return out;
+}
+
+// Body: { url: string, relPath: string }
+// Returns: { relPath, absPath, expectedSize? }
+adminRoutes.post('/storage/folder/:folderId/fetch-url/start', async (c) => {
+  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
+  if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  const url = String(body['url'] ?? '').trim();
+  const relPath = String(body['relPath'] ?? '').trim().replace(/^\/+/, '');
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return c.json({ error: 'url must be an absolute http(s) URL' }, 400);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return c.json({ error: 'url must be http(s)' }, 400);
+  }
+  const { dir, name } = splitRelPath(relPath);
+  if (!name) return c.json({ error: 'relPath must include a file name' }, 400);
+  let absDir: string;
+  let absPath: string;
+  try {
+    absDir = dir ? joinPcloudPath(loaded.rootPath, dir) : (loaded.rootPath.replace(/\/+$/, '') || '/');
+    absPath = joinPcloudPath(loaded.rootPath, relPath);
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+  // Refuse to clobber — pCloud would otherwise save alongside as "name (1)"
+  // and the registration step would point at the wrong file.
+  if (await pcloudStat(loaded.profile, absPath)) {
+    return c.json({ error: `Already exists in pCloud: ${absPath}` }, 409);
+  }
+  const probe = await probeSourceUrl(url);
+  if (probe.error) return c.json({ error: probe.error }, 400);
+  const folderId = await pcloudEnsureFolder(loaded.profile, absDir);
+  await pcloudDownloadFileAsync(loaded.profile, { url, folderId, name });
+  const out: { relPath: string; absPath: string; expectedSize?: number } = { relPath, absPath };
+  if (probe.size != null) out.expectedSize = probe.size;
+  return c.json(out);
+});
+
+// Query: ?relPath=…&expectedSize=N&lastSize=N
+// Returns: { finished: boolean, status: 'pending'|'downloading'|'ready', size?, downloaded? }
+adminRoutes.get('/storage/folder/:folderId/fetch-url/progress', async (c) => {
+  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
+  if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
+  const relPath = (c.req.query('relPath') ?? '').trim().replace(/^\/+/, '');
+  const expectedSize = Number(c.req.query('expectedSize') ?? '');
+  const lastSize = Number(c.req.query('lastSize') ?? '');
+  if (!relPath) return c.json({ error: 'relPath required' }, 400);
+  let absPath: string;
+  try {
+    absPath = joinPcloudPath(loaded.rootPath, relPath);
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+  const meta = await pcloudStat(loaded.profile, absPath);
+  if (!meta || meta.isfolder) return c.json({ finished: false, status: 'pending' });
+  const size = meta.size ?? 0;
+  const done = Number.isFinite(expectedSize) && expectedSize > 0
+    ? size >= expectedSize
+    // No Content-Length from the source: call it done once the size holds
+    // still across two polls. Only a heuristic, but it's all we've got.
+    : size > 0 && Number.isFinite(lastSize) && lastSize === size;
+  const out: { finished: boolean; status: string; size?: number; downloaded: number } = {
+    finished: done, status: done ? 'ready' : 'downloading', downloaded: size,
+  };
+  if (Number.isFinite(expectedSize) && expectedSize > 0) out.size = expectedSize;
+  return c.json(out);
+});
+
+// Body: { relPath: string, registerAsBook?: boolean }
+// Mirrors the tail of /upload/save so both paths register books identically.
+adminRoutes.post('/storage/folder/:folderId/fetch-url/finish', async (c) => {
+  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
+  if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  const relPath = String(body['relPath'] ?? '').trim().replace(/^\/+/, '');
+  const registerAsBook = body['registerAsBook'] !== false;
+  if (!relPath) return c.json({ error: 'relPath required' }, 400);
+  let absPath: string;
+  try {
+    absPath = joinPcloudPath(loaded.rootPath, relPath);
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+  const meta = await pcloudStat(loaded.profile, absPath);
+  if (!meta || meta.isfolder) return c.json({ error: `File not found in pCloud: ${absPath}` }, 404);
+
+  let itemId: string | undefined;
+  let registerError: string | undefined;
+  if (registerAsBook && /\.(m4b|m4a|aac)$/i.test(relPath)) {
+    try {
+      const hints: { sizeBytes?: number } = {};
+      if (meta.size != null) hints.sizeBytes = meta.size;
+      const result = await addBookByPath(c.env, loaded.folder.library_id, relPath, c.get('tenantId'), hints);
+      if (result.itemId) itemId = result.itemId;
+      if (!result.added && result.reason) registerError = result.reason;
+    } catch (e) {
+      registerError = (e as Error).message;
+    }
+  }
+  const out: { savedPath: string; size?: number; itemId?: string; registerError?: string } = { savedPath: absPath };
+  if (meta.size != null) out.size = meta.size;
+  if (itemId) out.itemId = itemId;
+  if (registerError) out.registerError = registerError;
+  return c.json(out);
+});
+
+// ─── Server-side zip extraction ─────────────────────────────────────────────
+//
+// Hands a zip that already sits in pCloud to ArchiveExtractDO (see
+// src/do/archive-extract.ts) and lets the browser poll it. Used after a
+// fetch-from-URL lands an archive; browser uploads still extract client-side
+// because that already works and handles rar.
+
+function extractJobStub(env: Env, tenantId: string, folderId: string, relPath: string): DurableObjectStub {
+  return env.ARCHIVE_EXTRACT.get(env.ARCHIVE_EXTRACT.idFromName(`${tenantId}|${folderId}|${relPath}`));
+}
+
+// Body: { relPath: string, deleteArchive?: boolean }
+adminRoutes.post('/storage/folder/:folderId/extract/start', async (c) => {
+  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
+  if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  const relPath = String(body['relPath'] ?? '').trim().replace(/^\/+/, '');
+  const deleteArchive = body['deleteArchive'] !== false;
+  if (!relPath) return c.json({ error: 'relPath required' }, 400);
+  if (/\.rar$/i.test(relPath)) {
+    return c.json({ error: 'rar archives can\'t be extracted server-side (pCloud\'s extract API is broken and rar needs a WASM decoder). Download it and use the browser upload, which extracts rar locally.' }, 400);
+  }
+  if (!/\.zip$/i.test(relPath)) return c.json({ error: 'Only .zip is supported' }, 400);
+  try {
+    joinPcloudPath(loaded.rootPath, relPath);
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+  const { dir, name } = splitRelPath(relPath);
+  const stem = name.replace(/\.zip$/i, '');
+  const destRelDir = dir ? `${dir}/${stem}` : stem;
+  const init = {
+    tenantId: c.get('tenantId'), libraryId: loaded.folder.library_id, folderId: loaded.folder.id,
+    profile: loaded.profile, rootPath: loaded.rootPath, archiveRelPath: relPath, destRelDir, deleteArchive,
+  };
+  const res = await extractJobStub(c.env, c.get('tenantId'), loaded.folder.id, relPath).fetch('https://do/start', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(init),
+  });
+  return c.json(await res.json(), res.status as 200);
+});
+
+// Query: ?relPath=
+adminRoutes.get('/storage/folder/:folderId/extract/status', async (c) => {
+  const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
+  if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
+  const relPath = (c.req.query('relPath') ?? '').trim().replace(/^\/+/, '');
+  if (!relPath) return c.json({ error: 'relPath required' }, 400);
+  const res = await extractJobStub(c.env, c.get('tenantId'), loaded.folder.id, relPath).fetch('https://do/status');
+  return c.json(await res.json(), res.status as 200);
 });
 
 // ─── Library item management ────────────────────────────────────────────────

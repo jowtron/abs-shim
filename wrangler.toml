@@ -42,9 +42,17 @@ class_name = "SignupRateLimitDO"
 tag = "v1"
 new_sqlite_classes = ["ListeningSessionDO"]
 
+[[durable_objects.bindings]]
+name = "ARCHIVE_EXTRACT"
+class_name = "ArchiveExtractDO"
+
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["SignupRateLimitDO"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["ArchiveExtractDO"]
 
 # Serve the official ABS web client (Nuxt static build extracted from the
 # advplyr/audiobookshelf docker image) for any path the Worker doesn't claim.

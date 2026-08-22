@@ -15,6 +15,7 @@ import { libraryRoutes } from './routes/library';
 import { itemRoutes } from './routes/items';
 import { authorRoutes } from './routes/authors';
 import { adminRoutes } from './routes/admin';
+import { abbRoutes } from './routes/abb';
 import { signupRoutes } from './routes/signup';
 import { renderSignupHtml } from './lib/signup-html';
 import { listProgressByUser, getProgress, upsertProgress, progressToAbs } from './db/progress';
@@ -33,6 +34,7 @@ import { WebDAVAdapter } from './storage/webdav';
 
 // Durable Object classes must be re-exported from the Worker entrypoint.
 export { SignupRateLimitDO } from './do/signup-limiter';
+export { ArchiveExtractDO } from './do/archive-extract';
 
 const app = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
@@ -430,6 +432,7 @@ app.get('/api/me/listening-sessions', requireAuth, async (c) => {
 app.route('/api/libraries', libraryRoutes);
 app.route('/api/items', itemRoutes);
 app.route('/api/authors', authorRoutes);
+app.route('/api/admin/abb', abbRoutes);
 app.route('/api/admin', adminRoutes);
 
 // Public self-serve signup (approval-gated). The API lives under /api/signup;

@@ -167,6 +167,31 @@ npx wrangler secret put PCLOUD_CLIENT_SECRET</pre>
     <div id="libraries-body" class="muted">Loading…</div>
   </div>
 
+  <div id="abb-card" class="card">
+    <h2>AudioBookBay → Real-Debrid</h2>
+    <p class="muted" style="margin-top:0">Search AudioBookBay, send a release to Real-Debrid, and have pCloud fetch the finished files straight into a library. Multi-file releases are added one file at a time so nothing arrives as a rar.</p>
+    <details id="abb-settings">
+      <summary>Accounts</summary>
+      <div class="upload-row" style="margin-top:0.5rem">
+        <input type="text" id="abb-user" placeholder="AudioBookBay username" autocomplete="off" />
+        <input type="password" id="abb-pass" placeholder="AudioBookBay password" autocomplete="new-password" />
+      </div>
+      <div class="upload-row">
+        <input type="password" id="abb-rd" placeholder="Real-Debrid API token (real-debrid.com/apitoken)" autocomplete="new-password" />
+        <button id="abb-save">Save</button>
+        <button class="secondary" id="abb-test">Test</button>
+      </div>
+      <div id="abb-settings-status" class="muted" style="font-size:0.85rem"></div>
+    </details>
+    <div class="upload-row" style="margin-top:0.75rem">
+      <input type="text" id="abb-q" placeholder="Search AudioBookBay… (title, author)" />
+      <select id="abb-target"></select>
+      <button id="abb-search">Search</button>
+    </div>
+    <div id="abb-results"></div>
+    <div class="upload-list" id="abb-jobs"></div>
+  </div>
+
   <div id="cover-cache-card" class="card">
     <h2>Cover cache</h2>
     <p class="muted">Covers are probed from the m4b on first request and stored in R2 so subsequent loads (from any CF POP) are fast. Click below to pre-fetch every library item's cover now.</p>
@@ -388,6 +413,7 @@ async function refresh() {
   renderConnections(status);
   renderConnectActions(status);
   renderLibraries(status, libs.libraries || []);
+  renderAbb(status, libs.libraries || []);
   renderHousehold(status);
   renderMembers(status);
 
@@ -747,6 +773,11 @@ function renderLibraries(status, libraries) {
       html += '<input type="text" placeholder="Optional subfolder, e.g. The Hobbit/" data-upload-subfolder="' + escapeHtml(lib.id) + '" />';
       html += '<button data-upload-go="' + escapeHtml(lib.id) + '">Upload</button>';
       html += '</div>';
+      html += '<div class="upload-row">';
+      html += '<input type="text" placeholder="…or paste a direct download URL (.m4b / .m4a / .aac / .zip)" data-fetch-url="' + escapeHtml(lib.id) + '" />';
+      html += '<input type="text" placeholder="Save as (optional file name)" data-fetch-name="' + escapeHtml(lib.id) + '" style="max-width:220px" />';
+      html += '<button data-fetch-go="' + escapeHtml(lib.id) + '">Fetch to pCloud</button>';
+      html += '</div>';
       html += '<div class="upload-list" id="upload-list-' + escapeHtml(lib.id) + '"></div>';
       html += '</div>';
     }
@@ -972,6 +1003,41 @@ function renderLibraries(status, libraries) {
     });
   });
 
+  body.querySelectorAll('[data-fetch-go]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const libId = btn.dataset.fetchGo;
+      const area = document.getElementById('upload-area-' + libId);
+      const folderId = area && area.dataset.folder;
+      const urlInput = document.querySelector('[data-fetch-url="' + libId + '"]');
+      const nameInput = document.querySelector('[data-fetch-name="' + libId + '"]');
+      const subfolderInput = document.querySelector('[data-upload-subfolder="' + libId + '"]');
+      const url = (urlInput && urlInput.value || '').trim();
+      if (!folderId || !url) {
+        showError('Paste a download URL first.');
+        return;
+      }
+      const subfolder = (subfolderInput && subfolderInput.value || '').trim().replace(/^\/+|\/+$/g, '');
+      let name = (nameInput && nameInput.value || '').trim();
+      if (!name) name = fileNameFromUrl(url);
+      if (!name) {
+        showError('Could not work out a file name from that URL — fill in "Save as".');
+        return;
+      }
+      if (!/\.(m4b|m4a|aac|zip)$/i.test(name)) {
+        if (!confirm('"' + name + '" is not .m4b/.m4a/.aac/.zip — it will be saved to pCloud but not registered as a book. Continue?')) return;
+      }
+      const listEl = document.getElementById('upload-list-' + libId);
+      btn.disabled = true;
+      try {
+        await fetchUrlToPcloud(folderId, url, joinPath(subfolder, name), listEl);
+        urlInput.value = '';
+        nameInput.value = '';
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
+
   body.querySelectorAll('[data-attach-pcloud]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const libId = btn.dataset.attachPcloud;
@@ -994,6 +1060,225 @@ function renderLibraries(status, libraries) {
       }
     });
   });
+}
+
+// ─── AudioBookBay → Real-Debrid ─────────────────────────────────────────────
+
+let abbWired = false;
+
+function renderAbb(status, libraries) {
+  const card = document.getElementById('abb-card');
+  const target = document.getElementById('abb-target');
+  // One option per pCloud folder; the fetch-url flow only works on pcloud_oauth.
+  const libName = {};
+  for (const lib of libraries) libName[lib.id] = lib.name;
+  void libraries;
+  const prev = target.value;
+  target.innerHTML = '';
+  for (const f of status.folders || []) {
+    if (f.provider !== 'pcloud_oauth') continue;
+    const opt = document.createElement('option');
+    opt.value = f.id;
+    opt.textContent = (f.libraryName || libName[f.libraryId] || f.libraryId) + ' → pCloud ' + ((f.config && f.config.rootPath) || '/');
+    target.appendChild(opt);
+  }
+  if (prev) target.value = prev;
+  card.style.display = target.options.length ? 'block' : 'none';
+  if (abbWired) return;
+  abbWired = true;
+
+  abbLoadSettings();
+  document.getElementById('abb-save').addEventListener('click', abbSaveSettings);
+  document.getElementById('abb-test').addEventListener('click', abbTestSettings);
+  document.getElementById('abb-search').addEventListener('click', abbDoSearch);
+  document.getElementById('abb-q').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') abbDoSearch(); });
+}
+
+async function abbLoadSettings() {
+  const st = document.getElementById('abb-settings-status');
+  try {
+    const s = await api('/api/admin/abb/settings');
+    document.getElementById('abb-user').value = s.abbUsername || '';
+    document.getElementById('abb-pass').placeholder = s.abbPasswordSet ? 'AudioBookBay password (saved — leave blank to keep)' : 'AudioBookBay password';
+    document.getElementById('abb-rd').placeholder = s.rdTokenSet ? 'Real-Debrid API token (saved — leave blank to keep)' : 'Real-Debrid API token (real-debrid.com/apitoken)';
+    if (!s.canEdit) {
+      for (const id of ['abb-user', 'abb-pass', 'abb-rd', 'abb-save']) document.getElementById(id).disabled = true;
+      st.textContent = 'Only the tenant owner can change these accounts.';
+    } else if (!s.rdTokenSet) {
+      document.getElementById('abb-settings').open = true;
+      st.textContent = 'Add a Real-Debrid API token to grab releases. The AudioBookBay login is optional (needed only for member-only pages).';
+    } else {
+      st.textContent = 'Real-Debrid token saved' + (s.abbUsername ? ', AudioBookBay login saved as ' + s.abbUsername : '') + '.';
+    }
+  } catch (e) {
+    st.textContent = 'Could not load settings: ' + e.message;
+  }
+}
+
+async function abbSaveSettings() {
+  const st = document.getElementById('abb-settings-status');
+  const btn = document.getElementById('abb-save');
+  btn.disabled = true;
+  try {
+    await api('/api/admin/abb/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        abbUsername: document.getElementById('abb-user').value,
+        abbPassword: document.getElementById('abb-pass').value,
+        rdToken: document.getElementById('abb-rd').value,
+      }),
+    });
+    document.getElementById('abb-pass').value = '';
+    document.getElementById('abb-rd').value = '';
+    st.textContent = 'Saved.';
+    await abbLoadSettings();
+  } catch (e) {
+    st.textContent = 'Save failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function abbTestSettings() {
+  const st = document.getElementById('abb-settings-status');
+  const btn = document.getElementById('abb-test');
+  btn.disabled = true; st.textContent = 'Testing…';
+  try {
+    const r = await api('/api/admin/abb/settings/test', { method: 'POST' });
+    const parts = [];
+    parts.push('AudioBookBay: ' + (!r.abb.configured ? 'not configured (anonymous search only)' : r.abb.ok ? 'login OK' : 'FAILED — ' + r.abb.error));
+    parts.push('Real-Debrid: ' + (!r.rd.configured ? 'no token' : r.rd.ok ? 'OK as ' + r.rd.username + (r.rd.premiumUntil ? ', premium until ' + new Date(r.rd.premiumUntil).toLocaleDateString() : '') + (r.rd.error ? ' — ' + r.rd.error : '') : 'FAILED — ' + r.rd.error));
+    st.textContent = parts.join(' · ');
+  } catch (e) {
+    st.textContent = 'Test failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function abbDoSearch() {
+  const q = document.getElementById('abb-q').value.trim();
+  const out = document.getElementById('abb-results');
+  const btn = document.getElementById('abb-search');
+  if (!q) return;
+  btn.disabled = true; out.textContent = 'Searching…';
+  try {
+    const r = await api('/api/admin/abb/search?q=' + encodeURIComponent(q));
+    if (!r.results.length) {
+      out.innerHTML = '<p class="muted">0 results. (If a known title returns nothing, AudioBookBay\'s page layout may have changed.)</p>';
+      return;
+    }
+    out.innerHTML = '';
+    const table = document.createElement('table');
+    table.innerHTML = '<thead><tr><th>Title</th><th>Format</th><th>Size</th><th>Lang</th><th></th></tr></thead>';
+    const tb = document.createElement('tbody');
+    for (const res of r.results) {
+      const tr = document.createElement('tr');
+      const fmt = (res.format ? res.format.toUpperCase() : '?') + (res.bitrate ? ' · ' + res.bitrate : '');
+      tr.innerHTML = '<td></td><td></td><td></td><td></td><td></td>';
+      tr.children[0].innerHTML = '<a target="_blank" rel="noopener"></a>';
+      tr.children[0].firstChild.href = res.url;
+      tr.children[0].firstChild.textContent = res.title;
+      tr.children[1].textContent = fmt;
+      tr.children[2].textContent = res.sizeBytes ? formatBytes(res.sizeBytes) : '';
+      tr.children[3].textContent = res.language || '';
+      const b = document.createElement('button');
+      b.textContent = 'Grab';
+      b.addEventListener('click', () => {
+        b.disabled = true;
+        abbGrab(res, document.getElementById('abb-target').value, document.getElementById('abb-jobs'))
+          .finally(() => { b.disabled = false; });
+      });
+      tr.children[4].appendChild(b);
+      tb.appendChild(tr);
+    }
+    table.appendChild(tb);
+    out.appendChild(table);
+  } catch (e) {
+    out.textContent = 'Search failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Resolve → add torrent(s) → poll → pCloud fetch each file → delete torrent.
+async function abbGrab(res, folderId, listEl) {
+  if (!folderId) { showError('Pick a target library first.'); return; }
+  const row = appendUploadRow(listEl, res.title, 'Resolving on AudioBookBay…');
+  try {
+    const m = await api('/api/admin/abb/resolve', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: res.url }),
+    });
+    if (m.error) throw new Error(m.error);
+    row.setStatus('Adding to Real-Debrid…');
+    const first = await abbAddTorrent(m.magnet, null);
+    const torrents = [{ id: first.id, fileId: first.selected }];
+    if (first.mode === 'multi') {
+      // One torrent per remaining audio file, a few at a time — RD caps
+      // active torrents and each add costs ~10 API calls.
+      const rest = first.files.filter((f) => f.id !== first.selected);
+      row.setStatus('Multi-file release: adding ' + rest.length + ' more torrent(s)…');
+      for (let i = 0; i < rest.length; i += 4) {
+        const batch = rest.slice(i, i + 4);
+        const added = await Promise.all(batch.map((f) => abbAddTorrent(m.magnet, f.id).catch((e) => ({ error: e.message, fileId: f.id }))));
+        for (const a of added) {
+          if (a.error) appendUploadRow(listEl, '  ↳ file ' + a.fileId, '').fail('Add failed: ' + a.error);
+          else torrents.push({ id: a.id, fileId: a.selected });
+        }
+        row.setStatus('Added ' + torrents.length + ' / ' + (rest.length + 1) + ' torrent(s)…');
+      }
+    }
+    row.setStatus(torrents.length + ' torrent(s) on Real-Debrid — waiting for download');
+
+    // Poll every torrent on one shared timer so RD's 250 req/min limit holds
+    // even for a 40-part set: interval scales with the torrent count.
+    const interval = Math.max(4000, torrents.length * 600);
+    const pending = new Map(torrents.map((t) => [t.id, appendUploadRow(listEl, '  ↳ RD ' + t.id, 'Queued on Real-Debrid')]));
+    const fetches = [];
+    while (pending.size) {
+      await new Promise((r) => setTimeout(r, interval));
+      for (const [id, trow] of [...pending]) {
+        let st;
+        try { st = await api('/api/admin/abb/torrents/' + encodeURIComponent(id)); }
+        catch (e) { trow.setStatus('Poll error: ' + e.message); continue; }
+        if (st.error && !st.downloads) { trow.fail(st.error); pending.delete(id); continue; }
+        if (st.status === 'downloaded' && st.downloads) {
+          pending.delete(id);
+          trow.complete('Ready on Real-Debrid: ' + st.downloads.map((d) => d.filename).join(', '));
+          // Hand each direct link to pCloud; delete the torrent once it lands.
+          fetches.push((async () => {
+            for (const d of st.downloads) {
+              if (!d.isAudio && !d.isArchive) continue;
+              if (d.ext === 'rar' || d.ext === '7z') {
+                appendUploadRow(listEl, '  ↳ ' + d.filename, '').fail('Real-Debrid produced a ' + d.ext + ' — can\'t extract server-side. Download it and use the browser upload instead.');
+                continue;
+              }
+              await fetchUrlToPcloud(folderId, d.download, m.folderName + '/' + d.filename, listEl);
+            }
+            await api('/api/admin/abb/torrents/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
+          })());
+        } else {
+          const pct = typeof st.progress === 'number' ? st.progress + '%' : '';
+          trow.setStatus(st.status + ' ' + pct + (st.seeders != null ? ' · ' + st.seeders + ' seeders' : '') + (st.speed ? ' · ' + formatBytes(st.speed) + '/s' : ''));
+          if (typeof st.progress === 'number') trow.setProgressPct(st.progress);
+        }
+      }
+    }
+    await Promise.all(fetches);
+    row.complete('Done');
+  } catch (e) {
+    row.fail(e.message || String(e));
+  }
+}
+
+async function abbAddTorrent(magnet, fileId) {
+  const body = fileId != null ? { magnet, fileId } : { magnet };
+  const r = await api('/api/admin/abb/torrents', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (r.error) throw new Error(r.error);
+  return r;
 }
 
 // ─── Upload pipeline ────────────────────────────────────────────────────────
@@ -1091,6 +1376,110 @@ async function chunkedUploadOne(folderId, blob, relPath, row) {
   }
 }
 
+// Last path segment of a URL, decoded, with the query string ignored.
+// Returns '' for URLs like https://host/download?id=123 so the caller can
+// insist on an explicit name.
+function fileNameFromUrl(url) {
+  try {
+    const u = new URL(url);
+    const seg = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '');
+    return /\.[a-z0-9]{2,4}$/i.test(seg) ? seg : '';
+  } catch {
+    return '';
+  }
+}
+
+// Fetch-from-URL: pCloud's servers download the file; we just poll its
+// size. Nothing here is stateful on the server — if the tab closes, the
+// download still completes and "Add book by path" picks the file up later.
+// pCloud gives no progress API for these jobs (see admin routes), so the
+// file may stay invisible until it lands in one go; the wait is bounded by
+// a generous timeout rather than by anything pCloud tells us.
+async function fetchUrlToPcloud(folderId, url, relPath, listEl) {
+  const row = appendUploadRow(listEl, relPath, 'Queueing…');
+  try {
+    const started = await api('/api/admin/storage/folder/' + folderId + '/fetch-url/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, relPath }),
+    });
+    const t0 = Date.now();
+    const maxWaitMs = 60 * 60 * 1000;
+    let lastSize = 0;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const qs = new URLSearchParams({ relPath: started.relPath, lastSize: String(lastSize) });
+      if (started.expectedSize) qs.set('expectedSize', String(started.expectedSize));
+      const p = await api('/api/admin/storage/folder/' + folderId + '/fetch-url/progress?' + qs.toString());
+      if (p.error) throw new Error(p.error);
+      if (p.finished) break;
+      const elapsed = Math.round((Date.now() - t0) / 1000);
+      if (elapsed * 1000 > maxWaitMs) throw new Error('Gave up after an hour — pCloud never finished the download (is the URL a direct link?)');
+      if (p.status === 'pending') {
+        row.setStatus('Waiting for pCloud to fetch it… ' + elapsed + 's'
+          + (started.expectedSize ? ' (' + formatBytes(started.expectedSize) + ')' : ''));
+      } else if (p.size) {
+        row.setProgress(p.downloaded, p.size);
+      } else {
+        row.setStatus('Downloading… ' + formatBytes(p.downloaded) + ' so far');
+      }
+      lastSize = p.downloaded || 0;
+    }
+    row.setStatus('Registering…');
+    const saved = await api('/api/admin/storage/folder/' + folderId + '/fetch-url/finish', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ relPath: started.relPath, registerAsBook: true }),
+    });
+    if (saved.itemId) {
+      row.complete('Saved & registered (' + saved.itemId + ')');
+    } else if (saved.registerError) {
+      row.complete('Saved to pCloud but NOT registered: ' + saved.registerError);
+    } else if (/\.zip$/i.test(started.relPath)) {
+      row.complete('Saved (' + formatBytes(saved.size || 0) + ') — extracting…');
+      await extractZipOnServer(folderId, started.relPath, listEl);
+    } else {
+      row.complete('Saved' + (saved.size ? ' (' + formatBytes(saved.size) + ')' : ''));
+    }
+  } catch (e) {
+    row.fail(e.message || String(e));
+  }
+}
+
+// Server-side zip extraction (ArchiveExtractDO). One row per file inside
+// the archive, created as the job reports them. The job runs in a Durable
+// Object, so closing the tab doesn't stop it — reopening and re-running
+// the same URL would just show "already exists".
+async function extractZipOnServer(folderId, relPath, listEl) {
+  const head = appendUploadRow(listEl, '↳ extracting ' + relPath, 'Reading archive…');
+  const rows = {};
+  try {
+    await api('/api/admin/storage/folder/' + folderId + '/extract/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ relPath, deleteArchive: true }),
+    });
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 2500));
+      const job = await api('/api/admin/storage/folder/' + folderId + '/extract/status?relPath=' + encodeURIComponent(relPath));
+      if (job.error && job.status !== 'done' && job.status !== 'error' && !job.entries) throw new Error(job.error);
+      for (const e of job.entries || []) {
+        if (!rows[e.outRelPath]) rows[e.outRelPath] = appendUploadRow(listEl, '  ↳ ' + e.outRelPath, 'Queued');
+        const r = rows[e.outRelPath];
+        if (e.status === 'running') r.setProgress(e.uploaded, e.size);
+        else if (e.status === 'done') r.complete(e.itemId ? 'Registered (' + e.itemId + ')' : (e.error || 'Extracted'));
+        else if (e.status === 'error') r.fail(e.error || 'Failed');
+      }
+      if (job.status === 'listing') head.setStatus('Reading archive…');
+      else if (job.status === 'running') head.setStatus((job.next || 0) + ' / ' + job.entries.length + ' files');
+      else if (job.status === 'done') { head.complete(job.entries.length + ' file(s) extracted' + (job.archiveDeleted ? ', archive deleted' : '') + (job.error ? ' — ' + job.error : '')); return; }
+      else if (job.status === 'error') { head.fail(job.error || 'Extraction failed'); return; }
+    }
+  } catch (e) {
+    head.fail(e.message || String(e));
+  }
+}
+
 // Per-upload-row helper: renders a <div> with file name, progress bar, status
 // and returns an object exposing setProgress / setStatus / complete / fail.
 function appendUploadRow(listEl, name, initialStatus) {
@@ -1111,6 +1500,7 @@ function appendUploadRow(listEl, name, initialStatus) {
       status.textContent = ' · ' + pct + '% (' + formatBytes(uploaded) + ' / ' + formatBytes(total) + ')';
     },
     setStatus(text) { status.textContent = ' · ' + text; },
+    setProgressPct(pct) { bar.style.width = Math.max(0, Math.min(100, pct)) + '%'; },
     complete(text) {
       el.classList.add('ok');
       bar.style.width = '100%';

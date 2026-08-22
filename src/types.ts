@@ -3,6 +3,8 @@ export type Env = {
   SESSION: DurableObjectNamespace;
   // Per-IP signup throttle — see src/do/signup-limiter.ts.
   SIGNUP_LIMITER: DurableObjectNamespace;
+  // Server-side zip extraction jobs — see src/do/archive-extract.ts.
+  ARCHIVE_EXTRACT: DurableObjectNamespace;
   ASSETS: Fetcher; // Cloudflare static-assets binding for the bundled ABS web UI.
   COVERS: R2Bucket; // Persistent cover cache — see src/routes/items.ts.
   // Secrets (set via `wrangler secret put`):

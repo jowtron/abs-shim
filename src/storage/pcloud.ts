@@ -357,3 +357,117 @@ export async function pcloudUploadSave(
   }
   return data;
 }
+
+// ─── Fetch-from-URL (server-side download) ──────────────────────────────────
+//
+// pCloud can pull a file from a public URL into the user's account on its own
+// servers: `downloadfileasync` queues the job and returns immediately. The
+// Worker never touches the bytes, so there's no body-size or wall-clock
+// concern — this is how "paste a download link" in /admin works.
+//
+// The docs say `uploadprogress?progresshash=…` reports the job's status.
+// Tested 2026-08-22: it answers 1900 "Upload not found" for the whole life
+// of an async download, even while the file is visibly landing. So there is
+// no progress API — completion is detected by stat-ing the target path and
+// comparing its size to the source's Content-Length (see admin routes).
+//
+// The blocking sibling `downloadfile` exists too but returns only when the
+// transfer finishes, which would pin a Worker request open for the whole
+// transfer. Always use the async form. Also observed: a URL pCloud can't
+// fetch (e.g. w3.org refuses it) is NOT an error — result 0, and the file
+// just never appears.
+
+async function pcloudGet<T extends PcloudApiResult>(
+  profile: PcloudProfile, method: string, params: URLSearchParams,
+): Promise<T> {
+  const url = `https://${profile.apiHost}/${method}?${params.toString()}`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${profile.accessToken}` } });
+  if (!res.ok) {
+    throw new Error(`pCloud ${method} HTTP ${res.status}: ${await res.text().catch(() => '')}`);
+  }
+  return await res.json() as T;
+}
+
+export type PcloudMetadata = {
+  fileid?: number; folderid?: number; path?: string; name: string; size?: number; isfolder: boolean;
+};
+
+// `createfolderifnotexists` only creates the leaf, so walk the path one
+// segment at a time. Returns the folderid of the deepest folder — that is
+// what downloadfileasync wants (passing `path` works too, but folderid
+// avoids a second round of path-encoding ambiguity on pCloud's side).
+export async function pcloudEnsureFolder(profile: PcloudProfile, absPath: string): Promise<number> {
+  const segs = absPath.split('/').filter(Boolean);
+  let folderId = 0; // root
+  let cur = '';
+  for (const seg of segs) {
+    cur += `/${seg}`;
+    const params = new URLSearchParams();
+    params.set('path', cur);
+    const data = await pcloudGet<PcloudApiResult & { metadata?: PcloudMetadata }>(profile, 'createfolderifnotexists', params);
+    if (data.result !== 0 || data.metadata?.folderid == null) {
+      throw new Error(`pCloud createfolderifnotexists(${cur}) result=${data.result} ${data.error ?? ''}`);
+    }
+    folderId = data.metadata.folderid;
+  }
+  return folderId;
+}
+
+// Returns null when the path doesn't exist (pCloud result 2009/2010).
+export async function pcloudStat(profile: PcloudProfile, absPath: string): Promise<PcloudMetadata | null> {
+  const params = new URLSearchParams();
+  params.set('path', absPath);
+  const data = await pcloudGet<PcloudApiResult & { metadata?: PcloudMetadata }>(profile, 'stat', params);
+  // Observed: 2055 when the leaf is missing, 2002 when a parent folder is
+  // missing ("A component of parent directory does not exist"), 2005 for a
+  // missing directory. 2009/2010 are the documented file-not-found /
+  // invalid-path codes. All of them mean "not there".
+  if ([2055, 2002, 2005, 2009, 2010].includes(data.result)) return null;
+  if (data.result !== 0 || !data.metadata) {
+    throw new Error(`pCloud stat(${absPath}) result=${data.result} ${data.error ?? ''}`);
+  }
+  return data.metadata;
+}
+
+// Queue a server-side download of `url` into `folderId`, saved as `name`.
+// `target` is documented as a "comma-separated urlencoded list", i.e. the
+// value is decoded once as a query param and then split on commas, so the
+// filename itself has to be encoded a second time — verified live: single
+// encoding turned "GH, Single.md" into a file called "GH".
+export async function pcloudDownloadFileAsync(
+  profile: PcloudProfile,
+  args: { url: string; folderId: number; name: string },
+): Promise<void> {
+  const params = new URLSearchParams();
+  params.set('url', args.url);
+  params.set('folderid', String(args.folderId));
+  params.set('target', encodeURIComponent(args.name));
+  const data = await pcloudGet<PcloudApiResult>(profile, 'downloadfileasync', params);
+  if (data.result !== 0) {
+    throw new Error(`pCloud downloadfileasync result=${data.result} ${data.error ?? ''}`);
+  }
+}
+
+// Short-lived direct URL for reading a file's bytes (Range-capable). Same
+// IP-binding caveat as the adapter's resolveUrl: only the caller's egress IP
+// can use it, so resolve and consume within one execution context.
+export async function pcloudFileLink(profile: PcloudProfile, absPath: string): Promise<string> {
+  const params = new URLSearchParams();
+  params.set('path', absPath);
+  params.set('forcedownload', '0');
+  params.set('skipfilename', '1');
+  const data = await pcloudGet<PcloudApiResult & { hosts?: string[]; path?: string }>(profile, 'getfilelink', params);
+  if (data.result !== 0 || !data.hosts?.length || !data.path) {
+    throw new Error(`pCloud getfilelink(${absPath}) result=${data.result} ${data.error ?? ''}`);
+  }
+  return `https://${data.hosts[0]}${data.path}`;
+}
+
+export async function pcloudDeleteFile(profile: PcloudProfile, absPath: string): Promise<void> {
+  const params = new URLSearchParams();
+  params.set('path', absPath);
+  const data = await pcloudGet<PcloudApiResult>(profile, 'deletefile', params);
+  if (data.result !== 0 && data.result !== 2055 && data.result !== 2009) {
+    throw new Error(`pCloud deletefile(${absPath}) result=${data.result} ${data.error ?? ''}`);
+  }
+}
