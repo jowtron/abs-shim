@@ -785,6 +785,8 @@ function renderLibraries(status, libraries) {
     html += '<button class="secondary" data-reprobe-missing="' + escapeHtml(lib.id) + '">Re-probe books missing chapters</button>';
     html += '<button class="secondary" data-reprobe-all="' + escapeHtml(lib.id) + '">Re-probe all</button>';
     html += '</div>';
+    // Per-book progress rows for the re-probe buttons (same rows as uploads).
+    html += '<div id="reprobe-list-' + escapeHtml(lib.id) + '" class="upload-list"></div>';
 
     // Hidden book list — populated lazily on first "Show books" click.
     html += '<div id="books-list-' + escapeHtml(lib.id) + '" class="books-list" style="display:none">Loading…</div>';
@@ -946,46 +948,13 @@ function renderLibraries(status, libraries) {
   });
 
   body.querySelectorAll('[data-reprobe-missing]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const libId = btn.dataset.reprobeMissing;
-      btn.disabled = true; btn.textContent = 'Re-probing…';
-      try {
-        const r = await api('/api/admin/libraries/' + libId + '/reprobe?onlyMissingChapters=1', { method: 'POST' });
-        document.getElementById('scan-card').style.display = 'block';
-        document.getElementById('scan-output').textContent = JSON.stringify(r, null, 2);
-        // If the books list is open, refresh it to show new chapter counts.
-        const list = document.getElementById('books-list-' + libId);
-        if (list && list.dataset.loaded === '1') {
-          const data = await api('/api/admin/libraries/' + libId + '/items');
-          renderBooksList(list, data.items || []);
-        }
-      } catch (e) {
-        showError('Re-probe failed: ' + e.message);
-      } finally {
-        btn.disabled = false; btn.textContent = 'Re-probe books missing chapters';
-      }
-    });
+    btn.addEventListener('click', () => runReprobe(btn.dataset.reprobeMissing, btn, true, 'Re-probe books missing chapters'));
   });
 
   body.querySelectorAll('[data-reprobe-all]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const libId = btn.dataset.reprobeAll;
+    btn.addEventListener('click', () => {
       if (!confirm('Re-probe every book in this library? This re-reads each m4b\'s moov atom — for a 100-book library that\'s ~500 MB of pCloud bandwidth and several minutes of wall time.')) return;
-      btn.disabled = true; btn.textContent = 'Re-probing…';
-      try {
-        const r = await api('/api/admin/libraries/' + libId + '/reprobe', { method: 'POST' });
-        document.getElementById('scan-card').style.display = 'block';
-        document.getElementById('scan-output').textContent = JSON.stringify(r, null, 2);
-        const list = document.getElementById('books-list-' + libId);
-        if (list && list.dataset.loaded === '1') {
-          const data = await api('/api/admin/libraries/' + libId + '/items');
-          renderBooksList(list, data.items || []);
-        }
-      } catch (e) {
-        showError('Re-probe failed: ' + e.message);
-      } finally {
-        btn.disabled = false; btn.textContent = 'Re-probe all';
-      }
+      runReprobe(btn.dataset.reprobeAll, btn, false, 'Re-probe all');
     });
   });
 
@@ -1596,6 +1565,56 @@ function appendUploadRow(listEl, name, initialStatus) {
       status.textContent = ' · ' + (text || 'Failed');
     },
   };
+}
+
+// Re-probe driven from the browser one book at a time so there's a live
+// row per book ("The Secret · 1 chapter · no chapter data in the file")
+// instead of one long silent request that dumped JSON at the bottom of the
+// page. "Missing chapters" = 0 or 1 chapters: a single-file mp3 scanned
+// before CHAP support shows as one whole-file chapter.
+async function runReprobe(libId, btn, onlyMissing, label) {
+  const list = document.getElementById('reprobe-list-' + libId);
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Re-probing…';
+  list.innerHTML = '';
+  const head = appendUploadRow(list, label, 'Listing books…');
+  let done = 0, withChapters = 0;
+  try {
+    const data = await api('/api/admin/libraries/' + libId + '/items');
+    let items = data.items || [];
+    if (onlyMissing) items = items.filter((it) => (it.chapter_count || 0) <= 1);
+    if (!items.length) { head.complete('Nothing to do — every book already has chapters'); return; }
+    for (const it of items) {
+      head.setStatus((done + 1) + ' / ' + items.length + ' — ' + (it.title || it.id));
+      head.setProgressPct((done / items.length) * 100);
+      const row = appendUploadRow(list, '  ↳ ' + (it.title || it.id), 'Reading tags…');
+      try {
+        const r = await api('/api/admin/items/' + it.id + '/reprobe', { method: 'POST' });
+        if (r.error) throw new Error(r.detail || r.error);
+        const parts = [r.chapters + ' chapter' + (r.chapters === 1 ? '' : 's')];
+        if (r.chapters <= 1) parts.push('no chapter data in the file (no chpl/CHAP)');
+        if (r.series) parts.push('series: ' + r.series);
+        if (r.durationSeconds) parts.push(formatDuration(r.durationSeconds));
+        if (r.coverRefreshed) parts.push('cover refreshed');
+        row.complete(parts.join(' · '));
+        if (r.chapters > 1) withChapters++;
+      } catch (e) {
+        row.fail(e.message || String(e));
+      }
+      done++;
+    }
+    head.complete(done + ' book' + (done === 1 ? '' : 's') + ' re-probed · ' + withChapters + ' with chapters');
+    const books = document.getElementById('books-list-' + libId);
+    if (books && books.dataset.loaded === '1') {
+      const fresh = await api('/api/admin/libraries/' + libId + '/items');
+      renderBooksList(books, fresh.items || []);
+    }
+  } catch (e) {
+    head.fail(e.message || String(e));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
 }
 
 function formatBytes(n) {
