@@ -532,6 +532,18 @@ export async function probeM4b(url: string): Promise<ProbeResult> {
       const tagPayload = ilst.slice(c.start + c.headerSize, c.start + c.size);
       const data = findChild(tagPayload, 'data');
       if (!data || data.length < 8) continue;
+      // "----" custom tags are mean/name/data trios; key them as
+      // "----:<mean>:<name>" (e.g. ----:com.apple.iTunes:SERIES), which is
+      // how ABS and mp3tag store series info. mean/name carry a 4-byte
+      // version/flags prefix before the string.
+      let key = c.type;
+      if (c.type === '----') {
+        const mean = findChild(tagPayload, 'mean');
+        const name = findChild(tagPayload, 'name');
+        if (!mean || !name) continue;
+        const td = new TextDecoder('utf-8');
+        key = `----:${td.decode(mean.slice(4))}:${td.decode(name.slice(4))}`;
+      }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const dataType = dv.getUint32(0) & 0x00ffffff; // low 24 bits = wellKnownType
       const value = data.slice(8);                   // skip type + locale
@@ -543,15 +555,17 @@ export async function probeM4b(url: string): Promise<ProbeResult> {
       }
       // Most tag types are UTF-8 text (dataType 1).
       if (dataType === 1) {
-        tags[c.type] = new TextDecoder('utf-8').decode(value);
-      } else if (dataType === 21 && value.length === 4) {
-        // Big-endian signed int (e.g. genre id, gnre).
+        tags[key] = new TextDecoder('utf-8').decode(value);
+      } else if (dataType === 21 || dataType === 0) {
+        // Big-endian signed int — 4 bytes (gnre, tves) or 2 bytes (©mvi,
+        // tvsn as some taggers write them). dataType 0 ("implicit") is what
+        // older taggers use for ints.
         const dv2 = new DataView(value.buffer, value.byteOffset, value.byteLength);
-        tags[c.type] = String(dv2.getInt32(0));
+        if (value.length === 4) tags[key] = String(dv2.getInt32(0));
+        else if (value.length === 2) tags[key] = String(dv2.getInt16(0));
+        else if (value.length === 1) tags[key] = String(dv2.getInt8(0));
       }
     }
-    // ABS-style "----" custom tags live as "----/mean/name/data" trios. Skipped
-    // here; we can revisit if a client needs them.
   }
 
   // Prefer chpl (single-atom, no extra fetches). Fall back to a QT chapter

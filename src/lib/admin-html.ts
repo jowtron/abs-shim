@@ -132,7 +132,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     </form>
   </div>
 
-  <div id="abb-card" class="card">
+  <div id="abb-card" class="card" style="display:none">
     <h2>AudioBookBay → Real-Debrid</h2>
     <p class="muted" style="margin-top:0">Search AudioBookBay, send a release to Real-Debrid, and have pCloud fetch the finished files straight into a library. Multi-file releases are added one file at a time so nothing arrives as a rar.</p>
     <details id="abb-settings">
@@ -283,6 +283,7 @@ class UnauthorizedError extends Error { constructor() { super('Unauthorized'); t
 
 function showLoginForm() {
   document.getElementById('login-card').style.display = 'block';
+  document.getElementById('abb-card').style.display = 'none';
   document.getElementById('connections-card').style.display = 'none';
   document.getElementById('libraries-card').style.display = 'none';
   document.getElementById('cover-cache-card').style.display = 'none';
@@ -1295,6 +1296,7 @@ async function abbGrab(res, folderId, listEl) {
     const interval = Math.max(4000, torrents.length * 600);
     const pending = new Map(torrents.map((t) => [t.id, appendUploadRow(listEl, '  ↳ RD ' + t.id, 'Queued on Real-Debrid')]));
     const fetches = [];
+    let needsScan = false;
     while (pending.size) {
       await new Promise((r) => setTimeout(r, interval));
       for (const [id, trow] of [...pending]) {
@@ -1313,7 +1315,8 @@ async function abbGrab(res, folderId, listEl) {
                 appendUploadRow(listEl, '  ↳ ' + d.filename, '').fail('Real-Debrid produced a ' + d.ext + ' — can\'t extract server-side. Download it and use the browser upload instead.');
                 continue;
               }
-              await fetchUrlToPcloud(folderId, d.download, m.folderName + '/' + d.filename, listEl);
+              const registered = await fetchUrlToPcloud(folderId, d.download, m.folderName + '/' + d.filename, listEl);
+              if (!registered) needsScan = true;
             }
             await api('/api/admin/abb/torrents/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
           })());
@@ -1328,9 +1331,12 @@ async function abbGrab(res, folderId, listEl) {
     // /fetch-url/finish only registers single m4b/m4a/aac files. An mp3
     // release is N chapter files that must land before they can be probed
     // as one book, so nothing registers them until a scan runs — do that
-    // here rather than making the user find "Scan now".
+    // here rather than making the user find "Scan now". Skipped when every
+    // file already registered: a scan racing another grab's /finish is how
+    // duplicate items appeared on 2026-08-23 (now also blocked by a unique
+    // index, but no point provoking it).
     const libId = abbLibraryIdForFolder(folderId);
-    if (libId) {
+    if (libId && needsScan) {
       row.setStatus('Scanning library…');
       try {
         const report = await api('/api/admin/libraries/' + libId + '/scan', { method: 'POST' });
@@ -1510,6 +1516,7 @@ async function fetchUrlToPcloud(folderId, url, relPath, listEl) {
     });
     if (saved.itemId) {
       row.complete('Saved & registered (' + saved.itemId + ')');
+      return true;
     } else if (saved.registerError) {
       row.complete('Saved to pCloud but NOT registered: ' + saved.registerError);
     } else if (/\.zip$/i.test(started.relPath)) {
@@ -1521,6 +1528,7 @@ async function fetchUrlToPcloud(folderId, url, relPath, listEl) {
   } catch (e) {
     row.fail(e.message || String(e));
   }
+  return false;
 }
 
 // Server-side zip extraction (ArchiveExtractDO). One row per file inside

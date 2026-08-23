@@ -343,7 +343,9 @@ export async function buildItemMinified(b: ItemBundle) {
         authorName: m?.author_name ?? '',
         authorNameLF: nameLF(m?.author_name ?? null),
         narratorName: m?.narrator_name ?? '',
-        seriesName: m?.series_name ?? '',
+        // Real ABS formats the minified field as "Series #2" — Pholia's
+        // "Book 2" badge parses the trailing "#n".
+        seriesName: m?.series_name ? (m.series_sequence ? `${m.series_name} #${m.series_sequence}` : m.series_name) : '',
         genres: m ? JSON.parse(m.genres || '[]') : [],
         // String, not number — ShelfPlayer rejects numeric publishedYear
         // and discards the entire shelf. See buildBookMetadataDetail above.

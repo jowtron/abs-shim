@@ -3,6 +3,7 @@ import { getAdapter, type FolderRow } from '../storage/factory';
 import { ListingNotSupportedError, type RemoteEntry } from '../storage/adapter';
 import { probeM4b } from '../prober/m4b';
 import { probeMp3, type Mp3Probe } from '../prober/mp3';
+import { deriveSeries } from '../lib/series';
 import { invalidateIdMap } from '../lib/ids';
 
 // Scanner: walk a library's folder via its storage adapter, probe each new
@@ -119,6 +120,7 @@ export async function runScan(env: Env, libraryId: string, tenantId: string): Pr
           });
         }
       } catch (e) {
+        if (isUniqueViolation(e)) { report.skipped += files.length; known.add(itemRel); continue; }
         report.errors.push({ relPath: itemRel, reason: (e as Error).message });
       }
     }
@@ -193,6 +195,10 @@ async function probeM4bBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
   // the whole insert batch for the book.
   const yearNum = probe.tags['©day'] ? Number(probe.tags['©day']!.slice(0, 4)) : NaN;
   const year = Number.isFinite(yearNum) ? yearNum : null;
+  const series = deriveSeries({
+    tags: probe.tags, title, author, album,
+    folderName: itemRel === file.relPath ? null : (itemRel.split('/').pop() ?? itemRel),
+  });
 
   const itemId = `it-${crypto.randomUUID().slice(0, 12)}`;
   const audioId = `af-${crypto.randomUUID().slice(0, 12)}`;
@@ -233,8 +239,8 @@ async function probeM4bBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
          (library_item_id, tenant_id, title, title_ignore_prefix, subtitle, author_name, narrator_name,
           series_name, series_sequence, description, isbn, asin, language, publish_year,
           publisher, genres, tags, explicit, abridged, cover_url)
-       VALUES (?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', 0, 0, NULL)`,
-    ).bind(itemId, folder.tenant_id, title, sortKey(title), author, narrator, year, album),
+       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', 0, 0, NULL)`,
+    ).bind(itemId, folder.tenant_id, title, sortKey(title), author, narrator, series?.name ?? null, series?.sequence ?? null, year, album),
 
     env.DB.prepare(
       `INSERT INTO audio_files
@@ -335,6 +341,14 @@ async function probeMp3Book(args: {
   const narrator = first.tags['TXXX:NARRATOR'] ?? first.tags['TCOM'] ?? null;
   const yearRaw = first.tags['TDRC'] ?? first.tags['TYER'] ?? null;
   const year = yearRaw ? Number(yearRaw.slice(0, 4)) || null : null;
+  const mp3Series = deriveSeries({
+    tags: {
+      ...(first.tags['TIT1'] ? { '©grp': first.tags['TIT1']! } : {}),
+      ...(first.tags['TXXX:SERIES'] ? { '----:com.apple.iTunes:SERIES': first.tags['TXXX:SERIES']! } : {}),
+      ...(first.tags['TXXX:SERIES-PART'] ? { '----:com.apple.iTunes:SERIES-PART': first.tags['TXXX:SERIES-PART']! } : {}),
+    },
+    title, author, album: first.tags['TALB'] ?? null, folderName: folderBase,
+  });
 
   const itemId = `it-${crypto.randomUUID().slice(0, 12)}`;
   const now = Date.now();
@@ -406,8 +420,8 @@ async function probeMp3Book(args: {
          (library_item_id, tenant_id, title, title_ignore_prefix, subtitle, author_name, narrator_name,
           series_name, series_sequence, description, isbn, asin, language, publish_year,
           publisher, genres, tags, explicit, abridged, cover_url)
-       VALUES (?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', 0, 0, NULL)`,
-    ).bind(itemId, folder.tenant_id, title, sortKey(title), author, narrator, year, album),
+       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', 0, 0, NULL)`,
+    ).bind(itemId, folder.tenant_id, title, sortKey(title), author, narrator, mp3Series?.name ?? null, mp3Series?.sequence ?? null, year, album),
 
     ...audioStmts,
     ...chapterStmts,
@@ -439,6 +453,7 @@ export async function reprobeItem(env: Env, itemId: string, tenantId: string): P
   chapters: number;
   durationSeconds: number | null;
   coverRefreshed: boolean;
+  series?: string;
 }> {
   const item = await env.DB.prepare(
     'SELECT * FROM library_items WHERE id = ? AND tenant_id = ?',
@@ -463,6 +478,25 @@ export async function reprobeItem(env: Env, itemId: string, tenantId: string): P
   const stmts: D1PreparedStatement[] = [
     env.DB.prepare('DELETE FROM chapters WHERE library_item_id = ?').bind(itemId),
   ];
+  // Series: items added before series derivation existed (pre 2026-08-23)
+  // have NULLs here. Only fill, never clobber — a value already present may
+  // be a deliberate edit.
+  const meta = await env.DB.prepare(
+    'SELECT title, author_name, publisher, series_name FROM book_metadata WHERE library_item_id = ?',
+  ).bind(itemId).first<{ title: string; author_name: string | null; publisher: string | null; series_name: string | null }>();
+  let seriesSet: string | null = null;
+  if (meta && !meta.series_name) {
+    const series = deriveSeries({
+      tags: probe.tags, title: meta.title, author: meta.author_name, album: meta.publisher,
+      folderName: item.rel_path === audio.rel_path ? null : (item.rel_path.split('/').pop() ?? item.rel_path),
+    });
+    if (series) {
+      seriesSet = series.sequence ? `${series.name} #${series.sequence}` : series.name;
+      stmts.push(env.DB.prepare(
+        'UPDATE book_metadata SET series_name = ?, series_sequence = ? WHERE library_item_id = ?',
+      ).bind(series.name, series.sequence, itemId));
+    }
+  }
   for (let i = 0; i < probe.chapters.length; i++) {
     const ch = probe.chapters[i]!;
     const next = probe.chapters[i + 1];
@@ -517,7 +551,12 @@ export async function reprobeItem(env: Env, itemId: string, tenantId: string): P
     chapters: probe.chapters.length,
     durationSeconds: probe.durationSeconds,
     coverRefreshed,
+    ...(seriesSet ? { series: seriesSet } : {}),
   };
+}
+
+function isUniqueViolation(e: unknown): boolean {
+  return /UNIQUE constraint failed/i.test((e as Error)?.message ?? '');
 }
 
 function sortKey(title: string): string {
@@ -555,7 +594,19 @@ export async function addBookByPath(
   // single-file uploads via /save end up with size=0.
   const file: RemoteEntry = { relPath, isDir: false };
   if (hints?.sizeBytes != null) file.sizeBytes = hints.sizeBytes;
-  await probeBook({ env, adapter, folder: folderRow, file, itemRel });
+  try {
+    await probeBook({ env, adapter, folder: folderRow, file, itemRel });
+  } catch (e) {
+    // Lost a race with a concurrent scan/registration of the same path
+    // (idx_items_folder_relpath, migration 0006). Surface the winner.
+    if (!isUniqueViolation(e)) throw e;
+    const winner = await env.DB.prepare(
+      `SELECT id FROM library_items WHERE folder_id = ? AND rel_path IN (?, ?)`,
+    ).bind(folderRow.id, itemRel, relPath).first<{ id: string }>();
+    return winner
+      ? { added: false, itemId: winner.id, reason: 'Already in library' }
+      : { added: false, reason: 'Already in library' };
+  }
   // probeBook generates an id internally; re-query to surface it.
   const fresh = await env.DB.prepare(
     `SELECT id FROM library_items WHERE folder_id = ? AND rel_path = ? ORDER BY created_at DESC LIMIT 1`,
