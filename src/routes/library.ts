@@ -10,6 +10,7 @@ import {
   buildFilterData, buildItemMinified, buildLibrary, buildPersonalizedShelves,
 } from '../lib/abs-shapes';
 import { derivedId } from '../lib/ids';
+import { listProgressByUser, progressToAbs, type MediaProgressRow } from '../db/progress';
 
 export const libraryRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
@@ -62,7 +63,12 @@ libraryRoutes.get('/:id/personalized', async (c) => {
   }))).filter((b): b is NonNullable<typeof b> => b !== null);
   const t3 = Date.now();
 
-  const shelves = await buildPersonalizedShelves({ libraryId: id, bundles });
+  // The caller's book progress feeds the continue-listening shelf and the
+  // progress bars on every other shelf's cards.
+  const progressRows = (await listProgressByUser(c.env, c.get('userId'))).filter((p) => !p.episode_id);
+  const progress = new Map<string, { row: MediaProgressRow; abs: unknown }>();
+  for (const p of progressRows) progress.set(p.library_item_id, { row: p, abs: await progressToAbs(c.env, p) });
+  const shelves = await buildPersonalizedShelves({ libraryId: id, bundles, progress });
   const t4 = Date.now();
 
   console.log(`[perf] /personalized lib=${id} items=${items.length} | getLibrary=${t1 - t0}ms listItems=${t2 - t1}ms bundles(N+1)=${t3 - t2}ms shelves=${t4 - t3}ms total=${t4 - t0}ms`);

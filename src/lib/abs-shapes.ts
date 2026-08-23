@@ -451,8 +451,26 @@ export async function buildFilterData(args: {
 export async function buildPersonalizedShelves(args: {
   libraryId: string;
   bundles: ItemBundle[];
+  // Caller's progress by item id (books only). Optional so other callers
+  // can build shelves without a user.
+  progress?: Map<string, { row: { progress: number; is_finished: number; hide_from_continue_listening: number; last_update: number }; abs: unknown }>;
 }) {
   const minified = await Promise.all(args.bundles.map((b) => buildItemMinified(b)));
+  // Stock ABS embeds `mediaProgress` on shelf entities; Pholia draws its
+  // card progress bars from it, strict clients ignore the extra key.
+  for (const m of minified) {
+    const p = args.progress?.get(m.id);
+    if (p) Object.assign(m, { mediaProgress: p.abs });
+  }
+
+  // Continue listening: started, not finished, not hidden — most recently
+  // listened first. Same shelf id/label as stock ABS so clients that key on
+  // it slot it in.
+  const byId = new Map(minified.map((m) => [m.id, m]));
+  const continueListening = [...(args.progress ?? [])]
+    .filter(([id, p]) => byId.has(id) && p.row.progress > 0 && p.row.is_finished !== 1 && p.row.hide_from_continue_listening !== 1)
+    .sort((a, b) => b[1].row.last_update - a[1].row.last_update)
+    .map(([id]) => byId.get(id)!);
 
   // Recently added: newest first, except that a run of same-series books
   // added together (within 30 min of each other — one grab session) is
@@ -526,6 +544,7 @@ export async function buildPersonalizedShelves(args: {
   })));
 
   return [
+    { id: 'continue-listening', label: 'Continue Listening', labelStringKey: 'LabelContinueListening', type: 'book', entities: continueListening, total: continueListening.length },
     { id: 'recently-added', label: 'Recently Added',  labelStringKey: 'LabelRecentlyAdded',  type: 'book',    entities: recentlyAdded, total: recentlyAdded.length },
     { id: 'recent-series',  label: 'Recent Series',   labelStringKey: 'LabelRecentSeries',   type: 'series',  entities: recentSeries,  total: recentSeries.length },
     { id: 'discover',       label: 'Discover',        labelStringKey: 'LabelDiscover',       type: 'book',    entities: discover,      total: discover.length },
