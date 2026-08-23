@@ -712,6 +712,13 @@ adminRoutes.post('/storage/folder/:folderId/fetch-url/start', async (c) => {
     if (probe.size != null && existing.size === probe.size) {
       return c.json({ relPath, absPath, expectedSize: probe.size, alreadyComplete: true });
     }
+    // Smaller than the source: pCloud is (or was) still writing it — a
+    // previous attempt whose tab died, or a transient error that killed the
+    // client's polling. Let the client resume polling instead of refusing;
+    // /progress's size-vs-expected rule decides when it's done.
+    if (probe.size != null && existing.size != null && existing.size < probe.size) {
+      return c.json({ relPath, absPath, expectedSize: probe.size, resumed: true });
+    }
     const why = probe.size != null && existing.size != null
       ? ` (pCloud copy is ${existing.size} bytes, source is ${probe.size} bytes)`
       : '';

@@ -606,6 +606,19 @@ app.get('/api/notifications', requireAuth, (c) => c.json({
 // the HTML 200 fallback as a successful response with garbage body, parsing
 // fails, and the whole connection gets marked offline. Be honest with API
 // clients; let only browser navigations reach the SPA.
+// Uncaught exceptions (a pCloud helper throwing on a transient API error,
+// say) used to become Hono's bare text 500, and the admin/Pholia UIs could
+// only show "HTTP 500". Give API clients the message; keep the stack in the
+// Worker logs.
+app.onError((err, c) => {
+  const path = new URL(c.req.url).pathname;
+  console.error(`[unhandled] ${c.req.method} ${path}: ${err.stack ?? err.message}`);
+  if (path.startsWith('/api/') || path.startsWith('/auth/')) {
+    return c.json({ error: err.message || 'Internal error', path }, 500);
+  }
+  return c.text('Internal Server Error', 500);
+});
+
 app.notFound((c) => {
   const path = new URL(c.req.url).pathname;
   if (path.startsWith('/api/') || path.startsWith('/auth/')) {

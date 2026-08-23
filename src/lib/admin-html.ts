@@ -1323,7 +1323,7 @@ async function abbLoadRdList() {
 // Real-Debrid accounts fill up with TV/film; hide anything that looks like
 // video by name (resolution / codec / source tags, SxxEyy, video extension)
 // unless the user asks for everything.
-const ABB_VIDEO_RE = /\b(2160p|1080[pi]|720p|480p|4k|uhd|x26[45]|h\.?26[45]|hevc|av1|xvid|divx|blu-?ray|bdrip|brrip|web-?dl|webrip|hdtv|hdrip|dvdrip|remux|s\d{1,2}e\d{1,3}|season\s?\d+|complete series|yify|yts|rarbg|dts(-hd)?|truehd|atmos|ddp?\s?[57]\.1|aac\s?[57]\.1)\b|\.(mkv|mp4|avi|m2ts|ts)$/i;
+const ABB_VIDEO_RE = /\b(2160p|1080[pi]|720p|480p|4k|uhd|x26[45]|h\.?26[45]|hevc|av1|xvid|divx|blu-?ray|bdrip|brrip|web-?dl|webrip|hdtv|hdrip|dvdrip|remux|hdr(10\+?)?|dolby[\s.]?vision|sdr|s\d{1,2}e\d{1,3}|season\s?\d+|complete series|yify|yts|rarbg|dts(-hd)?|truehd|atmos|ddp?\s?[57]\.1|aac\s?[57]\.1)\b|\.(mkv|mp4|avi|m2ts|ts)$/i;
 const ABB_AUDIO_RE = /\b(audiobook|unabridged|abridged|narrated|m4b|mp3)\b/i;
 const abbLooksVideo = (name) => ABB_VIDEO_RE.test(name) && !ABB_AUDIO_RE.test(name);
 let abbRdShowAll = false;
@@ -1829,12 +1829,24 @@ async function fetchUrlToPcloud(folderId, url, relPath, listEl) {
     const maxWaitMs = 60 * 60 * 1000;
     let lastSize = 0;
     if (started.alreadyComplete) row.setStatus('Already on pCloud (same size) — registering…');
+    if (started.resumed) row.setStatus('pCloud already has a partial copy — resuming…');
+    // A single failed poll (pCloud's API does throw transient 5xx / 5000s)
+    // must not kill the grab; only give up after several in a row.
+    let pollErrors = 0;
     for (; !started.alreadyComplete;) {
       await new Promise((r) => setTimeout(r, 3000));
       const qs = new URLSearchParams({ relPath: started.relPath, lastSize: String(lastSize) });
       if (started.expectedSize) qs.set('expectedSize', String(started.expectedSize));
-      const p = await api('/api/admin/storage/folder/' + folderId + '/fetch-url/progress?' + qs.toString());
-      if (p.error) throw new Error(p.error);
+      let p;
+      try {
+        p = await api('/api/admin/storage/folder/' + folderId + '/fetch-url/progress?' + qs.toString());
+        if (p.error) throw new Error(p.error);
+        pollErrors = 0;
+      } catch (e) {
+        if (++pollErrors >= 6) throw new Error('Progress check kept failing: ' + e.message);
+        row.setStatus('Progress check failed (' + pollErrors + '/6): ' + e.message + ' — retrying');
+        continue;
+      }
       if (p.finished) break;
       const elapsed = Math.round((Date.now() - t0) / 1000);
       if (elapsed * 1000 > maxWaitMs) throw new Error('Gave up after an hour — pCloud never finished the download (is the URL a direct link?)');
