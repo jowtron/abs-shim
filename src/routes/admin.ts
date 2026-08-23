@@ -7,6 +7,7 @@ import {
   apiHostFromLocationId, type PcloudProfile,
   pcloudUploadCreate, pcloudUploadWrite, pcloudUploadSave,
   pcloudEnsureFolder, pcloudStat, pcloudDownloadFileAsync,
+  pcloudDeleteFile, pcloudDeleteEmptyFolder,
 } from '../storage/pcloud';
 import { runScan, addBookByPath, reprobeItem, type ScanReport } from '../scanner/scan';
 import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem } from '../db/library';
@@ -936,12 +937,46 @@ adminRoutes.post('/libraries/:libId/reprobe', async (c) => {
 // Cascading: library_items + book_metadata + audio_files + chapters +
 // listening_sessions + media_progress + bookmarks all get removed. R2 cover
 // is best-effort.
+// ?deleteFiles=1 additionally removes the audio files from storage and
+// then the item's folder if that left it empty. pCloud (OAuth) folders
+// only — other providers return filesDeleted:0 with a reason and the D1
+// rows are still removed. Files are deleted one by one and the D1 delete
+// only runs afterwards, so a pCloud failure mid-way leaves a consistent
+// "item still listed, some files gone" state the next scan marks missing,
+// rather than an orphaned file nobody can see.
 adminRoutes.delete('/items/:itemId', async (c) => {
   const itemId = c.req.param('itemId');
+  const tenantId = c.get('tenantId');
+  const deleteFiles = c.req.query('deleteFiles') === '1';
   const item = await c.env.DB.prepare(
-    'SELECT id FROM library_items WHERE id = ? AND tenant_id = ?',
-  ).bind(itemId, c.get('tenantId')).first<{ id: string }>();
+    'SELECT id, folder_id, rel_path, is_file FROM library_items WHERE id = ? AND tenant_id = ?',
+  ).bind(itemId, tenantId).first<{ id: string; folder_id: string; rel_path: string; is_file: number }>();
   if (!item) return c.json({ error: 'Item not found' }, 404);
+
+  let filesDeleted = 0;
+  let folderDeleted = false;
+  let filesReason: string | undefined;
+  if (deleteFiles) {
+    const loaded = await loadPcloudFolder(c.env, item.folder_id, tenantId);
+    if (!loaded.ok) {
+      filesReason = `files left in place: ${loaded.error}`;
+    } else {
+      const files = await c.env.DB.prepare(
+        'SELECT rel_path FROM audio_files WHERE library_item_id = ? AND rel_path IS NOT NULL',
+      ).bind(itemId).all<{ rel_path: string }>();
+      try {
+        for (const f of files.results) {
+          await pcloudDeleteFile(loaded.profile, joinPcloudPath(loaded.rootPath, f.rel_path));
+          filesDeleted++;
+        }
+        if (item.is_file === 0 && item.rel_path && item.rel_path !== '/') {
+          folderDeleted = await pcloudDeleteEmptyFolder(loaded.profile, joinPcloudPath(loaded.rootPath, item.rel_path));
+        }
+      } catch (e) {
+        return c.json({ error: `Deleted ${filesDeleted} of ${files.results.length} file(s) from pCloud, then: ${(e as Error).message}. The item is still listed — retry.` }, 502);
+      }
+    }
+  }
   await c.env.DB.batch([
     c.env.DB.prepare('DELETE FROM chapters WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM audio_files WHERE library_item_id = ?').bind(itemId),
@@ -952,7 +987,10 @@ adminRoutes.delete('/items/:itemId', async (c) => {
     c.env.DB.prepare('DELETE FROM library_items WHERE id = ?').bind(itemId),
   ]);
   try { await c.env.COVERS.delete(`covers/${itemId}`); } catch { /* non-fatal */ }
-  return c.body(null, 204);
+  if (!deleteFiles) return c.body(null, 204);
+  const out: { deleted: true; filesDeleted: number; folderDeleted: boolean; reason?: string } = { deleted: true, filesDeleted, folderDeleted };
+  if (filesReason) out.reason = filesReason;
+  return c.json(out);
 });
 
 // Warm the R2 cover cache for every item that doesn't already have one stored.

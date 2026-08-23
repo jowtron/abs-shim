@@ -2043,6 +2043,7 @@ function renderBooksList(container, items) {
     html += '<span class="meta">' + formatBytes(it.size_bytes) + '</span>';
     html += '<button class="secondary" data-reprobe-item="' + escapeHtml(it.id) + '">Re-probe</button>';
     html += '<button class="danger" data-remove-item="' + escapeHtml(it.id) + '">Remove</button>';
+    html += '<button class="danger" data-delete-item-files="' + escapeHtml(it.id) + '" title="Remove from the library AND delete the audio files from pCloud">Delete + files</button>';
     html += '</div>';
   }
   container.innerHTML = html;
@@ -2061,6 +2062,24 @@ function renderBooksList(container, items) {
         showError('Re-probe failed: ' + e.message);
       } finally {
         btn.disabled = false; btn.textContent = 'Re-probe';
+      }
+    });
+  });
+
+  container.querySelectorAll('[data-delete-item-files]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const row = btn.closest('.book-row');
+      const title = row.querySelector('.title').textContent.trim().split(' · ')[0];
+      if (!confirm('Delete "' + title + '" from the library AND delete its audio file(s) from pCloud?\n\nThis cannot be undone.')) return;
+      btn.disabled = true; btn.textContent = '…';
+      try {
+        const r = await api('/api/admin/items/' + btn.dataset.deleteItemFiles + '?deleteFiles=1', { method: 'DELETE' });
+        if (r && r.error) throw new Error(r.error);
+        row.remove();
+        if (r && r.reason) showError(r.reason);
+      } catch (e) {
+        showError('Delete failed: ' + e.message);
+        btn.disabled = false; btn.textContent = 'Delete + files';
       }
     });
   });

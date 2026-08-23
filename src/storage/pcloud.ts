@@ -480,6 +480,17 @@ export async function pcloudFileLink(profile: PcloudProfile, absPath: string): P
   return `https://${data.hosts[0]}${data.path}`;
 }
 
+// Non-recursive on purpose: only removes the folder if nothing is left in
+// it. 2005/2055 = already gone, 2006 = not empty (caller keeps going).
+export async function pcloudDeleteEmptyFolder(profile: PcloudProfile, absPath: string): Promise<boolean> {
+  const params = new URLSearchParams();
+  params.set('path', absPath);
+  const data = await pcloudGet<PcloudApiResult>(profile, 'deletefolder', params);
+  if (data.result === 0) return true;
+  if ([2005, 2006, 2055, 2009, 2010].includes(data.result)) return false;
+  throw new Error(`pCloud deletefolder(${absPath}) result=${data.result} ${data.error ?? ''}`);
+}
+
 export async function pcloudDeleteFile(profile: PcloudProfile, absPath: string): Promise<void> {
   const params = new URLSearchParams();
   params.set('path', absPath);
