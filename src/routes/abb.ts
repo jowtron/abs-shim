@@ -287,7 +287,7 @@ abbRoutes.get('/torrents', async (c) => {
     const list = await rdList(token);
     return c.json({
       torrents: list.map((t) => ({
-        id: t.id, filename: t.filename, status: t.status, progress: t.progress, bytes: t.bytes,
+        id: t.id, hash: (t.hash ?? '').toLowerCase(), filename: t.filename, status: t.status, progress: t.progress, bytes: t.bytes,
         seeders: t.seeders ?? null, speed: t.speed ?? null, error: RD_FAILED[t.status] ?? null,
       })),
     });
@@ -307,14 +307,22 @@ abbRoutes.get('/torrents/:id', async (c) => {
     const info = await rdInfo(token, c.req.param('id'));
     const out: {
       id: string; status: string; progress: number; seeders?: number; speed?: number; filename: string;
-      error: string | null; selectedFiles: Array<{ id: number; path: string; bytes: number }>;
+      error: string | null; hash: string;
+      selectedFiles: Array<{ id: number; path: string; bytes: number }>;
+      files: Array<{ id: number; path: string; bytes: number; selected: boolean; isAudio: boolean; isArchive: boolean }>;
       downloads?: Array<{ filename: string; filesize: number; ext: string; isAudio: boolean; isArchive: boolean; download: string }>;
     } = {
       id: info.id, status: info.status, progress: info.progress, filename: info.filename,
       error: RD_FAILED[info.status] ?? null,
+      hash: (info.hash ?? '').toLowerCase(),
       // Lets a UI that didn't start this grab (tab closed, other device)
-      // recompute the pCloud destination for the file(s) it selected.
+      // recompute the pCloud destination for the file(s) it selected, and
+      // re-offer the picker over the whole torrent (files + selected flag).
       selectedFiles: (info.files ?? []).filter((f) => f.selected === 1).map((f) => ({ id: f.id, path: f.path, bytes: f.bytes })),
+      files: (info.files ?? []).filter((f) => !/\/?\.pad\//.test(f.path)).map((f) => {
+        const fe = extOf(f.path);
+        return { id: f.id, path: f.path, bytes: f.bytes, selected: f.selected === 1, isAudio: AUDIO_EXT.has(fe), isArchive: ARCHIVE_EXT.has(fe) };
+      }),
     };
     if (info.seeders != null) out.seeders = info.seeders;
     if (info.speed != null) out.speed = info.speed;

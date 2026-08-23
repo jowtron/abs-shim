@@ -1280,41 +1280,114 @@ async function abbLoadRdList() {
     box.textContent = 'Couldn\'t list: ' + e.message;
     return;
   }
-  const ts = r.torrents || [];
-  count.textContent = ts.length ? '(' + ts.length + ')' : '';
-  if (!ts.length) { box.textContent = 'Nothing on Real-Debrid.'; return; }
+  // One row per release: the grab flow adds one RD torrent per file, so a
+  // multi-file grab is N torrents sharing a hash.
+  const groups = abbGroupTorrents(r.torrents || []);
+  count.textContent = groups.length ? '(' + groups.length + ')' : '';
+  if (!groups.length) { box.textContent = 'Nothing on Real-Debrid.'; return; }
   box.innerHTML = '';
   const table = document.createElement('table');
   const tb = document.createElement('tbody');
-  for (const t of ts) {
+  const folderId = document.getElementById('abb-target').value;
+  const listEl = document.getElementById('abb-rd-progress');
+  for (const g of groups) {
     const tr = document.createElement('tr');
     tr.innerHTML = '<td></td><td style="white-space:nowrap"></td><td style="width:1%; white-space:nowrap"></td>';
-    tr.children[0].textContent = t.filename + (t.bytes ? ' · ' + formatBytes(t.bytes) : '');
-    tr.children[1].textContent = t.error ? t.error : (t.status + (typeof t.progress === 'number' ? ' ' + t.progress + '%' : '') + (t.seeders != null ? ' · ' + t.seeders + ' seeders' : ''));
-    const folderId = document.getElementById('abb-target').value;
-    const listEl = document.getElementById('abb-rd-progress');
+    tr.children[0].textContent = g.filename + ' · ' + g.torrents.length + ' torrent' + (g.torrents.length === 1 ? '' : 's') + (g.bytes ? ' · ' + formatBytes(g.bytes) : '');
+    tr.children[1].textContent = g.summary;
     const act = (label, fn) => { const b = document.createElement('button'); b.className = 'secondary'; b.textContent = label; b.style.marginLeft = '0.3rem'; b.addEventListener('click', async () => { b.disabled = true; await fn(); abbLoadRdList(); }); tr.children[2].appendChild(b); };
-    if (!t.error) act(t.status === 'downloaded' ? 'Finish' : 'Watch', () => abbResumeTorrent(t, folderId, listEl));
-    act('Delete', () => api('/api/admin/abb/torrents/' + encodeURIComponent(t.id), { method: 'DELETE' }).catch((e) => showError('Delete failed: ' + e.message)));
+    if (g.live.length) {
+      act('Choose files…', () => abbResumeGroup(g, folderId, listEl, true));
+      act(g.allDone ? 'Finish' : 'Watch', () => abbResumeGroup(g, folderId, listEl, false));
+    }
+    act('Delete', () => Promise.all(g.torrents.map((t) => api('/api/admin/abb/torrents/' + encodeURIComponent(t.id), { method: 'DELETE' }).catch(() => {}))));
     tb.appendChild(tr);
   }
   table.appendChild(tb);
   box.appendChild(table);
 }
 
-// Resume a torrent this tab didn't start: recompute the pCloud destination
-// from the file RD says was selected, then run the normal tracking loop.
-async function abbResumeTorrent(t, folderId, listEl) {
+function abbGroupTorrents(torrents) {
+  const byHash = new Map();
+  for (const t of torrents) {
+    const key = t.hash || t.id;
+    if (!byHash.has(key)) byHash.set(key, { hash: t.hash, filename: t.filename, torrents: [], bytes: 0 });
+    const g = byHash.get(key);
+    g.torrents.push(t);
+    g.bytes += t.bytes || 0;
+  }
+  return [...byHash.values()].map((g) => {
+    g.live = g.torrents.filter((t) => !t.error);
+    g.allDone = g.live.length > 0 && g.live.every((t) => t.status === 'downloaded');
+    const done = g.live.filter((t) => t.status === 'downloaded').length;
+    const errs = g.torrents.length - g.live.length;
+    const dl = g.live.filter((t) => t.status !== 'downloaded');
+    const pct = dl.length ? Math.round(dl.reduce((s, t) => s + (t.progress || 0), 0) / dl.length) : null;
+    const seeders = dl.length ? Math.max(...dl.map((t) => t.seeders || 0)) : null;
+    g.summary = [done + ' / ' + g.torrents.length + ' ready', pct != null ? 'downloading ' + pct + '%' : null, seeders != null ? seeders + ' seeders' : null, errs ? errs + ' failed' : null].filter(Boolean).join(' · ');
+    return g;
+  });
+}
+
+// Resume a release this tab didn't start. With pick=true, re-offer the file
+// picker over the whole torrent (currently selected files pre-ticked):
+// unticked files have their RD torrents deleted, newly ticked ones are
+// added from the hash. Then the normal tracking loop runs over the result,
+// with destinations planned across all chosen files together so the
+// shared-prefix collapse behaves like a fresh grab.
+async function abbResumeGroup(g, folderId, listEl, pick) {
   if (!folderId) { showError('Pick a target library first.'); return; }
-  const row = appendUploadRow(listEl, t.filename, 'Checking on Real-Debrid…');
+  const row = appendUploadRow(listEl, g.filename, 'Checking on Real-Debrid…');
   try {
-    const st = await api('/api/admin/abb/torrents/' + encodeURIComponent(t.id));
-    if (st.error && !st.downloads) throw new Error(st.error);
-    const sel = st.selectedFiles || [];
-    if (!sel.length) throw new Error('Real-Debrid has no file selected for this torrent — delete it and grab again');
+    const infos = [];
+    for (const t of g.live) {
+      const st = await api('/api/admin/abb/torrents/' + encodeURIComponent(t.id));
+      if (st.error && !st.downloads) { appendUploadRow(listEl, '  ↳ RD ' + t.id, '').fail(st.error); continue; }
+      infos.push(st);
+    }
+    if (!infos.length) throw new Error('No usable torrents in this group');
+    const allFiles = infos[0].files || [];
+    const byFile = new Map();  // fileId → torrent id currently covering it
+    for (const st of infos) for (const f of st.selectedFiles || []) byFile.set(f.id, st.id);
+    let chosen = allFiles.filter((f) => byFile.has(f.id));
+    if (pick) {
+      const candidates = allFiles.filter((f) => f.isAudio || f.isArchive).map((f) => ({ ...f, selected: byFile.has(f.id) }));
+      if (!candidates.length) throw new Error('Torrent contains no audio files');
+      row.setStatus('Choose which files to keep…');
+      chosen = await abbPickFiles(g.filename, candidates, true);
+      if (!chosen) { row.fail('Cancelled'); return; }
+    }
+    if (!chosen.length) throw new Error('Nothing selected');
+    const want = new Set(chosen.map((f) => f.id));
+    // Drop torrents covering only unwanted files; add torrents for wanted
+    // files nobody covers.
+    const hash = infos[0].hash || g.hash;
+    for (const st of infos) {
+      const covers = (st.selectedFiles || []).map((f) => f.id);
+      if (covers.length && !covers.some((id) => want.has(id))) {
+        await api('/api/admin/abb/torrents/' + encodeURIComponent(st.id), { method: 'DELETE' }).catch(() => {});
+        covers.forEach((id) => byFile.delete(id));
+      }
+    }
+    const missing = chosen.filter((f) => !byFile.has(f.id));
+    if (missing.length) {
+      row.setStatus('Adding ' + missing.length + ' torrent(s) to Real-Debrid…');
+      const magnet = 'magnet:?xt=urn:btih:' + hash + '&dn=' + encodeURIComponent(g.filename);
+      for (const f of missing) {
+        try { const a = await abbAddTorrent(magnet, f.id); byFile.set(f.id, a.id); }
+        catch (e) { appendUploadRow(listEl, '  ↳ ' + f.path, '').fail('Add failed: ' + e.message); }
+      }
+    }
     const san = (s) => s.replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120) || 'audiobook';
-    const plan = abbPlanDest(san(st.filename), sel);
-    await abbTrackTorrents(plan.map((p) => ({ id: t.id, dest: p.dest })).slice(0, 1), folderId, listEl, row);
+    const plan = abbPlanDest(san(g.filename), chosen.filter((f) => byFile.has(f.id)));
+    // One torrent may cover several files (old-flow first torrent); key the
+    // tracking list by torrent and give it the first covered file's dest.
+    const byTorrent = new Map();
+    for (const p of plan) { const tid = byFile.get(p.id); if (!byTorrent.has(tid)) byTorrent.set(tid, p.dest); }
+    const torrents = [...byTorrent].map(([id, dest]) => ({ id, dest }));
+    if (!torrents.length) throw new Error('Nothing to track');
+    row.setStatus(torrents.length + ' torrent(s) on Real-Debrid — waiting for download');
+    await abbTrackTorrents(torrents, folderId, listEl, row);
   } catch (e) {
     row.fail(e.message || String(e));
   }
@@ -1530,7 +1603,8 @@ function abbPlanDest(folderName, files) {
 // Modal picker for multi-file releases. Files grouped by directory; a
 // directory checkbox toggles its files. Resolves with the chosen files or
 // null on cancel.
-function abbPickFiles(name, files) {
+function abbPickFiles(name, files, useSelectedFlag) {
+  const pre = (f) => (useSelectedFlag ? !!f.selected : true);
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.className = 'abb-modal';
@@ -1558,7 +1632,8 @@ function abbPickFiles(name, files) {
       g.className = 'abb-pick-group';
       const dl = document.createElement('label');
       dl.className = 'abb-pick-dir';
-      const dcb = document.createElement('input'); dcb.type = 'checkbox'; dcb.checked = true;
+      const dcb = document.createElement('input'); dcb.type = 'checkbox';
+      dcb.checked = entries.every((e) => pre(e.f)); dcb.indeterminate = !dcb.checked && entries.some((e) => pre(e.f));
       dl.appendChild(dcb);
       dl.appendChild(document.createTextNode(' ' + dir + ' (' + entries.length + ' file' + (entries.length === 1 ? '' : 's') + ', ' + formatBytes(entries.reduce((s, e) => s + (e.f.bytes || 0), 0)) + ')'));
       g.appendChild(dl);
@@ -1566,7 +1641,7 @@ function abbPickFiles(name, files) {
       for (const e of entries) {
         const l = document.createElement('label');
         l.className = 'abb-pick-file';
-        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = true; cb._file = e.f;
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = pre(e.f); cb._file = e.f;
         l.appendChild(cb);
         l.appendChild(document.createTextNode(' ' + e.name + (e.f.bytes ? ' · ' + formatBytes(e.f.bytes) : '') + (e.f.isArchive ? ' · archive' : '')));
         g.appendChild(l);
