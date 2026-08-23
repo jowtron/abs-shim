@@ -1285,10 +1285,20 @@ async function abbLoadRdList() {
   }
   // One row per release: the grab flow adds one RD torrent per file, so a
   // multi-file grab is N torrents sharing a hash.
-  const groups = abbGroupTorrents(r.torrents || []);
-  count.textContent = groups.length ? '(' + groups.length + ')' : '';
-  if (!groups.length) { box.textContent = 'Nothing on Real-Debrid.'; return; }
+  const all = abbGroupTorrents(r.torrents || []);
+  const hidden = abbRdShowAll ? [] : all.filter((g) => ABB_VIDEO_RE.test(g.filename));
+  const groups = abbRdShowAll ? all : all.filter((g) => !ABB_VIDEO_RE.test(g.filename));
+  count.textContent = all.length ? '(' + groups.length + (hidden.length ? ' + ' + hidden.length + ' video' : '') + ')' : '';
   box.innerHTML = '';
+  if (!groups.length) box.appendChild(Object.assign(document.createElement('div'), { className: 'muted', textContent: all.length ? 'Nothing audiobook-looking on Real-Debrid.' : 'Nothing on Real-Debrid.' }));
+  if (hidden.length || abbRdShowAll) {
+    const t = document.createElement('button');
+    t.className = 'secondary'; t.style.margin = '0.3rem 0';
+    t.textContent = abbRdShowAll ? 'Hide video torrents' : 'Show ' + hidden.length + ' hidden video torrent' + (hidden.length === 1 ? '' : 's');
+    t.addEventListener('click', () => { abbRdShowAll = !abbRdShowAll; abbLoadRdList(); });
+    box.appendChild(t);
+  }
+  if (!groups.length) return;
   const table = document.createElement('table');
   const tb = document.createElement('tbody');
   const folderId = document.getElementById('abb-target').value;
@@ -1309,6 +1319,12 @@ async function abbLoadRdList() {
   table.appendChild(tb);
   box.appendChild(table);
 }
+
+// Real-Debrid accounts fill up with TV/film; hide anything that looks like
+// video by name (resolution / codec / source tags, SxxEyy, video extension)
+// unless the user asks for everything.
+const ABB_VIDEO_RE = /\b(2160p|1080[pi]|720p|480p|4k|uhd|x26[45]|h\.?26[45]|hevc|av1|xvid|divx|blu-?ray|bdrip|brrip|web-?dl|webrip|hdtv|hdrip|dvdrip|remux|s\d{1,2}e\d{1,3}|season\s?\d+|complete series|yify|yts|rarbg|dts(-hd)?|truehd|atmos|ddp?\s?[57]\.1|aac\s?[57]\.1)\b|\.(mkv|mp4|avi|m2ts|ts)$/i;
+let abbRdShowAll = false;
 
 function abbGroupTorrents(torrents) {
   const byHash = new Map();
