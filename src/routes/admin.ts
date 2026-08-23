@@ -883,8 +883,10 @@ adminRoutes.post('/items/:itemId/reprobe', async (c) => {
 adminRoutes.post('/libraries/:libId/reprobe', async (c) => {
   const libId = c.req.param('libId');
   const onlyMissing = c.req.query('onlyMissingChapters') === '1';
+  // "Missing" includes exactly-one-chapter books: a single-file mp3 scanned
+  // before CHAP support (2026-08-23) got one whole-file chapter.
   const filter = onlyMissing
-    ? `AND NOT EXISTS (SELECT 1 FROM chapters ch WHERE ch.library_item_id = li.id)`
+    ? `AND (SELECT count(*) FROM chapters ch WHERE ch.library_item_id = li.id) <= 1`
     : '';
   const tenantId = c.get('tenantId');
   const rows = await c.env.DB.prepare(

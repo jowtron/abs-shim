@@ -45,6 +45,11 @@ export type Mp3Probe = {
   channels: number | null;
   tags: Record<string, string>;
   cover: { bytes: Uint8Array; mimeType: string } | null;
+  // ID3v2 CHAP frames (v2.3/v2.4), seconds relative to this file, sorted by
+  // start. Empty when the file has none — single-file mp3 audiobooks from
+  // Audible/Libro.fm/ABB rips almost always carry them; folder-of-files
+  // books usually don't (each file is the chapter).
+  chapters: Array<{ start: number; end: number; title: string }>;
 };
 
 export async function probeMp3(url: string, fileSize?: number): Promise<Mp3Probe> {
@@ -79,6 +84,7 @@ export function parseMp3(bytes: Uint8Array, fileSize: number): Mp3Probe {
     channels: null,
     tags: {},
     cover: null,
+    chapters: [],
   };
 
   let id3End = 0;
@@ -129,6 +135,12 @@ export function parseMp3(bytes: Uint8Array, fileSize: number): Mp3Probe {
     }
   }
 
+  // CHAP frames may appear in any order; drop zero-length and duplicate
+  // starts (some taggers emit a final 0-length marker chapter).
+  result.chapters = result.chapters
+    .filter((c) => c.end > c.start)
+    .sort((a, b) => a.start - b.start)
+    .filter((c, i, arr) => i === 0 || c.start > arr[i - 1]!.start);
   return result;
 }
 
@@ -169,10 +181,22 @@ function parseId3v2Frames(
     const dataStart = cursor + headerLen;
     const dataEnd = dataStart + size;
     if (size <= 0 || dataEnd > end) break;
-    const data = bytes.subarray(dataStart, dataEnd);
+    let data = bytes.subarray(dataStart, dataEnd);
     const canonical = v22 ? mapV22Id(id) : id;
+    // Frame format flags (byte 2 of the flags). v2.3: compression 0x80 /
+    // encryption 0x40 — can't decode, skip. v2.4: data-length-indicator
+    // 0x01 prefixes 4 bytes; unsynchronisation 0x02 means FF 00 → FF.
+    const fmtFlags = v22 ? 0 : (bytes[cursor + idLen + sizeLen + 1] ?? 0);
+    if (majorVer === 3 && (fmtFlags & 0xC0)) { cursor = dataEnd; continue; }
+    if (majorVer === 4) {
+      if (fmtFlags & 0x01) data = data.subarray(4);
+      if (fmtFlags & 0x02) data = deUnsync(data);
+    }
 
-    if (canonical && canonical !== 'TXXX' && canonical.startsWith('T')) {
+    if (canonical === 'CHAP' && !v22) {
+      const ch = decodeChapFrame(data, majorVer);
+      if (ch) out.chapters.push(ch);
+    } else if (canonical && canonical !== 'TXXX' && canonical.startsWith('T')) {
       const text = decodeTextFrame(data);
       if (text) out.tags[canonical] = text;
     } else if (canonical === 'TXXX') {
@@ -185,6 +209,38 @@ function parseId3v2Frames(
 
     cursor = dataEnd;
   }
+}
+
+function deUnsync(data: Uint8Array): Uint8Array {
+  const out = new Uint8Array(data.length);
+  let n = 0;
+  for (let i = 0; i < data.length; i++) {
+    out[n++] = data[i]!;
+    if (data[i] === 0xFF && data[i + 1] === 0x00) i++;
+  }
+  return out.subarray(0, n);
+}
+
+// CHAP (ID3v2.3/2.4 chapter addendum):
+//   element id (latin1, NUL-terminated) | start ms u32 | end ms u32 |
+//   start byte u32 | end byte u32 | embedded sub-frames (TIT2 = title)
+// Byte offsets are usually 0xFFFFFFFF ("not set") and ignored here.
+function decodeChapFrame(
+  data: Uint8Array, majorVer: number,
+): { start: number; end: number; title: string } | null {
+  const nul = data.indexOf(0);
+  if (nul < 0 || nul + 17 > data.length) return null;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const startMs = view.getUint32(nul + 1);
+  const endMs = view.getUint32(nul + 5);
+  const sub: Mp3Probe = { durationSeconds: null, bitrate: null, sampleRate: null, channels: null, tags: {}, cover: null, chapters: [] };
+  parseId3v2Frames(data, nul + 17, data.length, majorVer, sub);
+  const elementId = TD_LATIN1.decode(data.subarray(0, nul));
+  return {
+    start: startMs / 1000,
+    end: endMs / 1000,
+    title: sub.tags['TIT2'] ?? elementId,
+  };
 }
 
 // Map the v2.2 3-char frame ids we care about to their v2.3+ canonical forms.

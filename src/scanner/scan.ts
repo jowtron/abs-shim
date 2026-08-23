@@ -392,21 +392,7 @@ async function probeMp3Book(args: {
     );
   });
 
-  // One chapter per file. Title = that file's TIT2, falling back to a
-  // sanitized filename. End = next chapter's start (== this file's start +
-  // duration); for the last file, end = totalDuration.
-  const chapterStmts = files.map((f, i) => {
-    const p = probes[i]!;
-    const start = offsets[i]!;
-    const end = i + 1 < probes.length ? offsets[i + 1]! : totalDuration;
-    const filename = f.relPath.split('/').pop() ?? f.relPath;
-    const titleFromName = filename.replace(/\.mp3$/i, '').replace(/^\d+\s*[-_.]?\s*/, '');
-    const chapterTitle = p.tags['TIT2'] ?? titleFromName;
-    return env.DB.prepare(
-      `INSERT INTO chapters (library_item_id, chapter_index, title, start_seconds, end_seconds)
-       VALUES (?, ?, ?, ?, ?)`,
-    ).bind(itemId, i, chapterTitle, start, end);
-  });
+  const chapterStmts = mp3ChapterStmts(env, itemId, files.map((f) => f.relPath), probes);
 
   await env.DB.batch([
     env.DB.prepare(
@@ -465,10 +451,13 @@ export async function reprobeItem(env: Env, itemId: string, tenantId: string): P
   if (!folder) throw new Error('Folder not found');
   const audio = await env.DB.prepare(
     'SELECT * FROM audio_files WHERE library_item_id = ? ORDER BY index_no ASC LIMIT 1',
-  ).bind(itemId).first<{ id: string; rel_path: string | null; provider_file_id: string | null; filedn_url: string; duration_seconds: number }>();
+  ).bind(itemId).first<{ id: string; rel_path: string | null; provider_file_id: string | null; filedn_url: string; duration_seconds: number; format: string | null }>();
   if (!audio) throw new Error('No audio file for item');
 
   const adapter = await getAdapter(env, folder);
+  if (audio.format === 'mp3' || /\.mp3$/i.test(audio.rel_path ?? '')) {
+    return reprobeMp3Item(env, adapter, itemId, item.rel_path);
+  }
   const probeUrl = audio.rel_path
     ? await adapter.resolveProbeUrl(audio.rel_path, audio.provider_file_id)
     : { url: audio.filedn_url };
@@ -555,8 +544,108 @@ export async function reprobeItem(env: Env, itemId: string, tenantId: string): P
   };
 }
 
+// Chapter rows for an mp3 book. A file with ID3v2 CHAP frames contributes
+// those (shifted by the file's cumulative start); a file without them is one
+// chapter titled from its TIT2 / sanitized filename. Shared by the scanner and
+// reprobe so both agree.
+export function mp3Chapters(
+  relPaths: string[], probes: Mp3Probe[],
+): Array<{ title: string; start: number; end: number }> {
+  const out: Array<{ title: string; start: number; end: number }> = [];
+  let cum = 0;
+  for (let i = 0; i < probes.length; i++) {
+    const p = probes[i]!;
+    const fileDur = p.durationSeconds ?? 0;
+    const fileStart = cum;
+    const fileEnd = cum + fileDur;
+    if (p.chapters.length) {
+      for (const ch of p.chapters) {
+        const end = fileDur ? Math.min(ch.end, fileDur) : ch.end;
+        if (ch.start >= end) continue;
+        out.push({ title: ch.title, start: fileStart + ch.start, end: fileStart + end });
+      }
+    } else {
+      const filename = relPaths[i]!.split('/').pop() ?? relPaths[i]!;
+      const titleFromName = filename.replace(/\.mp3$/i, '').replace(/^\d+\s*[-_.]?\s*/, '');
+      out.push({ title: p.tags['TIT2'] ?? titleFromName, start: fileStart, end: fileEnd });
+    }
+    cum = fileEnd;
+  }
+  return out;
+}
+
+function mp3ChapterStmts(env: Env, itemId: string, relPaths: string[], probes: Mp3Probe[]): D1PreparedStatement[] {
+  return mp3Chapters(relPaths, probes).map((ch, i) => env.DB.prepare(
+    `INSERT INTO chapters (library_item_id, chapter_index, title, start_seconds, end_seconds)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).bind(itemId, i, ch.title, ch.start, ch.end));
+}
+
 function isUniqueViolation(e: unknown): boolean {
   return /UNIQUE constraint failed/i.test((e as Error)?.message ?? '');
+}
+
+// mp3 re-probe: every file again (CHAP frames, durations), chapters rebuilt
+// with mp3Chapters, series filled if NULL, cover refreshed from APIC.
+async function reprobeMp3Item(
+  env: Env, adapter: Awaited<ReturnType<typeof getAdapter>>, itemId: string, itemRel: string,
+): Promise<{ itemId: string; chapters: number; durationSeconds: number | null; coverRefreshed: boolean; series?: string }> {
+  const files = await env.DB.prepare(
+    'SELECT id, rel_path, provider_file_id, filedn_url, size_bytes FROM audio_files WHERE library_item_id = ? ORDER BY index_no ASC',
+  ).bind(itemId).all<{ id: string; rel_path: string | null; provider_file_id: string | null; filedn_url: string; size_bytes: number }>();
+  const probes: Mp3Probe[] = [];
+  for (const f of files.results) {
+    const probeUrl = f.rel_path
+      ? await adapter.resolveProbeUrl(f.rel_path, f.provider_file_id)
+      : { url: f.filedn_url };
+    probes.push(await probeMp3(probeUrl.url, f.size_bytes || undefined));
+  }
+  const relPaths = files.results.map((f) => f.rel_path ?? f.filedn_url);
+  const stmts: D1PreparedStatement[] = [
+    env.DB.prepare('DELETE FROM chapters WHERE library_item_id = ?').bind(itemId),
+    ...mp3ChapterStmts(env, itemId, relPaths, probes),
+  ];
+  let total = 0;
+  files.results.forEach((f, i) => {
+    const d = probes[i]!.durationSeconds;
+    if (d) {
+      total += d;
+      stmts.push(env.DB.prepare('UPDATE audio_files SET duration_seconds = ? WHERE id = ?').bind(d, f.id));
+    }
+  });
+  const meta = await env.DB.prepare(
+    'SELECT title, author_name, publisher, series_name FROM book_metadata WHERE library_item_id = ?',
+  ).bind(itemId).first<{ title: string; author_name: string | null; publisher: string | null; series_name: string | null }>();
+  let seriesSet: string | null = null;
+  const first = probes[0];
+  if (meta && !meta.series_name && first) {
+    const series = deriveSeries({
+      tags: {
+        ...(first.tags['TIT1'] ? { '©grp': first.tags['TIT1']! } : {}),
+        ...(first.tags['TXXX:SERIES'] ? { '----:com.apple.iTunes:SERIES': first.tags['TXXX:SERIES']! } : {}),
+        ...(first.tags['TXXX:SERIES-PART'] ? { '----:com.apple.iTunes:SERIES-PART': first.tags['TXXX:SERIES-PART']! } : {}),
+      },
+      title: meta.title, author: meta.author_name, album: meta.publisher,
+      folderName: itemRel.split('/').pop() ?? itemRel,
+    });
+    if (series) {
+      seriesSet = series.sequence ? `${series.name} #${series.sequence}` : series.name;
+      stmts.push(env.DB.prepare(
+        'UPDATE book_metadata SET series_name = ?, series_sequence = ? WHERE library_item_id = ?',
+      ).bind(series.name, series.sequence, itemId));
+    }
+  }
+  await env.DB.batch(stmts);
+  let coverRefreshed = false;
+  const cover = probes.find((p) => p.cover)?.cover;
+  if (cover) {
+    try {
+      await env.COVERS.put(`covers/${itemId}`, cover.bytes, { httpMetadata: { contentType: cover.mimeType } });
+      coverRefreshed = true;
+    } catch { /* non-fatal */ }
+  }
+  const chapterCount = mp3Chapters(relPaths, probes).length;
+  return { itemId, chapters: chapterCount, durationSeconds: total || null, coverRefreshed, ...(seriesSet ? { series: seriesSet } : {}) };
 }
 
 function sortKey(title: string): string {

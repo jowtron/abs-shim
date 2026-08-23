@@ -454,8 +454,31 @@ export async function buildPersonalizedShelves(args: {
 }) {
   const minified = await Promise.all(args.bundles.map((b) => buildItemMinified(b)));
 
-  // Recently added: items sorted by addedAt desc.
-  const recentlyAdded = [...minified].sort((a, b) => b.addedAt - a.addedAt);
+  // Recently added: newest first, except that a run of same-series books
+  // added together (within 30 min of each other — one grab session) is
+  // shown in reading order, Book 1 first. Pure desc ordering put Book 3
+  // before Book 1 after a three-book ABB grab (Joseph, 2026-08-23).
+  const ordered = minified
+    .map((item, i) => {
+      const m = args.bundles[i]!.metadata;
+      const seqNum = parseFloat(m?.series_sequence ?? '');
+      return { item, addedAt: item.addedAt, series: m?.series_name ?? null, seq: Number.isFinite(seqNum) ? seqNum : Infinity };
+    })
+    .sort((a, b) => b.addedAt - a.addedAt);
+  const BATCH_WINDOW_MS = 30 * 60 * 1000;
+  const recentlyAdded: typeof minified = [];
+  for (let i = 0; i < ordered.length;) {
+    const run = [ordered[i]!];
+    let j = i + 1;
+    while (
+      j < ordered.length && run[0]!.series
+      && ordered[j]!.series === run[0]!.series
+      && ordered[j - 1]!.addedAt - ordered[j]!.addedAt < BATCH_WINDOW_MS
+    ) run.push(ordered[j++]!);
+    if (run.length > 1) run.sort((a, b) => a.seq - b.seq || b.addedAt - a.addedAt);
+    recentlyAdded.push(...run.map((r) => r.item));
+    i = j;
+  }
 
   // Recent series: group by series_name, return one shelf entry per series with the books in it.
   const seriesGroups = new Map<string, { name: string; books: typeof minified }>();
