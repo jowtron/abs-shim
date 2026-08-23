@@ -177,11 +177,23 @@ abbRoutes.get('/details', async (c) => {
   }
 });
 
-// Body: { url } → { title, folderName, infoHash, magnet }
+// Body: { url } or { magnet } → { title, folderName, infoHash, magnet }
+// A pasted magnet skips AudioBookBay entirely; the title comes from its
+// dn= parameter (or the hash when absent).
 abbRoutes.post('/resolve', async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const url = String(body['url'] ?? '').trim();
-  if (!url) return c.json({ error: 'url required' }, 400);
+  const magnet = String(body['magnet'] ?? '').trim();
+  if (magnet) {
+    if (!magnet.startsWith('magnet:?')) return c.json({ error: 'Not a magnet link' }, 400);
+    const hash = /btih:([0-9a-zA-Z]{32,40})/.exec(magnet)?.[1] ?? '';
+    if (!hash) return c.json({ error: 'Magnet has no info hash' }, 400);
+    let dn = '';
+    try { dn = new URL(magnet).searchParams.get('dn') ?? ''; } catch { /* malformed query — fall back to hash */ }
+    const title = dn.replace(/\+/g, ' ').trim() || `magnet ${hash.slice(0, 8)}`;
+    return c.json({ url: null, title, infoHash: hash.toLowerCase(), magnet, folderName: folderNameFromTitle(title) });
+  }
+  if (!url) return c.json({ error: 'url or magnet required' }, 400);
   let cookie: string | null = null;
   try {
     cookie = await abbCookie(c.env, c.get('tenantId'));
@@ -198,8 +210,11 @@ abbRoutes.post('/resolve', async (c) => {
 
 // ─── Torrents ───────────────────────────────────────────────────────────────
 
-// Body: { magnet, fileId? }
+// Body: { magnet, fileId?, inspect? }
 // Adds the magnet, waits for RD to list the files, then selects:
+//   inspect: true     → nothing; returns every file (path/size/kind) and
+//                       deletes the torrent again. The client shows a picker
+//                       and comes back with one fileId per wanted file.
 //   fileId given      → that one file (per-file add for multi-file sets)
 //   exactly one audio → it                    mode: 'single'
 //   several audio     → the first; the rest  mode: 'multi' (client adds them)
@@ -208,6 +223,7 @@ abbRoutes.post('/torrents', async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const magnet = String(body['magnet'] ?? '').trim();
   const fileId = body['fileId'] != null ? Number(body['fileId']) : null;
+  const inspect = body['inspect'] === true;
   if (!magnet.startsWith('magnet:?')) return c.json({ error: 'magnet required' }, 400);
   let token: string;
   try {
@@ -221,6 +237,14 @@ abbRoutes.post('/torrents', async (c) => {
     if (RD_FAILED[info.status]) {
       await rdDelete(token, added.id).catch(() => undefined);
       return c.json({ error: RD_FAILED[info.status] }, 502);
+    }
+    if (inspect) {
+      await rdDelete(token, added.id).catch(() => undefined);
+      const all = (info.files ?? []).map((f) => {
+        const ext = extOf(f.path);
+        return { id: f.id, path: f.path, bytes: f.bytes, ext, isAudio: AUDIO_EXT.has(ext), isArchive: ARCHIVE_EXT.has(ext) };
+      });
+      return c.json({ name: info.filename, files: all });
     }
     const audio = audioFiles(info);
     const files = audio.map((f) => ({ id: f.id, path: f.path, bytes: f.bytes }));

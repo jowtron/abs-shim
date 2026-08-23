@@ -69,6 +69,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     .upload-row input[type=text] { flex: 1; min-width: 160px; }
     .upload-item { padding: 0.4rem 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 4px; margin: 0.25rem 0; font-size: 0.85rem; }
     .upload-item .name { font-weight: 500; word-break: break-all; }
+    .upload-item .row-btn { float: right; padding: 0.1rem 0.5rem; font-size: 0.75rem; margin-left: 0.5rem; }
     .spinner { display: inline-block; width: 0.8em; height: 0.8em; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: -0.1em; margin-right: 0.4em; }
     @keyframes spin { to { transform: rotate(360deg); } }
     .abb-cover { width: 44px; height: 44px; object-fit: cover; border-radius: 4px; background: var(--border); display: block; }
@@ -89,6 +90,14 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     .abb-details .meta { color: var(--muted); margin-bottom: 0.4rem; }
     .abb-details p { margin: 0 0 0.5rem 0; }
     .abb-details p:last-child { margin-bottom: 0; }
+    .abb-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 1rem; }
+    .abb-modal-box { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; width: min(640px, 100%); max-height: 90vh; display: flex; flex-direction: column; }
+    .abb-modal-box h3 { margin: 0 0 0.25rem 0; font-size: 1rem; overflow-wrap: anywhere; }
+    .abb-pick-list { overflow-y: auto; flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: 6px; padding: 0.25rem 0.5rem; font-size: 0.85rem; }
+    .abb-pick-group { margin: 0.35rem 0; }
+    .abb-pick-dir { display: block; font-weight: 600; padding: 0.2rem 0; overflow-wrap: anywhere; }
+    .abb-pick-file { display: block; padding: 0.15rem 0 0.15rem 1.4rem; overflow-wrap: anywhere; }
+    .abb-pick-file input, .abb-pick-dir input { margin-right: 0.3rem; }
     /* Mobile: cards scroll sideways instead of overflowing the viewport. */
     .card { min-width: 0; overflow-x: auto; }
     code { overflow-wrap: anywhere; }
@@ -1186,7 +1195,11 @@ async function abbDoSearch() {
   if (!q) return;
   btn.disabled = true; out.textContent = 'Searching…';
   try {
-    const r = await api('/api/admin/abb/search?q=' + encodeURIComponent(q));
+    // A pasted magnet link becomes a single pseudo-result; Grab resolves it
+    // server-side (title from dn=) and inspects it like any release.
+    const r = /^magnet:\?/i.test(q)
+      ? { results: [{ title: abbMagnetTitle(q), url: null, magnet: q, cover: null, format: null, bitrate: null, sizeBytes: null, language: '', posted: null }] }
+      : await api('/api/admin/abb/search?q=' + encodeURIComponent(q));
     if (!r.results.length) {
       out.innerHTML = '<p class="muted">0 results. (If a known title returns nothing, AudioBookBay\'s page layout may have changed.)</p>';
       return;
@@ -1196,7 +1209,7 @@ async function abbDoSearch() {
     const tb = document.createElement('tbody');
     for (const res of r.results) {
       const tr = document.createElement('tr');
-      const fmt = [res.format ? res.format.toUpperCase() : null, res.bitrate, res.sizeBytes ? formatBytes(res.sizeBytes) : null, res.language, res.posted ? 'Posted ' + res.posted : null].filter(Boolean).join(' · ');
+      const fmt = res.magnet ? 'Magnet link' : [res.format ? res.format.toUpperCase() : null, res.bitrate, res.sizeBytes ? formatBytes(res.sizeBytes) : null, res.language, res.posted ? 'Posted ' + res.posted : null].filter(Boolean).join(' · ');
       tr.innerHTML = '<td style="width:44px"></td><td></td><td style="width:1%; white-space:nowrap"></td>';
       if (res.cover && /^https?:/.test(res.cover)) {
         const img = document.createElement('img');
@@ -1207,14 +1220,14 @@ async function abbDoSearch() {
       }
       tr.children[1].innerHTML = '<span class="abb-title" role="button" title="Show description"></span><a class="abb-ext" target="_blank" rel="noopener" title="Open on AudioBookBay">↗</a><div class="abb-sub"></div>';
       tr.children[1].querySelector('.abb-title').textContent = res.title;
-      tr.children[1].querySelector('.abb-ext').href = res.url;
+      if (res.url) tr.children[1].querySelector('.abb-ext').href = res.url; else tr.children[1].querySelector('.abb-ext').remove();
       tr.children[1].querySelector('.abb-sub').textContent = fmt;
       // Tap the title → blurb + written by / read by, fetched once.
       const drow = document.createElement('tr');
       drow.className = 'abb-details-row';
       drow.style.display = 'none';
       drow.innerHTML = '<td colspan="3"><div class="abb-details"></div></td>';
-      tr.children[1].querySelector('.abb-title').addEventListener('click', () => abbToggleDetails(res, drow));
+      if (res.url) tr.children[1].querySelector('.abb-title').addEventListener('click', () => abbToggleDetails(res, drow));
       const b = document.createElement('button');
       b.textContent = 'Grab';
       // Progress renders in a row directly under this result, not at the
@@ -1243,6 +1256,10 @@ async function abbDoSearch() {
   } finally {
     btn.disabled = false;
   }
+}
+
+function abbMagnetTitle(magnet) {
+  try { return (new URL(magnet).searchParams.get('dn') || '').replace(/\+/g, ' ').trim() || 'Magnet link'; } catch (e) { return 'Magnet link'; }
 }
 
 async function abbToggleDetails(res, drow) {
@@ -1282,49 +1299,80 @@ function renderAbbDetails(box, d) {
 // Resolve → add torrent(s) → poll → pCloud fetch each file → delete torrent.
 async function abbGrab(res, folderId, listEl) {
   if (!folderId) { showError('Pick a target library first.'); return false; }
-  const row = appendUploadRow(listEl, res.title, 'Resolving on AudioBookBay…');
+  const row = appendUploadRow(listEl, res.title, res.magnet ? 'Reading magnet…' : 'Resolving on AudioBookBay…');
   try {
     const m = await api('/api/admin/abb/resolve', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: res.url }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(res.magnet ? { magnet: res.magnet } : { url: res.url }),
     });
     if (m.error) throw new Error(m.error);
-    row.setStatus('Adding to Real-Debrid…');
-    const first = await abbAddTorrent(m.magnet, null);
-    const torrents = [{ id: first.id, fileId: first.selected }];
-    if (first.mode === 'multi') {
-      // One torrent per remaining audio file, a few at a time — RD caps
-      // active torrents and each add costs ~10 API calls.
-      const rest = first.files.filter((f) => f.id !== first.selected);
-      row.setStatus('Multi-file release: adding ' + rest.length + ' more torrent(s)…');
-      for (let i = 0; i < rest.length; i += 4) {
-        const batch = rest.slice(i, i + 4);
-        const added = await Promise.all(batch.map((f) => abbAddTorrent(m.magnet, f.id).catch((e) => ({ error: e.message, fileId: f.id }))));
-        for (const a of added) {
-          if (a.error) appendUploadRow(listEl, '  ↳ file ' + a.fileId, '').fail('Add failed: ' + a.error);
-          else torrents.push({ id: a.id, fileId: a.selected });
-        }
-        row.setStatus('Added ' + torrents.length + ' / ' + (rest.length + 1) + ' torrent(s)…');
-      }
+    row.setStatus('Asking Real-Debrid what\'s in it…');
+    const peek = await api('/api/admin/abb/torrents', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ magnet: m.magnet, inspect: true }),
+    });
+    if (peek.error) throw new Error(peek.error);
+    const candidates = (peek.files || []).filter((f) => f.isAudio || f.isArchive);
+    if (!candidates.length) throw new Error('Torrent contains no audio files');
+    let chosen = candidates;
+    if (candidates.length > 1) {
+      row.setStatus('Choose which files to grab…');
+      chosen = await abbPickFiles(peek.name || m.title, candidates);
+      if (!chosen) { row.fail('Cancelled'); return false; }
     }
+    const plan = abbPlanDest(m.folderName, chosen);
+    row.setStatus('Adding ' + plan.length + ' torrent(s) to Real-Debrid…');
+    // One torrent per file, a few at a time — RD caps active torrents and
+    // each add costs ~10 API calls.
+    const torrents = [];
+    for (let i = 0; i < plan.length; i += 4) {
+      const batch = plan.slice(i, i + 4);
+      const added = await Promise.all(batch.map((p) => abbAddTorrent(m.magnet, p.id).then((a) => ({ ...a, dest: p.dest })).catch((e) => ({ error: e.message, dest: p.dest }))));
+      for (const a of added) {
+        if (a.error) appendUploadRow(listEl, '  ↳ ' + a.dest, '').fail('Add failed: ' + a.error);
+        else torrents.push({ id: a.id, dest: a.dest });
+      }
+      row.setStatus('Added ' + torrents.length + ' / ' + plan.length + ' torrent(s)…');
+    }
+    if (!torrents.length) throw new Error('Nothing could be added to Real-Debrid');
     row.setStatus(torrents.length + ' torrent(s) on Real-Debrid — waiting for download');
 
     // Poll every torrent on one shared timer so RD's 250 req/min limit holds
     // even for a 40-part set: interval scales with the torrent count.
+    // Cancel deletes whatever is still on RD; a torrent whose progress
+    // hasn't moved for 20 min (no seeders) is given up on the same way —
+    // RD itself would otherwise sit on it indefinitely.
     const interval = Math.max(4000, torrents.length * 600);
-    const pending = new Map(torrents.map((t) => [t.id, appendUploadRow(listEl, '  ↳ RD ' + t.id, 'Queued on Real-Debrid')]));
+    const STALL_MS = 20 * 60 * 1000;
+    const pending = new Map(torrents.map((t) => [t.id, { row: appendUploadRow(listEl, '  ↳ ' + t.dest, 'Queued on Real-Debrid'), dest: t.dest, lastProgress: -1, lastChangeAt: Date.now() }]));
     const fetches = [];
     let needsScan = false;
+    let cancelled = false;
+    const removeCancel = row.addButton('Cancel', () => { cancelled = true; });
+    const dropTorrent = (id) => api('/api/admin/abb/torrents/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
     while (pending.size) {
       await new Promise((r) => setTimeout(r, interval));
-      for (const [id, trow] of [...pending]) {
+      if (cancelled) {
+        for (const [id, p] of pending) { p.row.fail('Cancelled'); dropTorrent(id); }
+        pending.clear();
+        removeCancel();
+        row.fail('Cancelled — torrents removed from Real-Debrid');
+        return false;
+      }
+      for (const [id, p] of [...pending]) {
         let st;
         try { st = await api('/api/admin/abb/torrents/' + encodeURIComponent(id)); }
-        catch (e) { trow.setStatus('Poll error: ' + e.message); continue; }
-        if (st.error && !st.downloads) { trow.fail(st.error); pending.delete(id); continue; }
+        catch (e) { p.row.setStatus('Poll error: ' + e.message); continue; }
+        if (st.error && !st.downloads) { p.row.fail(st.error); pending.delete(id); dropTorrent(id); continue; }
+        if (st.progress !== p.lastProgress) { p.lastProgress = st.progress; p.lastChangeAt = Date.now(); }
+        else if (st.status !== 'downloaded' && Date.now() - p.lastChangeAt > STALL_MS) {
+          p.row.fail('No progress for 20 min (' + (st.seeders || 0) + ' seeders) — gave up and removed it from Real-Debrid');
+          pending.delete(id); dropTorrent(id); continue;
+        }
         if (st.status === 'downloaded' && st.downloads) {
           pending.delete(id);
-          trow.complete('Ready on Real-Debrid: ' + st.downloads.map((d) => d.filename).join(', '));
-          // Hand each direct link to pCloud; delete the torrent once it lands.
+          p.row.complete('Ready on Real-Debrid');
+          // Hand each direct link to pCloud at the planned path; delete the
+          // torrent once it lands.
           fetches.push((async () => {
             for (const d of st.downloads) {
               if (!d.isAudio && !d.isArchive) continue;
@@ -1332,19 +1380,21 @@ async function abbGrab(res, folderId, listEl) {
                 appendUploadRow(listEl, '  ↳ ' + d.filename, '').fail('Real-Debrid produced a ' + d.ext + ' — can\'t extract server-side. Download it and use the browser upload instead.');
                 continue;
               }
-              const registered = await fetchUrlToPcloud(folderId, d.download, m.folderName + '/' + d.filename, listEl);
+              const registered = await fetchUrlToPcloud(folderId, d.download, p.dest, listEl);
               if (!registered) needsScan = true;
             }
             await api('/api/admin/abb/torrents/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
           })());
         } else {
           const pct = typeof st.progress === 'number' ? st.progress + '%' : '';
-          trow.setStatus(st.status + ' ' + pct + (st.seeders != null ? ' · ' + st.seeders + ' seeders' : '') + (st.speed ? ' · ' + formatBytes(st.speed) + '/s' : ''));
-          if (typeof st.progress === 'number') trow.setProgressPct(st.progress);
+          p.row.setStatus(st.status + ' ' + pct + (st.seeders != null ? ' · ' + st.seeders + ' seeders' : '') + (st.speed ? ' · ' + formatBytes(st.speed) + '/s' : ''));
+          if (typeof st.progress === 'number') p.row.setProgressPct(st.progress);
         }
       }
     }
+    removeCancel();
     await Promise.all(fetches);
+    if (!fetches.length) { row.fail('Nothing downloaded'); return false; }
     // /fetch-url/finish only registers single m4b/m4a/aac files. An mp3
     // release is N chapter files that must land before they can be probed
     // as one book, so nothing registers them until a scan runs — do that
@@ -1370,6 +1420,103 @@ async function abbGrab(res, folderId, listEl) {
     row.fail(e.message || String(e));
     return false;
   }
+}
+
+// Where each chosen torrent file lands on pCloud, relative to the library
+// folder. RD paths look like "/Pack Name/Book 28 - The Secret/01.mp3".
+//   • The dirs every chosen file shares are collapsed to their deepest one,
+//     so picking only "Book 28" out of a 4-book pack lands it as
+//     "Book 28 - The Secret/01.mp3", not "Pack Name/Book 28 …/01.mp3".
+//   • Sub-folders below that are kept, so a whole pack lands as one folder
+//     per book and the scanner sees separate books.
+//   • Two m4b/m4a siblings in one dir would be read as one broken
+//     "multi-file non-mp3" book, so each gets its own folder named after
+//     the file. mp3 siblings stay together — they're chapters of one book.
+function abbPlanDest(folderName, files) {
+  const san = (s) => s.replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const split = files.map((f) => f.path.split('/').filter(Boolean));
+  let depth = 0;
+  while (split.every((p) => p.length > depth + 1 && p[depth] === split[0][depth])) depth++;
+  const top = depth > 0 ? san(split[0][depth - 1]) : san(folderName);
+  const rels = split.map((p) => [top, ...p.slice(depth)].map(san));
+  const dirOf = (r) => r.slice(0, -1).join('/');
+  const m4bLike = (name) => /\.(m4b|m4a|aac)$/i.test(name);
+  return files.map((f, i) => {
+    const r = rels[i];
+    const name = r[r.length - 1];
+    const siblings = rels.filter((o, j) => j !== i && dirOf(o) === dirOf(r) && /\.(m4b|m4a|aac|mp3|flac|ogg|opus)$/i.test(o[o.length - 1]));
+    const dest = m4bLike(name) && siblings.length
+      ? [...r.slice(0, -1), name.replace(/\.[^.]+$/, ''), name].join('/')
+      : r.join('/');
+    return { id: f.id, dest, bytes: f.bytes };
+  });
+}
+
+// Modal picker for multi-file releases. Files grouped by directory; a
+// directory checkbox toggles its files. Resolves with the chosen files or
+// null on cancel.
+function abbPickFiles(name, files) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'abb-modal';
+    overlay.innerHTML =
+      '<div class="abb-modal-box">' +
+        '<h3></h3><p class="muted" style="margin-top:0">Pick what to grab. Whole folders are one book each; mp3 files in a folder are chapters of that book.</p>' +
+        '<div class="abb-pick-list"></div>' +
+        '<div class="upload-row" style="justify-content:flex-end; margin:0.75rem 0 0">' +
+          '<span class="muted abb-pick-summary" style="margin-right:auto"></span>' +
+          '<button class="secondary" data-cancel>Cancel</button><button data-ok>Grab</button>' +
+        '</div>' +
+      '</div>';
+    overlay.querySelector('h3').textContent = name;
+    const list = overlay.querySelector('.abb-pick-list');
+    const groups = new Map();
+    for (const f of files) {
+      const parts = f.path.split('/').filter(Boolean);
+      const dir = parts.slice(0, -1).join('/') || '/';
+      if (!groups.has(dir)) groups.set(dir, []);
+      groups.get(dir).push({ f, name: parts[parts.length - 1] });
+    }
+    const boxes = [];
+    for (const [dir, entries] of groups) {
+      const g = document.createElement('div');
+      g.className = 'abb-pick-group';
+      const dl = document.createElement('label');
+      dl.className = 'abb-pick-dir';
+      const dcb = document.createElement('input'); dcb.type = 'checkbox'; dcb.checked = true;
+      dl.appendChild(dcb);
+      dl.appendChild(document.createTextNode(' ' + dir + ' (' + entries.length + ' file' + (entries.length === 1 ? '' : 's') + ', ' + formatBytes(entries.reduce((s, e) => s + (e.f.bytes || 0), 0)) + ')'));
+      g.appendChild(dl);
+      const fileBoxes = [];
+      for (const e of entries) {
+        const l = document.createElement('label');
+        l.className = 'abb-pick-file';
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = true; cb._file = e.f;
+        l.appendChild(cb);
+        l.appendChild(document.createTextNode(' ' + e.name + (e.f.bytes ? ' · ' + formatBytes(e.f.bytes) : '') + (e.f.isArchive ? ' · archive' : '')));
+        g.appendChild(l);
+        fileBoxes.push(cb); boxes.push(cb);
+        cb.addEventListener('change', () => { dcb.checked = fileBoxes.every((b) => b.checked); dcb.indeterminate = !dcb.checked && fileBoxes.some((b) => b.checked); update(); });
+      }
+      dcb.addEventListener('change', () => { fileBoxes.forEach((b) => { b.checked = dcb.checked; }); dcb.indeterminate = false; update(); });
+      list.appendChild(g);
+    }
+    const ok = overlay.querySelector('[data-ok]');
+    const summary = overlay.querySelector('.abb-pick-summary');
+    const chosen = () => boxes.filter((b) => b.checked).map((b) => b._file);
+    const update = () => {
+      const c = chosen();
+      ok.disabled = !c.length;
+      ok.textContent = 'Grab ' + c.length + ' file' + (c.length === 1 ? '' : 's');
+      summary.textContent = c.length ? formatBytes(c.reduce((s, f) => s + (f.bytes || 0), 0)) : 'Nothing selected';
+    };
+    update();
+    const close = (val) => { overlay.remove(); resolve(val); };
+    ok.addEventListener('click', () => close(chosen()));
+    overlay.querySelector('[data-cancel]').addEventListener('click', () => close(null));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(null); });
+    document.body.appendChild(overlay);
+  });
 }
 
 async function abbAddTorrent(magnet, fileId) {
@@ -1506,7 +1653,8 @@ async function fetchUrlToPcloud(folderId, url, relPath, listEl) {
     const t0 = Date.now();
     const maxWaitMs = 60 * 60 * 1000;
     let lastSize = 0;
-    for (;;) {
+    if (started.alreadyComplete) row.setStatus('Already on pCloud (same size) — registering…');
+    for (; !started.alreadyComplete;) {
       await new Promise((r) => setTimeout(r, 3000));
       const qs = new URLSearchParams({ relPath: started.relPath, lastSize: String(lastSize) });
       if (started.expectedSize) qs.set('expectedSize', String(started.expectedSize));
@@ -1611,6 +1759,15 @@ function appendUploadRow(listEl, name, initialStatus) {
     fail(text) {
       el.classList.add('err');
       status.textContent = ' · ' + (text || 'Failed');
+    },
+    // Small inline button (e.g. "Cancel"); returns a function that removes it.
+    addButton(label, onClick) {
+      const b = document.createElement('button');
+      b.className = 'secondary row-btn';
+      b.textContent = label;
+      b.addEventListener('click', onClick);
+      el.appendChild(b);
+      return () => b.remove();
     },
   };
 }

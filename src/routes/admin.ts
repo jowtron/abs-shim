@@ -700,12 +700,23 @@ adminRoutes.post('/storage/folder/:folderId/fetch-url/start', async (c) => {
     return c.json({ error: (e as Error).message }, 400);
   }
   // Refuse to clobber — pCloud would otherwise save alongside as "name (1)"
-  // and the registration step would point at the wrong file.
-  if (await pcloudStat(loaded.profile, absPath)) {
-    return c.json({ error: `Already exists in pCloud: ${absPath}` }, 409);
-  }
+  // and the registration step would point at the wrong file. There's no
+  // hash to compare (pCloud exposes none for a remote URL), so "same path
+  // AND same byte size as the source" is treated as already-landed: the
+  // client skips straight to /finish. A size mismatch is a different or
+  // partial file and stays a hard 409.
+  const existing = await pcloudStat(loaded.profile, absPath);
   const probe = await probeSourceUrl(url);
   if (probe.error) return c.json({ error: probe.error }, 400);
+  if (existing) {
+    if (probe.size != null && existing.size === probe.size) {
+      return c.json({ relPath, absPath, expectedSize: probe.size, alreadyComplete: true });
+    }
+    const why = probe.size != null && existing.size != null
+      ? ` (pCloud copy is ${existing.size} bytes, source is ${probe.size} bytes)`
+      : '';
+    return c.json({ error: `Already exists in pCloud: ${absPath}${why} — delete it there first if you want it re-fetched` }, 409);
+  }
   const folderId = await pcloudEnsureFolder(loaded.profile, absDir);
   await pcloudDownloadFileAsync(loaded.profile, { url, folderId, name });
   const out: { relPath: string; absPath: string; expectedSize?: number } = { relPath, absPath };
