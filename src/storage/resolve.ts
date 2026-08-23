@@ -39,6 +39,28 @@ export async function resolveProbeUrl(
 //
 // We keep this in resolve.ts (rather than per-route) so /api/items/:id/file
 // and /public/session/:id/track stay in sync — both stream the same way.
+// Bound only time-to-headers on upstream (pCloud CDN) fetches: the timer is
+// cleared once the response headers arrive, so a multi-minute audio body
+// still streams unbounded. Why not AbortSignal.timeout(): that would abort
+// the BODY ~10s into the stream. 10s sits comfortably above pCloud's ~800ms
+// TTFB and well inside the ~40s iOS waits before giving up with a fatal
+// (client-unretried) error 4 — see crash-log analysis 2026-08-23.
+export const UPSTREAM_HEADER_TIMEOUT_MS = 10_000;
+
+export async function fetchWithHeaderTimeout(
+  url: string,
+  headers: HeadersInit,
+  timeoutMs = UPSTREAM_HEADER_TIMEOUT_MS,
+): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error('upstream header timeout')), timeoutMs);
+  try {
+    return await fetch(url, { headers, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function streamAudio(
   env: Env,
   folder: LibraryFolderRow,
@@ -52,7 +74,17 @@ export async function streamAudio(
     const fwd = new Headers();
     const range = req.headers.get('Range');
     if (range) fwd.set('Range', range);
-    const upstream = await fetch(stream.url, { headers: fwd });
+    // One retry on hang/5xx. A pCloud TTFB hang used to propagate to the
+    // client as a ~40s dead wait, which iOS turns into a fatal error 4.
+    // Retrying the SAME url is right for hangs; expired-link failures come
+    // back fast as 4xx and pass through unchanged, as before.
+    let upstream: Response;
+    try {
+      upstream = await fetchWithHeaderTimeout(stream.url, fwd);
+      if (upstream.status >= 500) throw new Error(`pCloud upstream ${upstream.status}`);
+    } catch {
+      upstream = await fetchWithHeaderTimeout(stream.url, fwd);
+    }
     // Don't pass through pCloud's CORS headers (the Worker already handles
     // CORS for its own origin) and drop Content-Encoding so the runtime
     // doesn't re-encode a stream pCloud already left raw.

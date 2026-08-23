@@ -1,6 +1,6 @@
 import type { Env } from '../types';
 import type { AudioFileRow, LibraryFolderRow } from '../db/library';
-import { resolveStreamUrl, audioContentType } from './resolve';
+import { resolveStreamUrl, audioContentType, fetchWithHeaderTimeout } from './resolve';
 import { parseRange } from './moov-cache';
 
 // Opportunistic R2 cache of arbitrary audio byte ranges. Complements
@@ -129,9 +129,14 @@ export async function tryServeByteRange(
           // then iOS has already buffered the cached prefix and is happily
           // decoding ahead of its own playhead.
           const streamUrl = await resolveStreamUrl(env, folder, audio);
-          const upstream = await fetch(streamUrl.url, {
-            headers: { Range: `bytes=${cursor}-${range.end}` },
-          });
+          const hdrs = { Range: `bytes=${cursor}-${range.end}` };
+          // Header-timeout + one retry: a pCloud TTFB hang at the R2→pCloud
+          // seam would otherwise stall the client mid-body with no recovery
+          // (same failure mode as streamAudio's cold path).
+          let upstream = await fetchWithHeaderTimeout(streamUrl.url, hdrs).catch(() => null);
+          if (!upstream || upstream.status !== 206 || !upstream.body) {
+            upstream = await fetchWithHeaderTimeout(streamUrl.url, hdrs);
+          }
           // Anything other than 206 means the body doesn't match our declared
           // Content-Range (a 200 restarts at byte 0; an expired-filelink 403
           // is an HTML error page) — erroring lets the client retry cleanly
@@ -187,8 +192,11 @@ export async function warmByteChunk(
     if (existing) return;
 
     const streamUrl = await resolveStreamUrl(env, folder, audio);
+    // Best-effort background warm: bound the WHOLE fetch (headers + 4 MiB
+    // body) so a pCloud hang can't pin the waitUntil for minutes.
     const upstream = await fetch(streamUrl.url, {
       headers: { Range: `bytes=${chunk.start}-${chunk.end}` },
+      signal: AbortSignal.timeout(30_000),
     });
     if (upstream.status !== 206 && upstream.status !== 200) return;
 

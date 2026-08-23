@@ -55,8 +55,11 @@ export async function warmMoovCache(env: Env, folder: LibraryFolderRow, audio: A
 
     const streamUrl = await resolveStreamUrl(env, folder, audio);
     const last = audio.moov_offset + audio.moov_size - 1;
+    // Bounded: moov atoms run up to ~10 MB; a pCloud hang shouldn't pin the
+    // waitUntil for minutes. Best-effort, so a mid-body abort is fine.
     const upstream = await fetch(streamUrl.url, {
       headers: { Range: `bytes=${audio.moov_offset}-${last}` },
+      signal: AbortSignal.timeout(60_000),
     });
     // Accept 206 (Partial Content) and 200 (server ignored Range). Anything
     // else means upstream isn't going to give us the bytes — bail.

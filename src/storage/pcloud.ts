@@ -68,6 +68,10 @@ type PcloudListFolder = PcloudApiResult & {
 // overlapping fileids.
 type CachedStreamUrl = { url: string; expiresAt: number };
 const streamUrlCache = new Map<string, CachedStreamUrl>();
+// In-flight getfilelink calls, keyed like streamUrlCache. A cold play start
+// fires ~5 concurrent resolveUrl calls for one file (/play prewarms + the
+// first Range request) — one getfilelink is enough for all of them.
+const inflightFileLinks = new Map<string, Promise<CachedStreamUrl>>();
 // Safety margin under the pCloud `expires` timestamp. If pCloud says the URL
 // is valid until T, treat it as valid until T-60s — covers clock skew and the
 // occasional 6h-window race.
@@ -95,6 +99,31 @@ export class PcloudOAuthAdapter implements StorageAdapter {
       return cached;
     }
 
+    // Dedup concurrent resolutions. Awaiting a promise created by ANOTHER
+    // request context can throw in Workers ("Cannot perform I/O on behalf
+    // of a different request") — the catch falls through to a fresh call,
+    // so the worst case is exactly the old behaviour.
+    const pending = inflightFileLinks.get(key);
+    if (pending) {
+      try {
+        return await pending;
+      } catch { /* fall through to a fresh call */ }
+    }
+    const p = this.fetchFileLink(key, relPath, providerFileId);
+    inflightFileLinks.set(key, p);
+    try {
+      return await p;
+    } finally {
+      inflightFileLinks.delete(key);
+    }
+  }
+
+  private async fetchFileLink(
+    key: string,
+    relPath: string,
+    providerFileId?: string | null,
+  ): Promise<CachedStreamUrl> {
+    const now = Date.now();
     // Prefer fileid when we already know it (set by the scanner) — saves a
     // path lookup roundtrip per request. Fall back to path lookup otherwise.
     const params = new URLSearchParams();
@@ -391,11 +420,18 @@ export async function pcloudFetchWithRetry(method: string, url: string, accessTo
   for (let i = 0; i < attempts; i++) {
     if (i) await new Promise((r) => setTimeout(r, 500 * 2 ** (i - 1)));
     let res: Response;
+    // Per-attempt time-to-headers bound: observed 2026-08-23, pCloud API
+    // hangs/522s stacked into a ~40s dead wait on the streaming hot path.
+    // Timer cleared once headers arrive so response bodies aren't bounded.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(new Error('pCloud header timeout')), 10_000);
     try {
-      res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+      res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` }, signal: ctrl.signal });
     } catch (e) {
       lastErr = new Error(`pCloud ${method} network error: ${(e as Error).message}`);
       continue;
+    } finally {
+      clearTimeout(timer);
     }
     if (res.ok) return res;
     const body = await res.text().catch(() => '');
