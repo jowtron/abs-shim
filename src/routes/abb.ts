@@ -6,8 +6,7 @@ import { abbLogin, abbSearch, abbMagnet, abbDetails, type AbbCookie } from '../l
 import { sealSecret, openSecret, secretsConfigured } from '../lib/secret-box';
 import {
   rdUser, rdInfo, rdAddMagnet, rdSelectFiles, rdDelete, rdUnrestrict, rdWaitForFiles,
-  audioFiles, extOf, AUDIO_EXT, ARCHIVE_EXT, RD_FAILED,
-} from '../lib/realdebrid';
+  audioFiles, extOf, AUDIO_EXT, ARCHIVE_EXT, RD_FAILED, rdList } from '../lib/realdebrid';
 
 // AudioBookBay → Real-Debrid → pCloud. Mounted at /api/admin/abb.
 //
@@ -274,6 +273,29 @@ abbRoutes.post('/torrents', async (c) => {
   }
 });
 
+// Everything on the Real-Debrid account. The grab flow is browser-driven,
+// so a tab closed mid-grab leaves torrents here with nobody watching; the
+// UIs list these with Finish / Watch / Delete.
+abbRoutes.get('/torrents', async (c) => {
+  let token: string;
+  try {
+    token = await requireRd(c.env, c.get('tenantId'));
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+  try {
+    const list = await rdList(token);
+    return c.json({
+      torrents: list.map((t) => ({
+        id: t.id, filename: t.filename, status: t.status, progress: t.progress, bytes: t.bytes,
+        seeders: t.seeders ?? null, speed: t.speed ?? null, error: RD_FAILED[t.status] ?? null,
+      })),
+    });
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 502);
+  }
+});
+
 abbRoutes.get('/torrents/:id', async (c) => {
   let token: string;
   try {
@@ -285,10 +307,14 @@ abbRoutes.get('/torrents/:id', async (c) => {
     const info = await rdInfo(token, c.req.param('id'));
     const out: {
       id: string; status: string; progress: number; seeders?: number; speed?: number; filename: string;
-      error: string | null; downloads?: Array<{ filename: string; filesize: number; ext: string; isAudio: boolean; isArchive: boolean; download: string }>;
+      error: string | null; selectedFiles: Array<{ id: number; path: string; bytes: number }>;
+      downloads?: Array<{ filename: string; filesize: number; ext: string; isAudio: boolean; isArchive: boolean; download: string }>;
     } = {
       id: info.id, status: info.status, progress: info.progress, filename: info.filename,
       error: RD_FAILED[info.status] ?? null,
+      // Lets a UI that didn't start this grab (tab closed, other device)
+      // recompute the pCloud destination for the file(s) it selected.
+      selectedFiles: (info.files ?? []).filter((f) => f.selected === 1).map((f) => ({ id: f.id, path: f.path, bytes: f.bytes })),
     };
     if (info.seeders != null) out.seeders = info.seeders;
     if (info.speed != null) out.speed = info.speed;
