@@ -172,13 +172,16 @@ export const ADMIN_HTML = String.raw`<!doctype html>
       <select id="abb-target"></select>
       <button id="abb-search">Search</button>
     </div>
+    <div id="abb-active" style="display:none; margin:0.5rem 0 0.75rem">
+      <div style="font-weight:600; margin-bottom:0.25rem">In progress</div>
+      <div id="abb-rd-progress" class="upload-list"></div>
+    </div>
     <div id="abb-results"></div>
     <details id="abb-rd" style="margin-top:0.75rem">
       <summary>On Real-Debrid <span id="abb-rd-count" class="muted"></span></summary>
       <p class="muted" style="margin:0.4rem 0">Grabs run in this browser tab. If a tab was closed mid-grab the torrents are still here — <b>Finish</b> collects a completed one into the library, <b>Watch</b> resumes waiting for one that's still downloading, <b>Delete</b> removes it from Real-Debrid.</p>
       <div id="abb-rd-list" class="muted">Not loaded.</div>
       <button class="secondary" id="abb-rd-refresh" style="margin-top:0.4rem">Refresh</button>
-      <div id="abb-rd-progress" class="upload-list"></div>
     </details>
   </div>
 
@@ -1337,6 +1340,10 @@ function abbGroupTorrents(torrents) {
 // shared-prefix collapse behaves like a fresh grab.
 async function abbResumeGroup(g, folderId, listEl, pick) {
   if (!folderId) { showError('Pick a target library first.'); return; }
+  // Progress lives in the always-visible "In progress" block above the
+  // results, not at the bottom of an 80-row account list.
+  document.getElementById('abb-active').style.display = '';
+  document.getElementById('abb-active').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   const row = appendUploadRow(listEl, g.filename, 'Checking on Real-Debrid…');
   try {
     const infos = [];
