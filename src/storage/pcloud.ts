@@ -184,12 +184,7 @@ export class PcloudOAuthAdapter implements StorageAdapter {
 
   private async call<T extends PcloudApiResult>(method: string, params: URLSearchParams): Promise<T> {
     const url = `https://${this.profile.apiHost}/${method}?${params.toString()}`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${this.profile.accessToken}` },
-    });
-    if (!res.ok) {
-      throw new Error(`pCloud ${method} HTTP ${res.status}: ${await res.text().catch(() => '')}`);
-    }
+    const res = await pcloudFetchWithRetry(method, url, this.profile.accessToken);
     const data = await res.json() as T;
     if (data.result !== 0) {
       throw new Error(`pCloud ${method} result=${data.result} ${data.error ?? ''}`);
@@ -381,11 +376,33 @@ async function pcloudGet<T extends PcloudApiResult>(
   profile: PcloudProfile, method: string, params: URLSearchParams,
 ): Promise<T> {
   const url = `https://${profile.apiHost}/${method}?${params.toString()}`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${profile.accessToken}` } });
-  if (!res.ok) {
-    throw new Error(`pCloud ${method} HTTP ${res.status}: ${await res.text().catch(() => '')}`);
-  }
+  const res = await pcloudFetchWithRetry(method, url, profile.accessToken);
   return await res.json() as T;
+}
+
+// pCloud's API sits behind Cloudflare and occasionally answers 522/520/5xx
+// or drops the connection (observed 2026-08-23: "pCloud stat HTTP 522"
+// killed a grab on its first call). Retry those a few times with backoff;
+// 4xx are real answers and are not retried. Every pCloud call in the shim
+// is idempotent or safe to repeat (stat/listfolder/createfolderifnotexists/
+// downloadfileasync-with-same-target).
+export async function pcloudFetchWithRetry(method: string, url: string, accessToken: string, attempts = 4): Promise<Response> {
+  let lastErr: Error | null = null;
+  for (let i = 0; i < attempts; i++) {
+    if (i) await new Promise((r) => setTimeout(r, 500 * 2 ** (i - 1)));
+    let res: Response;
+    try {
+      res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    } catch (e) {
+      lastErr = new Error(`pCloud ${method} network error: ${(e as Error).message}`);
+      continue;
+    }
+    if (res.ok) return res;
+    const body = await res.text().catch(() => '');
+    lastErr = new Error(`pCloud ${method} HTTP ${res.status}: ${body.slice(0, 200)}`);
+    if (res.status < 500) break;
+  }
+  throw lastErr ?? new Error(`pCloud ${method} failed`);
 }
 
 export type PcloudMetadata = {
