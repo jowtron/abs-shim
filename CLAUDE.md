@@ -34,6 +34,10 @@ For backends that can't 302 directly (WebDAV), `proxy-url.ts` mints HMAC-signed 
 
 **Prober** (`src/prober/m4b.ts`): pure-JS MP4 atom walker, reads moov via Range requests, extracts mvhd duration, udta/meta/ilst tags (incl. `----:<mean>:<name>` custom tags), covr cover. No FFmpeg.
 
+**mp3 chapters**: `src/prober/mp3.ts` reads ID3v2 `CHAP` frames (how single-file mp3 audiobooks carry chapters); `mp3Chapters()` in the scanner merges them across a folder of files (a file without CHAP is one chapter). `reprobeItem` dispatches mp3 items to `reprobeMp3Item`; "Re-probe books missing chapters" in /admin includes 1-chapter books for exactly this case.
+
+**Recently Added** (`buildPersonalizedShelves`): newest-first, but a run of same-series books added within 30 min is shown Book 1 first.
+
 **Series** (`src/lib/series.ts`): `deriveSeries()` fills `book_metadata.series_name/series_sequence` at scan time and on reprobe (only when NULL). Tags first (`----:com.apple.iTunes:SERIES`/`SERIES-PART`, `©mvn`/`©mvi`, `tvsh`/`tves`, `©grp`), then a folder/title heuristic for AudioBookBay-style "Title Series, Book N - Author" folder names. Minified `seriesName` is emitted as `Series #N` like real ABS; Pholia parses that for its "Book N" badge. Metadata lives only in D1 — the files on pCloud are never rewritten.
 
 **Admin UI** (`src/lib/admin-html.ts`): single self-contained HTML+JS embedded in the Worker (a `String.raw` template — regex escapes are verbatim), served at `/admin`. Cookie-authed with inline login form. Renders all library_folders per library (multi-backend), with attach buttons for S3/WebDAV/pCloud, chunked browser upload (zip/rar extracted client-side via libarchive.js), fetch-from-URL, and the AudioBookBay → Real-Debrid panel. Before deploying UI changes: extract the `<script>` and run `node --check` on it — there's no other syntax check.
