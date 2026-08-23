@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import type { Env } from '../types';
 import { requireAuth, type AuthVars } from '../auth/middleware';
 import { getTenantSetting, setTenantSetting, deleteTenantSetting } from '../db/settings';
-import { abbLogin, abbSearch, abbMagnet, type AbbCookie } from '../lib/abb';
+import { abbLogin, abbSearch, abbMagnet, abbDetails, type AbbCookie } from '../lib/abb';
 import { sealSecret, openSecret, secretsConfigured } from '../lib/secret-box';
 import {
   rdUser, rdInfo, rdAddMagnet, rdSelectFiles, rdDelete, rdUnrestrict, rdWaitForFiles,
@@ -155,6 +155,23 @@ abbRoutes.get('/search', async (c) => {
   try {
     const results = await abbSearch(q, pages, cookie);
     return c.json({ query: q, count: results.length, results });
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 502);
+  }
+});
+
+// ?url= → blurb + "Written by / Read by / Format / Bit Rate / Length" from
+// the detail page. Shown on tap in the search results; anonymous fetch is
+// fine (detail pages are public, only the magnet is member-gated).
+abbRoutes.get('/details', async (c) => {
+  const url = (c.req.query('url') ?? '').trim();
+  if (!url) return c.json({ error: 'url required' }, 400);
+  let cookie: string | null = null;
+  try {
+    cookie = await abbCookie(c.env, c.get('tenantId'));
+  } catch { /* anonymous is fine */ }
+  try {
+    return c.json(await abbDetails(url, cookie));
   } catch (e) {
     return c.json({ error: (e as Error).message }, 502);
   }

@@ -82,6 +82,13 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     #abb-results td { vertical-align: middle; }
     #abb-results .abb-title { font-weight: 500; }
     #abb-results .abb-sub { color: var(--muted); font-size: 0.8rem; }
+    #abb-results .abb-title { cursor: pointer; }
+    #abb-results .abb-ext { color: var(--muted); font-size: 0.8rem; margin-left: 0.4rem; text-decoration: none; }
+    .abb-details-row td { padding: 0 0.5rem 0.6rem 0.5rem; }
+    .abb-details { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.75rem; font-size: 0.85rem; line-height: 1.45; }
+    .abb-details .meta { color: var(--muted); margin-bottom: 0.4rem; }
+    .abb-details p { margin: 0 0 0.5rem 0; }
+    .abb-details p:last-child { margin-bottom: 0; }
     /* Mobile: cards scroll sideways instead of overflowing the viewport. */
     .card { min-width: 0; overflow-x: auto; }
     code { overflow-wrap: anywhere; }
@@ -1198,10 +1205,16 @@ async function abbDoSearch() {
         img.addEventListener('error', () => { img.style.visibility = 'hidden'; });
         tr.children[0].appendChild(img);
       }
-      tr.children[1].innerHTML = '<a class="abb-title" target="_blank" rel="noopener"></a><div class="abb-sub"></div>';
-      tr.children[1].firstChild.href = res.url;
-      tr.children[1].firstChild.textContent = res.title;
-      tr.children[1].lastChild.textContent = fmt;
+      tr.children[1].innerHTML = '<span class="abb-title" role="button" title="Show description"></span><a class="abb-ext" target="_blank" rel="noopener" title="Open on AudioBookBay">↗</a><div class="abb-sub"></div>';
+      tr.children[1].querySelector('.abb-title').textContent = res.title;
+      tr.children[1].querySelector('.abb-ext').href = res.url;
+      tr.children[1].querySelector('.abb-sub').textContent = fmt;
+      // Tap the title → blurb + written by / read by, fetched once.
+      const drow = document.createElement('tr');
+      drow.className = 'abb-details-row';
+      drow.style.display = 'none';
+      drow.innerHTML = '<td colspan="3"><div class="abb-details"></div></td>';
+      tr.children[1].querySelector('.abb-title').addEventListener('click', () => abbToggleDetails(res, drow));
       const b = document.createElement('button');
       b.textContent = 'Grab';
       // Progress renders in a row directly under this result, not at the
@@ -1220,6 +1233,7 @@ async function abbDoSearch() {
       });
       tr.children[2].appendChild(b);
       tb.appendChild(tr);
+      tb.appendChild(drow);
       tb.appendChild(prow);
     }
     table.appendChild(tb);
@@ -1229,6 +1243,40 @@ async function abbDoSearch() {
   } finally {
     btn.disabled = false;
   }
+}
+
+async function abbToggleDetails(res, drow) {
+  const box = drow.firstChild.firstChild;
+  if (drow.style.display !== 'none') { drow.style.display = 'none'; return; }
+  drow.style.display = '';
+  if (drow.dataset.loaded) return;
+  box.innerHTML = '<span class="spinner"></span>Loading description…';
+  try {
+    const d = await api('/api/admin/abb/details?url=' + encodeURIComponent(res.url));
+    if (d.error) throw new Error(d.error);
+    renderAbbDetails(box, d);
+    drow.dataset.loaded = '1';
+  } catch (e) {
+    box.textContent = 'Couldn\'t load details: ' + e.message;
+  }
+}
+
+function renderAbbDetails(box, d) {
+  box.innerHTML = '';
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  meta.textContent = [
+    d.author ? 'Written by ' + d.author : null,
+    d.narrators && d.narrators.length ? 'Read by ' + d.narrators.join(', ') : null,
+    d.format, d.bitrate, d.length,
+    d.abridged === true ? 'Abridged' : d.abridged === false ? 'Unabridged' : null,
+  ].filter(Boolean).join(' · ');
+  box.appendChild(meta);
+  const paras = (d.description || '').split(/\n\n+/).filter(Boolean);
+  if (!paras.length) {
+    const p = document.createElement('p'); p.className = 'muted'; p.textContent = 'No description on the listing.'; box.appendChild(p);
+  }
+  for (const t of paras) { const p = document.createElement('p'); p.textContent = t; box.appendChild(p); }
 }
 
 // Resolve → add torrent(s) → poll → pCloud fetch each file → delete torrent.

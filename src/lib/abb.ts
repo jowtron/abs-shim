@@ -158,6 +158,51 @@ export async function abbMagnet(pageUrl: string, cookie: string | null): Promise
   return { url: pageUrl, title, infoHash: hash.toLowerCase(), magnet };
 }
 
+export type AbbDetails = {
+  url: string;
+  title: string;
+  author: string | null;
+  narrators: string[];
+  format: string | null;
+  bitrate: string | null;
+  length: string | null;
+  abridged: boolean | null;
+  description: string;      // plain text, paragraphs separated by blank lines
+};
+
+// The detail page's <div class="desc" itemprop="description"> holds a
+// "Written by / Read by / Format / Unabridged" header paragraph, a
+// "Bit Rate / Length / Narrators" paragraph, then the blurb. The header
+// fields are tagged (span.author, span.narrator, span.format,
+// span.is_abridged) so those are read structurally; the blurb is whatever
+// paragraphs remain once the two meta paragraphs are dropped.
+export async function abbDetails(pageUrl: string, cookie: string | null): Promise<AbbDetails> {
+  const u = new URL(pageUrl);
+  if (u.origin !== ABB_BASE) throw new Error('Not an AudioBookBay URL');
+  const html = await abbFetch(u.pathname + u.search, cookie);
+  return parseDetails(pageUrl, html);
+}
+
+export function parseDetails(pageUrl: string, html: string): AbbDetails {
+  const title = htmlTitle(html);
+  const descStart = html.search(/<div class="desc"[^>]*>/);
+  const desc = descStart >= 0 ? html.slice(descStart, html.indexOf('</div>', descStart)) : '';
+  const text = (s: string) => decodeEntities(s.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+  const spans = (cls: string) => [...desc.matchAll(new RegExp(`<span class="${cls}"[^>]*>([\\s\\S]*?)<\\/span>`, 'g'))].map((m) => text(m[1]!)).filter(Boolean);
+  const author = spans('author')[0] ?? null;
+  const narrators = spans('narrator');
+  const format = spans('format')[0] ?? null;
+  const abridgedSpan = spans('is_abridged')[0];
+  const abridged = abridgedSpan ? /^abridged/i.test(abridgedSpan) : null;
+  const paras = [...desc.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/g)].map((m) => text(m[1]!)).filter(Boolean);
+  const metaRe = /^(Written by|Read by|Format:|Bit ?Rate:|Length:|Narrators?:)/i;
+  const meta = paras.filter((p) => metaRe.test(p)).join(' ');
+  const bitrate = /Bit ?Rate:\s*([^\n]+?)(?=\s+(?:Length|Narrators?):|$)/i.exec(meta)?.[1]?.trim() ?? null;
+  const length = /Length:\s*([^\n]+?)(?=\s+Narrators?:|$)/i.exec(meta)?.[1]?.trim() ?? null;
+  const description = paras.filter((p) => !metaRe.test(p)).join('\n\n');
+  return { url: pageUrl, title, author, narrators, format, bitrate, length, abridged, description };
+}
+
 function safeHttpUrl(raw: string): string | null {
   try {
     const u = new URL(decodeEntities(raw), ABB_BASE);
