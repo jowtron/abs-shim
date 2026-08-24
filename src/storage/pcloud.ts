@@ -213,7 +213,11 @@ export class PcloudOAuthAdapter implements StorageAdapter {
 
   private async call<T extends PcloudApiResult>(method: string, params: URLSearchParams): Promise<T> {
     const url = `https://${this.profile.apiHost}/${method}?${params.toString()}`;
-    const res = await pcloudFetchWithRetry(method, url, this.profile.accessToken);
+    // getfilelink sits on the streaming hot path, where a hang used to become
+    // a ~40s dead wait that iOS turns into a fatal error 4 — keep it tight.
+    // Everything else (scanner listfolder etc.) gets the lenient default.
+    const headerTimeoutMs = method === 'getfilelink' ? 10_000 : 60_000;
+    const res = await pcloudFetchWithRetry(method, url, this.profile.accessToken, 4, headerTimeoutMs);
     const data = await res.json() as T;
     if (data.result !== 0) {
       throw new Error(`pCloud ${method} result=${data.result} ${data.error ?? ''}`);
@@ -415,16 +419,21 @@ async function pcloudGet<T extends PcloudApiResult>(
 // 4xx are real answers and are not retried. Every pCloud call in the shim
 // is idempotent or safe to repeat (stat/listfolder/createfolderifnotexists/
 // downloadfileasync-with-same-target).
-export async function pcloudFetchWithRetry(method: string, url: string, accessToken: string, attempts = 4): Promise<Response> {
+// headerTimeoutMs bounds time-to-headers per attempt. Default is generous:
+// metadata calls (stat/createfolder/downloadfileasync) can legitimately block
+// well past 10s while pCloud is busy writing the very file being polled —
+// a 10s bound here broke grab progress polling ("pCloud stat network error:
+// pCloud header timeout", 2026-08-24). Only the streaming hot path passes a
+// tight bound (getfilelink in the adapter's call()).
+export async function pcloudFetchWithRetry(method: string, url: string, accessToken: string, attempts = 4, headerTimeoutMs = 60_000): Promise<Response> {
   let lastErr: Error | null = null;
   for (let i = 0; i < attempts; i++) {
     if (i) await new Promise((r) => setTimeout(r, 500 * 2 ** (i - 1)));
     let res: Response;
-    // Per-attempt time-to-headers bound: observed 2026-08-23, pCloud API
-    // hangs/522s stacked into a ~40s dead wait on the streaming hot path.
-    // Timer cleared once headers arrive so response bodies aren't bounded.
+    // Per-attempt time-to-headers bound (see headerTimeoutMs above). Timer
+    // cleared once headers arrive so response bodies aren't bounded.
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(new Error('pCloud header timeout')), 10_000);
+    const timer = setTimeout(() => ctrl.abort(new Error('pCloud header timeout')), headerTimeoutMs);
     try {
       res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` }, signal: ctrl.signal });
     } catch (e) {
