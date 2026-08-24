@@ -1521,25 +1521,29 @@ async function abbTrackTorrents(torrents, folderId, listEl, row) {
     let needsScan = false;
     let cancelled = false;
     const removeCancel = row.addButton('Cancel', () => { cancelled = true; });
-    const dropTorrent = (id) => api('/api/admin/abb/torrents/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
+    // No automatic torrent deletion anywhere in this flow: Real-Debrid
+    // expires old torrents on its own, and auto-deleting on failure destroyed
+    // the only way to retry a grab (The Secret, 2026-08-24). Only the explicit
+    // Delete button in the On Real-Debrid panel (and deselecting files in the
+    // picker) removes torrents. Kept in sync with Pholia's abbTrackTorrents.
     while (pending.size) {
       await new Promise((r) => setTimeout(r, interval));
       if (cancelled) {
-        for (const [id, p] of pending) { p.row.fail('Cancelled'); dropTorrent(id); }
+        for (const [, p] of pending) p.row.fail('Cancelled');
         pending.clear();
         removeCancel();
-        row.fail('Cancelled — torrents removed from Real-Debrid');
+        row.fail('Cancelled — torrents left on Real-Debrid (resume from the On Real-Debrid panel)');
         return false;
       }
       for (const [id, p] of [...pending]) {
         let st;
         try { st = await api('/api/admin/abb/torrents/' + encodeURIComponent(id)); }
         catch (e) { p.row.setStatus('Poll error: ' + e.message); continue; }
-        if (st.error && !st.downloads) { p.row.fail(st.error); pending.delete(id); dropTorrent(id); continue; }
+        if (st.error && !st.downloads) { p.row.fail(st.error); pending.delete(id); continue; }
         if (st.progress !== p.lastProgress) { p.lastProgress = st.progress; p.lastChangeAt = Date.now(); }
         else if (st.status !== 'downloaded' && Date.now() - p.lastChangeAt > STALL_MS) {
-          p.row.fail('No progress for 20 min (' + (st.seeders || 0) + ' seeders) — gave up and removed it from Real-Debrid');
-          pending.delete(id); dropTorrent(id); continue;
+          p.row.fail('No progress for 20 min (' + (st.seeders || 0) + ' seeders) — gave up; it is still on Real-Debrid to retry later');
+          pending.delete(id); continue;
         }
         if (st.status === 'downloaded' && st.downloads) {
           pending.delete(id);
@@ -1556,7 +1560,6 @@ async function abbTrackTorrents(torrents, folderId, listEl, row) {
               const registered = await fetchUrlToPcloud(folderId, d.download, p.dest, listEl);
               if (!registered) needsScan = true;
             }
-            await api('/api/admin/abb/torrents/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
           })());
         } else {
           const pct = typeof st.progress === 'number' ? st.progress + '%' : '';
