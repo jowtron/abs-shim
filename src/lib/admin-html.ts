@@ -425,6 +425,10 @@ function describeFolder(f) {
 // supported — gets a one-line explanation instead of a stack trace.
 function formatScanReport(report) {
   const lines = [];
+  if (!report.added && (!report.errors || !report.errors.length)) {
+    lines.push('No changes — every audio file is already in the library.');
+    lines.push('');
+  }
   lines.push('Added: ' + report.added);
   lines.push('Skipped: ' + report.skipped);
   lines.push('Duration: ' + report.durationMs + ' ms');
@@ -869,11 +873,26 @@ function renderLibraries(status, libraries) {
         const report = await api('/api/admin/libraries/' + btn.dataset.scan + '/scan', { method: 'POST' });
         document.getElementById('scan-card').style.display = 'block';
         document.getElementById('scan-output').textContent = formatScanReport(report);
+        // Re-render FIRST, then attach the summary beside the fresh button —
+        // refresh() rebuilds this section and would wipe an earlier insert.
+        // Always shown, even for "no changes": the Last-scan card lives at
+        // the bottom of the page and clicking Scan gave no visible feedback.
+        await refresh();
+        const summary = (report.added > 0 ? 'Added ' + report.added + ' book(s)' : 'No changes')
+          + ' — ' + report.skipped + ' already in library'
+          + (report.errors && report.errors.length ? ', ' + report.errors.length + ' error(s) — see "Last scan" at the bottom' : '')
+          + ' · ' + (report.durationMs / 1000).toFixed(1) + 's';
+        const fresh = document.querySelector('[data-scan="' + btn.dataset.scan + '"]');
+        if (fresh) {
+          const note = document.createElement('span');
+          note.className = 'muted';
+          note.style.marginLeft = '0.6em';
+          note.textContent = summary;
+          fresh.insertAdjacentElement('afterend', note);
+        }
       } catch (e) {
         showError('Scan failed: ' + e.message);
-      } finally {
         btn.disabled = false; btn.textContent = 'Scan now';
-        refresh();
       }
     });
   });
