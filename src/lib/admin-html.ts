@@ -1842,11 +1842,22 @@ function fileNameFromUrl(url) {
 async function fetchUrlToPcloud(folderId, url, relPath, listEl) {
   const row = appendUploadRow(listEl, relPath, 'Queueing…');
   try {
-    const started = await api('/api/admin/storage/folder/' + folderId + '/fetch-url/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, relPath }),
-    });
+    // /start can block for a while (pCloud's stat of the target hangs 10-60s
+    // while pCloud is busy writing) — tick elapsed time so it doesn't look
+    // frozen. Seen: >1 min of silent "Queueing", 2026-08-24. Same in Pholia.
+    const t0q = Date.now();
+    const qTimer = setInterval(() => row.setStatus(
+      'Queueing on pCloud… ' + Math.round((Date.now() - t0q) / 1000) + 's (checking for an existing copy — pCloud can be slow here)'), 3000);
+    let started;
+    try {
+      started = await api('/api/admin/storage/folder/' + folderId + '/fetch-url/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, relPath }),
+      });
+    } finally {
+      clearInterval(qTimer);
+    }
     const t0 = Date.now();
     const maxWaitMs = 60 * 60 * 1000;
     let lastSize = 0;

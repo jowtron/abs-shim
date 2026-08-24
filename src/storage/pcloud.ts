@@ -425,7 +425,7 @@ async function pcloudGet<T extends PcloudApiResult>(
 // a 10s bound here broke grab progress polling ("pCloud stat network error:
 // pCloud header timeout", 2026-08-24). Only the streaming hot path passes a
 // tight bound (getfilelink in the adapter's call()).
-export async function pcloudFetchWithRetry(method: string, url: string, accessToken: string, attempts = 4, headerTimeoutMs = 60_000): Promise<Response> {
+export async function pcloudFetchWithRetry(method: string, url: string, accessToken: string, attempts = 4, headerTimeoutMs = 30_000): Promise<Response> {
   let lastErr: Error | null = null;
   for (let i = 0; i < attempts; i++) {
     if (i) await new Promise((r) => setTimeout(r, 500 * 2 ** (i - 1)));
@@ -438,6 +438,10 @@ export async function pcloudFetchWithRetry(method: string, url: string, accessTo
       res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` }, signal: ctrl.signal });
     } catch (e) {
       lastErr = new Error(`pCloud ${method} network error: ${(e as Error).message}`);
+      // Surfaced in Workers Logs / wrangler tail — a burst of these is the
+      // signature of pCloud's stat-during-write hangs (2026-08-24: >1 min of
+      // silent "Queueing" in the /admin+Pholia grab UIs was one of these).
+      console.warn(`pCloud ${method} attempt ${i + 1}/${attempts} failed: ${(e as Error).message}`);
       continue;
     } finally {
       clearTimeout(timer);
@@ -445,6 +449,7 @@ export async function pcloudFetchWithRetry(method: string, url: string, accessTo
     if (res.ok) return res;
     const body = await res.text().catch(() => '');
     lastErr = new Error(`pCloud ${method} HTTP ${res.status}: ${body.slice(0, 200)}`);
+    console.warn(`pCloud ${method} attempt ${i + 1}/${attempts} HTTP ${res.status}`);
     if (res.status < 500) break;
   }
   throw lastErr ?? new Error(`pCloud ${method} failed`);
