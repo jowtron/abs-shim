@@ -86,6 +86,11 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     #abb-results .abb-title { cursor: pointer; }
     #abb-results .abb-ext { color: var(--muted); font-size: 0.8rem; margin-left: 0.4rem; text-decoration: none; }
     .abb-details-row td { padding: 0 0.5rem 0.6rem 0.5rem; }
+    .abb-browse-row { margin-top: 0.4rem; }
+    .abb-browse-row select { flex: 1; min-width: 8rem; }
+    .abb-cached { color: var(--muted); font-size: 0.75rem; margin-left: 0.4rem; }
+    .abb-more { margin: 0.5rem 0; }
+    #abb-catalog-listings span { display: inline-block; margin: 0 0.5rem 0.15rem 0; white-space: nowrap; }
     .abb-details { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.75rem; font-size: 0.85rem; line-height: 1.45; }
     .abb-details .meta { color: var(--muted); margin-bottom: 0.4rem; }
     .abb-details p { margin: 0 0 0.5rem 0; }
@@ -172,6 +177,12 @@ export const ADMIN_HTML = String.raw`<!doctype html>
       <select id="abb-target"></select>
       <button id="abb-search">Search</button>
     </div>
+    <div class="upload-row abb-browse-row" id="abb-browse-row" style="display:none">
+      <select id="abb-cat" title="Category"><option value="">Latest (all categories)</option></select>
+      <select id="abb-lang" title="Language"><option value="">Any language</option></select>
+      <select id="abb-fmt" title="Format"><option value="">Any format</option></select>
+      <button class="secondary" id="abb-browse">Browse</button>
+    </div>
     <div id="abb-active" style="display:none; margin:0.5rem 0 0.75rem">
       <div style="font-weight:600; margin-bottom:0.25rem">In progress</div>
       <div id="abb-rd-progress" class="upload-list"></div>
@@ -182,6 +193,23 @@ export const ADMIN_HTML = String.raw`<!doctype html>
       <p class="muted" style="margin:0.4rem 0">Grabs run in this browser tab. If a tab was closed mid-grab the torrents are still here — <b>Finish</b> collects a completed one into the library, <b>Watch</b> resumes waiting for one that's still downloading, <b>Delete</b> removes it from Real-Debrid.</p>
       <div id="abb-rd-list" class="muted">Not loaded.</div>
       <button class="secondary" id="abb-rd-refresh" style="margin-top:0.4rem">Refresh</button>
+    </details>
+    <details id="abb-catalog" style="margin-top:0.5rem">
+      <summary>Catalogue <span id="abb-catalog-count" class="muted"></span></summary>
+      <p class="muted" style="margin:0.4rem 0">A local copy of AudioBookBay's listings, built up by a cron tick every 5 minutes (~50 page fetches each). Search answers from it first and adds live results; a cached release goes straight to Real-Debrid without touching AudioBookBay. Each listing on ABB stops at 500 pages, so the backfill reaches roughly a year back in busy categories and everything from now on.</p>
+      <div id="abb-catalog-status" class="muted">Not loaded.</div>
+      <div id="abb-catalog-listings" class="muted" style="font-size:0.8rem; margin-top:0.4rem"></div>
+      <div class="upload-row" style="margin-top:0.5rem; flex-wrap:wrap">
+        <button class="secondary" id="abb-catalog-refresh">Refresh</button>
+        <button class="secondary" data-catalog="run">Run a tick now</button>
+        <button class="secondary" data-catalog="pause">Pause</button>
+        <button class="secondary" data-catalog="resume" style="display:none">Resume</button>
+        <button class="secondary" data-catalog="retry-errors">Retry errors</button>
+        <button class="secondary" data-catalog="restart-backfill" data-confirm="Re-walk every listing from page 1? Cached posts are kept and refreshed.">Restart backfill</button>
+        <button class="secondary" data-catalog="clear-backoff" style="display:none">Clear backoff</button>
+        <button class="secondary" data-catalog="send-report" title="Sends the check-in push now, as a test">Send report now</button>
+        <label class="muted" style="font-size:0.85rem; white-space:nowrap">Fetches per tick <input type="number" id="abb-budget" min="1" max="30" style="width:4.5rem"></label>
+      </div>
     </details>
   </div>
 
@@ -1135,6 +1163,14 @@ function renderAbb(status, libraries) {
   document.getElementById('abb-save').addEventListener('click', abbSaveSettings);
   document.getElementById('abb-test').addEventListener('click', abbTestSettings);
   document.getElementById('abb-search').addEventListener('click', abbDoSearch);
+  document.getElementById('abb-browse').addEventListener('click', () => abbBrowse(1));
+  document.getElementById('abb-cat').addEventListener('change', () => abbBrowse(1));
+  abbLoadFacets();
+  document.getElementById('abb-catalog-refresh').addEventListener('click', abbLoadCatalog);
+  document.getElementById('abb-catalog').addEventListener('toggle', (ev) => { if (ev.target.open) abbLoadCatalog(); });
+  for (const b of document.querySelectorAll('#abb-catalog [data-catalog]')) b.addEventListener('click', () => abbCatalogAction(b.dataset.catalog, b));
+  document.getElementById('abb-budget').addEventListener('change', (ev) => abbCatalogAction('set-budget', ev.target, Number(ev.target.value)));
+  abbLoadCatalog();
   const q = document.getElementById('abb-q');
   const clear = document.getElementById('abb-clear');
   const syncClear = () => q.parentElement.classList.toggle('has-value', q.value.length > 0);
@@ -1237,9 +1273,32 @@ async function abbDoSearch() {
       return;
     }
     out.innerHTML = '';
+    if (r.liveError) {
+      const p = document.createElement('p');
+      p.className = 'muted';
+      p.textContent = 'AudioBookBay didn\'t answer (' + r.liveError + ') — showing the catalogue only.';
+      out.appendChild(p);
+    }
+    abbRenderResults(r.results, out);
+  } catch (e) {
+    out.textContent = 'Search failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Shared by search and browse. Appends to an existing table in "out" when
+// there is one (browse's "Load more"), otherwise starts a new one.
+function abbRenderResults(results, out) {
+  let tb = out.querySelector('table > tbody');
+  if (!tb) {
     const table = document.createElement('table');
-    const tb = document.createElement('tbody');
-    for (const res of r.results) {
+    tb = document.createElement('tbody');
+    table.appendChild(tb);
+    out.appendChild(table);
+  }
+  {
+    for (const res of results) {
       const tr = document.createElement('tr');
       const fmt = res.magnet ? 'Magnet link' : [res.format ? res.format.toUpperCase() : null, res.bitrate, res.sizeBytes ? formatBytes(res.sizeBytes) : null, res.language, res.posted ? 'Posted ' + res.posted : null].filter(Boolean).join(' · ');
       tr.innerHTML = '<td style="width:44px"></td><td></td><td style="width:1%; white-space:nowrap"></td>';
@@ -1252,6 +1311,13 @@ async function abbDoSearch() {
       }
       tr.children[1].innerHTML = '<span class="abb-title" role="button" title="Show description"></span><a class="abb-ext" target="_blank" rel="noopener" title="Open on AudioBookBay">↗</a><div class="abb-sub"></div>';
       tr.children[1].querySelector('.abb-title').textContent = res.title;
+      if (res.infoHash) {
+        const c = document.createElement('span');
+        c.className = 'abb-cached';
+        c.title = 'Magnet is cached — Real-Debrid gets it without a trip to AudioBookBay';
+        c.textContent = '⚡ cached';
+        tr.children[1].querySelector('.abb-ext').after(c);
+      }
       if (res.url) tr.children[1].querySelector('.abb-ext').href = res.url; else tr.children[1].querySelector('.abb-ext').remove();
       tr.children[1].querySelector('.abb-sub').textContent = fmt;
       // Tap the title → blurb + written by / read by, fetched once.
@@ -1281,10 +1347,135 @@ async function abbDoSearch() {
       tb.appendChild(drow);
       tb.appendChild(prow);
     }
-    table.appendChild(tb);
-    out.appendChild(table);
+  }
+}
+
+// ─── Catalogue: browse by category + crawler status ─────────────────────────
+
+let abbBrowsePage = 1;
+
+async function abbLoadFacets() {
+  try {
+    const f = await api('/api/admin/abb/catalog/categories');
+    const row = document.getElementById('abb-browse-row');
+    if (!f.total) { row.style.display = 'none'; return; }
+    row.style.display = '';
+    const fill = (id, items, label) => {
+      const sel = document.getElementById(id);
+      const prev = sel.value;
+      while (sel.options.length > 1) sel.remove(1);
+      for (const it of items) {
+        const o = document.createElement('option');
+        o.value = it.name;
+        o.textContent = label(it.name) + ' (' + it.count.toLocaleString() + ')';
+        sel.appendChild(o);
+      }
+      sel.value = prev;
+    };
+    fill('abb-cat', f.categories, (n) => n);
+    fill('abb-lang', f.languages, (n) => n);
+    fill('abb-fmt', f.formats, (n) => n.toUpperCase());
+    document.getElementById('abb-cat').options[0].textContent = 'Latest (all categories, ' + f.total.toLocaleString() + ')';
   } catch (e) {
-    out.textContent = 'Search failed: ' + e.message;
+    console.warn('catalog facets', e);
+  }
+}
+
+async function abbBrowse(page) {
+  const out = document.getElementById('abb-results');
+  const btn = document.getElementById('abb-browse');
+  const qs = new URLSearchParams({ page: String(page), limit: '30' });
+  const cat = document.getElementById('abb-cat').value;
+  const lang = document.getElementById('abb-lang').value;
+  const fmt = document.getElementById('abb-fmt').value;
+  if (cat) qs.set('cat', cat);
+  if (lang) qs.set('language', lang);
+  if (fmt) qs.set('format', fmt);
+  if (page === 1) out.textContent = 'Loading…';
+  const more = out.querySelector('.abb-more');
+  if (more) more.remove();
+  btn.disabled = true;
+  try {
+    const r = await api('/api/admin/abb/catalog/browse?' + qs.toString());
+    if (page === 1) {
+      out.innerHTML = '';
+      if (!r.results.length) { out.innerHTML = '<p class="muted">Nothing in the catalogue for that yet — the crawler adds more every few minutes.</p>'; return; }
+    }
+    abbRenderResults(r.results, out);
+    abbBrowsePage = page;
+    if (r.hasMore) {
+      const b = document.createElement('button');
+      b.className = 'secondary abb-more';
+      b.textContent = 'Load more';
+      b.addEventListener('click', () => abbBrowse(abbBrowsePage + 1));
+      out.appendChild(b);
+    }
+  } catch (e) {
+    out.textContent = 'Browse failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function abbAgo(ts) {
+  if (!ts) return 'never';
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 90) return s + 's ago';
+  if (s < 5400) return Math.round(s / 60) + 'm ago';
+  if (s < 172800) return Math.round(s / 3600) + 'h ago';
+  return Math.round(s / 86400) + 'd ago';
+}
+
+async function abbLoadCatalog() {
+  const box = document.getElementById('abb-catalog-status');
+  const lst = document.getElementById('abb-catalog-listings');
+  const count = document.getElementById('abb-catalog-count');
+  try {
+    const st = await api('/api/admin/abb/catalog/status');
+    const c = st.counts, s = st.stats;
+    count.textContent = c.total ? '(' + c.total.toLocaleString() + ' posts)' : '';
+    const done = st.listings.filter((l) => l.done).length;
+    const running = s.tickStartedAt && (!s.lastTick || s.tickStartedAt > s.lastTick);
+    const lines = [
+      c.total.toLocaleString() + ' posts cached · ' + c.withHash.toLocaleString() + ' with a magnet · ' + c.pending.toLocaleString() + ' awaiting details' + (c.errors ? ' · ' + c.errors + ' detail errors' : ''),
+      'Listings: ' + done + '/' + st.listings.length + ' backfilled · ' + s.pagesFetched.toLocaleString() + ' pages fetched over ' + s.ticks + ' ticks',
+      (s.paused ? 'PAUSED · ' : '') + (running ? 'Tick running (started ' + abbAgo(s.tickStartedAt) + ')' : 'Last tick ' + abbAgo(s.lastTick) + (s.lastTickMs ? ' (' + Math.round(s.lastTickMs / 1000) + 's)' : '')) + ' · ' + (s.budget || 6) + ' fetches per 2-minute tick',
+      s.backoffUntil && s.backoffUntil > Date.now() ? '⚠ BACKING OFF until ' + new Date(s.backoffUntil).toLocaleString() + ' — AudioBookBay stopped answering (episode ' + s.backoffLevel + '). Live search may be affected while the egress IP is blocked.' : null,
+      'Check-in push ' + (s.reportSentAt ? 'sent ' + abbAgo(s.reportSentAt) : 'due ' + new Date(st.reportDueAt).toLocaleDateString()),
+    ];
+    if (s.blockedTicks) lines.push('Backoff episodes so far: ' + s.blockedTicks);
+    if (s.zeroParsePages) lines.push('⚠ ' + s.zeroParsePages + ' listing page(s) parsed to 0 posts — AudioBookBay\'s markup may have changed.');
+    if (s.lastError) lines.push('Last error (' + abbAgo(s.lastErrorAt) + '): ' + s.lastError);
+    box.innerHTML = '';
+    for (const t of lines) { if (!t) continue; const d = document.createElement('div'); d.textContent = t; box.appendChild(d); }
+    const budget = document.getElementById('abb-budget');
+    if (document.activeElement !== budget) budget.value = s.budget || 6;
+    document.querySelector('#abb-catalog [data-catalog="clear-backoff"]').style.display = s.backoffUntil && s.backoffUntil > Date.now() ? '' : 'none';
+    lst.innerHTML = '';
+    for (const l of st.listings) {
+      const sp = document.createElement('span');
+      sp.textContent = (l.done ? '✓ ' : l.page ? '… ' : '· ') + l.name + (l.page ? ' p' + l.page : '') + (l.error ? ' ⚠' : '');
+      if (l.error) sp.title = l.error;
+      lst.appendChild(sp);
+    }
+    document.querySelector('#abb-catalog [data-catalog="pause"]').style.display = s.paused ? 'none' : '';
+    document.querySelector('#abb-catalog [data-catalog="resume"]').style.display = s.paused ? '' : 'none';
+  } catch (e) {
+    box.textContent = 'Couldn\'t load: ' + e.message;
+  }
+}
+
+async function abbCatalogAction(action, btn, value) {
+  if (btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
+  btn.disabled = true;
+  try {
+    if (action === 'run') await api('/api/admin/abb/catalog/run', { method: 'POST' });
+    else await api('/api/admin/abb/catalog/control', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(value != null ? { action, value } : { action }) });
+    if (action === 'run') setTimeout(abbLoadCatalog, 3000);
+    await abbLoadCatalog();
+    if (action === 'run') abbLoadFacets();
+  } catch (e) {
+    alert('Failed: ' + e.message);
   } finally {
     btn.disabled = false;
   }

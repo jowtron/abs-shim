@@ -16,6 +16,7 @@ import { itemRoutes } from './routes/items';
 import { authorRoutes } from './routes/authors';
 import { adminRoutes } from './routes/admin';
 import { abbRoutes } from './routes/abb';
+import { runCatalogTick } from './lib/abb-catalog';
 import { signupRoutes } from './routes/signup';
 import { renderSignupHtml } from './lib/signup-html';
 import { listProgressByUser, getProgress, upsertProgress, progressToAbs } from './db/progress';
@@ -723,5 +724,16 @@ export default {
     }
     if (mutated) req = new Request(u.toString(), req);
     return app.fetch(req, env, ctx);
+  },
+
+  // Cron (wrangler.toml [triggers]): one AudioBookBay catalogue tick. The
+  // tick is ~50 sequential page fetches, i.e. a minute or two of wall
+  // time, which is why it lives on the cron and not behind a request.
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      runCatalogTick(env)
+        .then((r) => { if (r.ran) console.log('[abb-catalog] ' + r.log.join(' | ')); })
+        .catch((e: Error) => console.error('[abb-catalog] tick failed: ' + e.message)),
+    );
   },
 };

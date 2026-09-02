@@ -7,7 +7,7 @@
 // []), so the admin UI says "0 results — ABB markup may have changed" rather
 // than "no such book".
 
-const ABB_BASE = 'https://audiobookbay.lu';
+export const ABB_BASE = 'https://audiobookbay.lu';
 // ABB blocks non-browser user agents.
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
@@ -22,6 +22,14 @@ export type AbbResult = {
   bitrate: string | null;
   sizeBytes: number | null;
   posted: string | null;    // "24 Dec 2025" — ABB's upload date, verbatim
+  categories: string[];     // "Category:" labels as ABB prints them (Fantasy, Sci-Fi, …)
+  keywords: string[];
+  // Filled from the catalogue (src/lib/abb-catalog.ts) when the post is
+  // cached; live-only results leave them out.
+  infoHash?: string | null;
+  author?: string | null;
+  narrators?: string[];
+  cached?: boolean;
 };
 
 export type AbbCookie = { cookie: string; expiresAt: number };
@@ -59,11 +67,19 @@ function collectCookies(resp: Response): string {
 }
 
 async function abbFetch(path: string, cookie: string | null): Promise<string> {
+  const { status, html } = await abbFetchRaw(path, cookie);
+  if (status < 200 || status >= 300) throw new Error(`AudioBookBay HTTP ${status}`);
+  return html;
+}
+
+// Status + body, for the crawler, which treats 404 as "end of listing"
+// rather than an error. 20s bound: ABB normally answers in ~2s and a cron
+// tick has a fixed fetch budget, so a hung request must not eat it.
+export async function abbFetchRaw(path: string, cookie: string | null): Promise<{ status: number; html: string }> {
   const headers: Record<string, string> = { 'User-Agent': UA };
   if (cookie) headers['Cookie'] = cookie;
-  const resp = await fetch(ABB_BASE + path, { headers, redirect: 'follow' });
-  if (!resp.ok) throw new Error(`AudioBookBay HTTP ${resp.status}`);
-  return resp.text();
+  const resp = await fetch(ABB_BASE + path, { headers, redirect: 'follow', signal: AbortSignal.timeout(20_000) });
+  return { status: resp.status, html: await resp.text() };
 }
 
 // Search works without a login; the cookie only unlocks member-only detail
@@ -85,7 +101,7 @@ export async function abbSearch(query: string, pages: number, cookie: string | n
   return results;
 }
 
-function parseResults(html: string): AbbResult[] {
+export function parseResults(html: string): AbbResult[] {
   const out: AbbResult[] = [];
   const postRe = /<div class="post">([\s\S]*?)(?=<div class="post">|$)/g;
   let m: RegExpExecArray | null;
@@ -106,12 +122,23 @@ function parseResults(html: string): AbbResult[] {
     const info = fmt ? fmt[1]!.trim() : '';
     // "Posted: 24 Dec 2025" sits right before "Format:" in the same <p>.
     const posted = /Posted:\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})/.exec(infoText)?.[1] ?? null;
+    // "Category: Adults&nbsp; General Fiction&nbsp; <br />" — labels can
+    // contain spaces, so split on the raw &nbsp; separators, not whitespace.
+    // Keywords use "&nbsp" without the semicolon.
+    const nbspList = (re: RegExp) => {
+      const raw = re.exec(block)?.[1] ?? '';
+      return raw.split(/&nbsp;?/).map((x) => decodeEntities(x.replace(/<[^>]+>/g, '')).trim()).filter(Boolean);
+    };
+    const categories = nbspList(/Category:([\s\S]*?)<br/);
+    const keywords = nbspList(/Keywords:([\s\S]*?)<\/span>/);
     out.push({
       title, url, cover,
       category: cat ? cat[1]!.trim() : '',
       language: cat ? cat[2]! : '',
       info,
       posted,
+      categories,
+      keywords,
       ...parseInfo(info),
     });
   }
@@ -141,6 +168,10 @@ export async function abbMagnet(pageUrl: string, cookie: string | null): Promise
   const u = new URL(pageUrl);
   if (u.origin !== ABB_BASE) throw new Error('Not an AudioBookBay URL');
   const html = await abbFetch(u.pathname + u.search, cookie);
+  return parseMagnet(pageUrl, html);
+}
+
+export function parseMagnet(pageUrl: string, html: string): AbbMagnet {
   const title = htmlTitle(html);
   const m = /href="(magnet:\?[^"]+)"/i.exec(html);
   if (m) {
@@ -151,11 +182,16 @@ export async function abbMagnet(pageUrl: string, cookie: string | null): Promise
   const cell = /Info Hash:<\/td>\s*<td>([0-9a-fA-F]{40})<\/td>/.exec(html);
   const hash = cell?.[1] ?? /\b([0-9a-fA-F]{40})\b/.exec(html)?.[1] ?? '';
   if (!hash) throw new Error('No info hash found on the AudioBookBay page');
+  return { url: pageUrl, title, infoHash: hash.toLowerCase(), magnet: magnetFromHash(hash, title) };
+}
+
+// Public-tracker magnet from a bare info hash — what non-members get from
+// the detail page, and what the catalogue serves for a cached post.
+export function magnetFromHash(hash: string, title: string): string {
   const dn = title.replace(/[^\w]+/g, '+').slice(0, 80);
-  const magnet = `magnet:?xt=urn:btih:${hash}&dn=${dn}`
+  return `magnet:?xt=urn:btih:${hash}&dn=${dn}`
     + '&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A80'
     + '&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce';
-  return { url: pageUrl, title, infoHash: hash.toLowerCase(), magnet };
 }
 
 export type AbbDetails = {
@@ -217,7 +253,7 @@ function htmlTitle(html: string): string {
   return t ? decodeEntities(t[1]!.replace(/<[^>]+>/g, '').trim()) : 'audiobook';
 }
 
-function decodeEntities(s: string): string {
+export function decodeEntities(s: string): string {
   return s
     .replace(/&#(\d+);/g, (_, n: string) => String.fromCodePoint(Number(n)))
     .replace(/&amp;/g, '&')

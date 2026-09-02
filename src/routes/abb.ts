@@ -2,7 +2,11 @@ import { Hono } from 'hono';
 import type { Env } from '../types';
 import { requireAuth, type AuthVars } from '../auth/middleware';
 import { getTenantSetting, setTenantSetting, deleteTenantSetting } from '../db/settings';
-import { abbLogin, abbSearch, abbMagnet, abbDetails, type AbbCookie } from '../lib/abb';
+import { abbLogin, abbSearch, abbMagnet, abbDetails, magnetFromHash, type AbbCookie, type AbbResult } from '../lib/abb';
+import {
+  catalogSearch, catalogBrowse, catalogFacets, catalogGet, rowToDetails, catalogRecordHash, catalogRecordDetails,
+  upsertPosts, runCatalogTick, catalogStatus, catalogControl, sendReportNow, type CatalogAction,
+} from '../lib/abb-catalog';
 import { sealSecret, openSecret, secretsConfigured } from '../lib/secret-box';
 import {
   rdUser, rdInfo, rdAddMagnet, rdSelectFiles, rdDelete, rdUnrestrict, rdWaitForFiles,
@@ -143,20 +147,93 @@ abbRoutes.post('/settings/test', async (c) => {
 
 // ─── Search / resolve ───────────────────────────────────────────────────────
 
+// Catalogue + live, merged: cached hits first (ranked by FTS), then live
+// results the catalogue doesn't have yet. A live failure is tolerated when
+// the cache answered — that's the whole point of having one. Live-only
+// extras are folded into the catalogue in the background, so a search for
+// an old title teaches the cache about it.
+//   ?mode=cache  → catalogue only (instant, offline-safe)
+//   ?mode=live   → ABB only (the pre-catalogue behaviour)
 abbRoutes.get('/search', async (c) => {
   const q = (c.req.query('q') ?? '').trim();
   const pages = Number(c.req.query('pages') ?? '1') || 1;
+  const mode = c.req.query('mode') ?? 'both';
   if (!q) return c.json({ error: 'q required' }, 400);
   let cookie: string | null = null;
-  try {
-    cookie = await abbCookie(c.env, c.get('tenantId'));
-  } catch { /* anonymous search still works */ }
-  try {
-    const results = await abbSearch(q, pages, cookie);
-    return c.json({ query: q, count: results.length, results });
-  } catch (e) {
-    return c.json({ error: (e as Error).message }, 502);
+  if (mode !== 'cache') {
+    try {
+      cookie = await abbCookie(c.env, c.get('tenantId'));
+    } catch { /* anonymous search still works */ }
   }
+  const cachedP: Promise<AbbResult[]> = mode === 'live' ? Promise.resolve([]) : catalogSearch(c.env, q, 60).catch(() => []);
+  const liveP: Promise<AbbResult[] | Error> = mode === 'cache'
+    ? Promise.resolve([])
+    : abbSearch(q, pages, cookie).catch((e: Error) => e);
+  const [cached, live] = await Promise.all([cachedP, liveP]);
+  if (live instanceof Error && !cached.length && mode !== 'cache') {
+    return c.json({ error: live.message }, 502);
+  }
+  const seen = new Set(cached.map((r) => r.url));
+  const extras: AbbResult[] = [];
+  if (!(live instanceof Error)) {
+    for (const r of live) {
+      if (seen.has(r.url)) continue;
+      seen.add(r.url);
+      extras.push({ ...r, cached: false });
+    }
+    if (extras.length) c.executionCtx.waitUntil(upsertPosts(c.env, extras).catch(() => undefined));
+  }
+  const results = [...cached, ...extras];
+  return c.json({
+    query: q, count: results.length, results,
+    source: mode === 'cache' ? 'cache' : live instanceof Error ? 'cache' : mode === 'live' ? 'live' : 'both',
+    ...(live instanceof Error ? { liveError: live.message } : {}),
+  });
+});
+
+// ─── Catalogue (see src/lib/abb-catalog.ts) ─────────────────────────────────
+
+abbRoutes.get('/catalog/status', async (c) => c.json(await catalogStatus(c.env)));
+
+abbRoutes.get('/catalog/categories', async (c) => c.json(await catalogFacets(c.env)));
+
+// ?cat=Fantasy&language=English&format=m4b&page=1&limit=30 — newest first.
+// No cat = everything, i.e. ABB's home listing.
+abbRoutes.get('/catalog/browse', async (c) => {
+  const limit = Math.min(Number(c.req.query('limit') ?? '30') || 30, 100);
+  const page = Math.max(Number(c.req.query('page') ?? '1') || 1, 1);
+  const o: Parameters<typeof catalogBrowse>[1] = { limit, offset: (page - 1) * limit };
+  const cat = (c.req.query('cat') ?? '').trim();
+  const language = (c.req.query('language') ?? '').trim();
+  const format = (c.req.query('format') ?? '').trim();
+  if (cat) o.cat = cat;
+  if (language) o.language = language;
+  if (format) o.format = format;
+  const results = await catalogBrowse(c.env, o);
+  return c.json({ page, limit, count: results.length, hasMore: results.length === limit, results });
+});
+
+// Manual tick (the cron runs one every 5 minutes). Runs after the response;
+// poll /catalog/status to watch it.
+abbRoutes.post('/catalog/run', async (c) => {
+  c.executionCtx.waitUntil(runCatalogTick(c.env, { force: true }).catch(() => undefined));
+  return c.json({ ok: true });
+});
+
+// Body: { action: 'pause' | 'resume' | 'retry-errors' | 'restart-backfill' | 'reset-report' | 'send-report'
+//                 | 'set-budget' (+ value) | 'clear-backoff' }
+abbRoutes.post('/catalog/control', async (c) => {
+  if (c.get('tenantRole') !== 'owner') return c.json({ error: 'Only the tenant owner can control the crawler' }, 403);
+  const body = await c.req.json().catch(() => ({})) as { action?: string; value?: number };
+  const action = body.action ?? '';
+  if (action === 'send-report') {
+    await sendReportNow(c.env);
+    return c.json({ ok: true });
+  }
+  const allowed: CatalogAction[] = ['pause', 'resume', 'retry-errors', 'restart-backfill', 'reset-report', 'set-budget', 'clear-backoff'];
+  if (!allowed.includes(action as CatalogAction)) return c.json({ error: 'unknown action' }, 400);
+  await catalogControl(c.env, action as CatalogAction, typeof body.value === 'number' ? body.value : undefined);
+  return c.json({ ok: true });
 });
 
 // ?url= → blurb + "Written by / Read by / Format / Bit Rate / Length" from
@@ -169,9 +246,14 @@ abbRoutes.get('/details', async (c) => {
   try {
     cookie = await abbCookie(c.env, c.get('tenantId'));
   } catch { /* anonymous is fine */ }
+  const row = await catalogGet(c.env, url).catch(() => null);
+  if (row && row.detail_fetched_at && !row.detail_error) return c.json({ ...rowToDetails(row), cached: true });
   try {
-    return c.json(await abbDetails(url, cookie));
+    const d = await abbDetails(url, cookie);
+    c.executionCtx.waitUntil(catalogRecordDetails(c.env, d, null).catch(() => undefined));
+    return c.json(d);
   } catch (e) {
+    if (row && row.detail_fetched_at) return c.json({ ...rowToDetails(row), cached: true, liveError: (e as Error).message });
     return c.json({ error: (e as Error).message }, 502);
   }
 });
@@ -193,6 +275,11 @@ abbRoutes.post('/resolve', async (c) => {
     return c.json({ url: null, title, infoHash: hash.toLowerCase(), magnet, folderName: folderNameFromTitle(title) });
   }
   if (!url) return c.json({ error: 'url or magnet required' }, 400);
+  // Cached hash → no ABB round trip at all (and it works while ABB is down).
+  const row = await catalogGet(c.env, url).catch(() => null);
+  if (row?.info_hash) {
+    return c.json({ url, title: row.title, infoHash: row.info_hash, magnet: magnetFromHash(row.info_hash, row.title), folderName: folderNameFromTitle(row.title), cached: true });
+  }
   let cookie: string | null = null;
   try {
     cookie = await abbCookie(c.env, c.get('tenantId'));
@@ -201,6 +288,7 @@ abbRoutes.post('/resolve', async (c) => {
   }
   try {
     const m = await abbMagnet(url, cookie);
+    if (m.infoHash) c.executionCtx.waitUntil(catalogRecordHash(c.env, url, m.title, m.infoHash).catch(() => undefined));
     return c.json({ ...m, folderName: folderNameFromTitle(m.title) });
   } catch (e) {
     return c.json({ error: (e as Error).message }, 502);

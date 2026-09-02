@@ -16,6 +16,12 @@ ip = "0.0.0.0"
 [observability]
 enabled = true
 
+# AudioBookBay catalogue crawler (src/lib/abb-catalog.ts) — one tick every
+# 2 minutes, a handful of paced page fetches each. ABB firewalls IPs that
+# fetch in bursts, so keep this gentle (the per-tick budget is set in /admin).
+[triggers]
+crons = ["*/2 * * * *"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "abs-shim-db"
