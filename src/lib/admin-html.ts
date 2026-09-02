@@ -1615,11 +1615,14 @@ function audibleRender(status, libraries) {
   audibleLoadAccounts();
 }
 
-async function audibleLoadAccounts() {
+async function audibleLoadAccounts(live) {
   const card = document.getElementById('audible-card');
   const box = document.getElementById('audible-accounts');
   try {
-    const r = await api('/api/admin/audible/accounts');
+    const r = await api('/api/admin/audible/accounts' + (live ? '?live=1' : ''));
+    // Snapshot painted → fetch the live view once in the background and
+    // redraw if it differs (a just-linked account, new sync counts).
+    if (r.cached && !live) setTimeout(() => audibleLoadAccounts(true), 300);
     card.style.display = '';
     box.innerHTML = '';
     if (!r.accounts.length) {
@@ -1654,8 +1657,8 @@ async function audibleLoadAccounts() {
     }
     if (prevAcct) sel.value = prevAcct;
     document.getElementById('audible-library-wrap').style.display = '';
-    audibleLoadLibrary(false);
-    audibleLoadJobs();
+    if (!live || !audibleItems.length) audibleLoadLibrary(false);
+    if (!live) audibleLoadJobs();
   } catch (e) {
     // 403 (not owner) / 503 (no wharf) → keep the card hidden; anything else, show why.
     if (/HTTP (403|503)/.test(e.message)) { card.style.display = 'none'; return; }
@@ -1710,16 +1713,21 @@ async function audibleFinish() {
   }
 }
 
-async function audibleLoadLibrary(refresh) {
+async function audibleLoadLibrary(refresh, live) {
   const account = document.getElementById('audible-lib-account').value;
   const st = document.getElementById('audible-lib-status');
   const out = document.getElementById('audible-library');
   if (!account) return;
-  st.textContent = refresh ? 'Fetching from Audible (can take a minute for a big library)…' : 'Loading…';
+  if (refresh) st.textContent = 'Fetching from Audible (can take a minute for a big library)…';
+  else if (!live) st.textContent = 'Loading…';
   try {
-    const r = await api('/api/admin/audible/library?account=' + encodeURIComponent(account) + (refresh ? '&refresh=1' : ''));
+    const r = await api('/api/admin/audible/library?account=' + encodeURIComponent(account) + (refresh ? '&refresh=1' : live ? '&live=1' : ''));
+    if (document.getElementById('audible-lib-account').value !== account) return; // switched accounts meanwhile
+    const before = JSON.stringify(audibleItems);
+    if (live && JSON.stringify(r.items || []) === before) return; // background refresh: nothing changed
+    if (r.cached && !live) setTimeout(() => audibleLoadLibrary(false, true), 300);
     audibleItems = r.items || [];
-    audibleSelected = new Set();
+    if (!live) audibleSelected = new Set();
     const synced = audibleItems.filter((i) => i.synced).length;
     const nodl = audibleItems.filter((i) => !i.synced && (i.downloadable === false || i.content_type === 'Podcast')).length;
     st.textContent = audibleItems.length + ' titles, ' + synced + ' backed up' + (nodl ? ', ' + nodl + ' not downloadable' : '') + (r.fetched_at ? ' · library as of ' + new Date(r.fetched_at).toLocaleString() : '');
@@ -1743,7 +1751,12 @@ function audibleDrawLibrary() {
     const cb = tr.querySelector('input');
     cb.checked = audibleSelected.has(it.asin);
     cb.addEventListener('change', () => { if (cb.checked) audibleSelected.add(it.asin); else audibleSelected.delete(it.asin); document.getElementById('audible-sync-selected').textContent = 'Sync selected' + (audibleSelected.size ? ' (' + audibleSelected.size + ')' : ''); });
-    if (it.cover) { const img = document.createElement('img'); img.className = 'aud-cover'; img.loading = 'lazy'; img.alt = ''; img.src = it.cover; tr.children[1].appendChild(img); }
+    if (it.cover) {
+      const img = document.createElement('img'); img.className = 'aud-cover abb-cover'; img.loading = 'lazy'; img.alt = ''; img.src = it.cover;
+      // Amazon image URLs carry the size in the name (…_SL500_.jpg); ask for the big one in the lightbox.
+      img.addEventListener('click', () => abbLightbox(it.cover.replace(/_SL\d+_/, '_SL1215_'), it.cover));
+      tr.children[1].appendChild(img);
+    }
     tr.querySelector('.aud-title').textContent = it.title + (it.subtitle ? ': ' + it.subtitle : '');
     const hrs = it.runtime_min ? Math.round(it.runtime_min / 6) / 10 + ' h' : null;
     tr.querySelector('.aud-sub').textContent = [(it.authors || []).join(', '), (it.narrators || []).length ? 'read by ' + it.narrators.join(', ') : null, it.series ? it.series + (it.series_sequence ? ' #' + it.series_sequence : '') : null, hrs, it.purchase_date ? 'bought ' + it.purchase_date.slice(0, 10) : null].filter(Boolean).join(' · ');

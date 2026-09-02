@@ -43,9 +43,32 @@ async function jobRecords(env: Env, tenantId: string): Promise<SyncJobRecord[]> 
 
 const err = (e: unknown) => (e as Error).message;
 
+// Every wharf call is a job round trip (a second or three), so the UI
+// paints from a per-tenant snapshot in tenant_settings first and refreshes
+// live in the background: GET without ?live=1 returns the snapshot when
+// there is one (and refreshes it after the response); ?live=1 waits for
+// wharf and stores the result.
+async function snapshot<T>(c: { env: Env }, tenantId: string, key: string): Promise<T | null> {
+  try { const v = await getTenantSetting(c.env, tenantId, key); return v ? JSON.parse(v) as T : null; } catch { return null; }
+}
+
+async function cachedOrLive<T extends object>(c: { env: Env; executionCtx: ExecutionContext }, tenantId: string, key: string, live: boolean, fetchLive: () => Promise<T>): Promise<T & { cached?: boolean; cachedAt?: number }> {
+  if (!live) {
+    const snap = await snapshot<T & { cachedAt?: number }>(c, tenantId, key);
+    if (snap) {
+      c.executionCtx.waitUntil(fetchLive().then((v) => setTenantSetting(c.env, tenantId, key, JSON.stringify({ ...v, cachedAt: Date.now() }))).catch(() => undefined));
+      return { ...snap, cached: true };
+    }
+  }
+  const v = await fetchLive();
+  c.executionCtx.waitUntil(setTenantSetting(c.env, tenantId, key, JSON.stringify({ ...v, cachedAt: Date.now() })).catch(() => undefined));
+  return v;
+}
+
 audibleRoutes.get('/accounts', async (c) => {
   try {
-    return c.json(await runAndWait(c.env, PROJECT, 'accounts', {}, 30_000));
+    return c.json(await cachedOrLive(c, c.get('tenantId'), 'audible_accounts', c.req.query('live') === '1',
+      () => runAndWait<{ ok: boolean; accounts: unknown[]; pending: string[] }>(c.env, PROJECT, 'accounts', {}, 30_000)));
   } catch (e) {
     return c.json({ error: err(e) }, 502);
   }
@@ -90,7 +113,8 @@ audibleRoutes.get('/library', async (c) => {
   if (!ACCOUNT_RE.test(account)) return c.json({ error: 'account required' }, 400);
   const refresh = c.req.query('refresh') === '1';
   try {
-    return c.json(await runAndWait(c.env, PROJECT, 'library', { account, refresh }, refresh ? 240_000 : 30_000));
+    return c.json(await cachedOrLive(c, c.get('tenantId'), 'audible_library:' + account, refresh || c.req.query('live') === '1',
+      () => runAndWait<{ ok: boolean; account: string; fetched_at: number; items: unknown[] }>(c.env, PROJECT, 'library', { account, refresh }, refresh ? 240_000 : 30_000)));
   } catch (e) {
     return c.json({ error: err(e) }, 502);
   }
