@@ -28,6 +28,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 # wharf copies an approved handler to state/registered/<project>/<name>/,
@@ -128,6 +130,128 @@ def run_download(cmd, timeout):
     return p.returncode, "\n".join(tail)
 
 
+RCLONE_STATS_RE = re.compile(r"Transferred:\s*([\d.]+\s*[KMGT]?i?B?)\s*/\s*([\d.]+\s*[KMGT]?i?B?),\s*(\d+)%,\s*([\d.]+\s*[KMGT]?i?B/s),\s*ETA\s*(\S+)")
+
+
+def run_rclone(args, timeout, label):
+    """rclone with --stats on stderr, turned into a log line every ~15 s."""
+    cmd = ["rclone", *args, "--stats", "15s", "--stats-one-line", "--stats-log-level", "NOTICE", "--log-level", "NOTICE"]
+    p = subprocess.Popen(cmd, cwd=str(L.PROJECT), env=L.env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    tail, deadline = [], time.time() + timeout
+    for line in p.stdout:
+        line = line.rstrip()
+        m = RCLONE_STATS_RE.search(line)
+        if m:
+            L.log(f"  {label} {m.group(3):>3}% · {m.group(1).strip()} / {m.group(2).strip()} · {m.group(4)}, ETA {m.group(5)}")
+        elif line:
+            tail.append(line)
+            tail = tail[-20:]
+        if time.time() > deadline:
+            p.kill()
+            raise subprocess.TimeoutExpired(cmd, timeout)
+    p.wait()
+    return p.returncode, "\n".join(tail)
+
+
+def rclone_has_remote(name):
+    try:
+        return f"[{name}]" in Path(L.RCLONE_CONF).read_text().splitlines()
+    except OSError:
+        return False
+
+
+def pcloud_token():
+    """OAuth access token from the rclone pcloud remote (rclone stores the
+    token as a JSON blob on the `token = ` line)."""
+    for line in Path(L.RCLONE_CONF).read_text().splitlines():
+        if line.startswith("token = "):
+            return json.loads(line[len("token = "):]).get("access_token")
+    raise RuntimeError("no pcloud token in rclone.conf")
+
+
+PCLOUD_API = "https://api.pcloud.com"
+
+
+def pcloud_api(method, params, token, timeout=60):
+    q = urllib.parse.urlencode(params)
+    req = urllib.request.Request(f"{PCLOUD_API}/{method}?{q}", headers={"Authorization": f"Bearer {token}"})
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.load(r)
+        except Exception as e:  # noqa: BLE001 — pCloud's API sits behind Cloudflare and 5xx/drops now and then
+            if attempt == 3:
+                raise RuntimeError(f"pCloud {method}: {e}") from e
+            time.sleep(2 ** attempt)
+
+
+def pcloud_ensure_folder(token, abs_path):
+    """createfolderifnotexists only creates the leaf: walk the path. Returns folderid."""
+    folderid = 0
+    cur = ""
+    for seg in [p for p in abs_path.split("/") if p]:
+        cur += "/" + seg
+        d = pcloud_api("createfolderifnotexists", {"path": cur}, token)
+        if d.get("result") != 0:
+            raise RuntimeError(f"pCloud createfolderifnotexists {cur}: {d.get('result')} {d.get('error', '')}")
+        folderid = d["metadata"]["folderid"]
+    return folderid
+
+
+def pcloud_stat_size(token, abs_path):
+    d = pcloud_api("stat", {"path": abs_path}, token, timeout=90)
+    if d.get("result") == 2009 or d.get("result") == 2055:   # not found
+        return None
+    if d.get("result") != 0:
+        raise RuntimeError(f"pCloud stat {abs_path}: {d.get('result')} {d.get('error', '')}")
+    return d["metadata"].get("size")
+
+
+def upload_via_r2(account, asin, out, dest_root, folder, expected):
+    """Stage the m4b in R2 (fast from anywhere), then have pCloud pull it
+    from a signed URL — its servers fetch at datacentre speed, so the slow
+    box→pCloud leg (37 KB/s from stereo-au, 2026-09-03) never happens."""
+    key = f"abs-shim-audible-staging/{account}/{asin}/{out.name}"
+    L.log(f"[{asin}] staging in R2…")
+    rc, tail = run_rclone(["copyto", str(out), f"r2:{key}", "--s3-upload-concurrency", "4", "--s3-chunk-size", "16M", "--retries", "5"], 3 * 3600, "R2")
+    if rc != 0:
+        raise RuntimeError(f"R2 upload failed: {tail[-300:]}")
+    r = L.run(["rclone", "link", f"r2:{key}", "--expire", "12h"], timeout=60)
+    url = (r.stdout or "").strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else ""
+    if not url.startswith("http"):
+        raise RuntimeError(f"could not presign the R2 object: {(r.stderr or '').strip()[-200:]}")
+    token = pcloud_token()
+    abs_dir = f"/{dest_root.strip('/')}/{folder}"
+    abs_path = f"{abs_dir}/{out.name}"
+    folderid = pcloud_ensure_folder(token, abs_dir)
+    have = pcloud_stat_size(token, abs_path)
+    if have == expected:
+        L.log(f"[{asin}] already on pCloud with the same size")
+    else:
+        L.log(f"[{asin}] asking pCloud to pull {expected / 1024 / 1024:.0f} MB…")
+        # `target` is double-encoded on pCloud's side (verified in the shim's fetch-url flow).
+        d = pcloud_api("downloadfileasync", {"url": url, "folderid": folderid, "target": urllib.parse.quote(out.name)}, token)
+        if d.get("result") != 0:
+            raise RuntimeError(f"pCloud downloadfileasync: {d.get('result')} {d.get('error', '')}")
+        # No progress API for async pulls (uploadprogress never reports them):
+        # stat the target until its size matches. stat can block for a while
+        # mid-write, hence the generous per-call timeout above.
+        t0, last, last_log = time.time(), -1, 0.0
+        while True:
+            time.sleep(10)
+            size = pcloud_stat_size(token, abs_path)
+            if size == expected:
+                break
+            if size is not None and size != last:
+                last = size
+                if time.time() - last_log > 30:
+                    L.log(f"  pCloud {size * 100 // expected:>3}% · {size / 1024 / 1024:.0f} / {expected / 1024 / 1024:.0f} MB")
+                    last_log = time.time()
+            if time.time() - t0 > 2 * 3600:
+                raise RuntimeError("pCloud pull didn't finish within 2 h")
+    L.run(["rclone", "deletefile", f"r2:{key}"], timeout=120)
+
+
 def activation_bytes(account):
     r = L.run(["audible", "-P", account, "activation-bytes"], timeout=120)
     if r.returncode != 0:
@@ -141,14 +265,22 @@ def activation_bytes(account):
 def sync_one(account, item, dest_root, quality):
     asin = item["asin"]
     work = L.DL_DIR / account / asin
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True)
-    L.log(f"[{asin}] downloading “{item.get('title')}”…")
-    cmd = ["audible", "-P", account, "download", "--asin", asin, "--aax-fallback", "--cover", "--cover-size", "1215",
-           "--chapter", "--chapter-type", "flat", "-q", quality, "-o", str(work), "-y",
-           "--filename-mode", "asin_ascii", "--timeout", "120"]
-    rc, out_tail = run_download(cmd, DOWNLOAD_TIMEOUT)
+    work.mkdir(parents=True, exist_ok=True)
+    # A previous attempt's download (killed mid-upload, say) is reused
+    # rather than fetched again; only the finished m4b is rebuilt.
     audio = [p for p in work.iterdir() if p.suffix.lower() in AUDIO_EXTS]
+    for old_m4b in work.glob("*.m4b"):
+        old_m4b.unlink()
+    if audio:
+        L.log(f"[{asin}] reusing downloaded {audio[0].name}")
+        rc, out_tail = 0, ""
+    else:
+        L.log(f"[{asin}] downloading “{item.get('title')}”…")
+        cmd = ["audible", "-P", account, "download", "--asin", asin, "--aax-fallback", "--cover", "--cover-size", "1215",
+               "--chapter", "--chapter-type", "flat", "-q", quality, "-o", str(work), "-y",
+               "--filename-mode", "asin_ascii", "--timeout", "120"]
+        rc, out_tail = run_download(cmd, DOWNLOAD_TIMEOUT)
+        audio = [p for p in work.iterdir() if p.suffix.lower() in AUDIO_EXTS]
     if rc != 0 and not audio:
         raise RuntimeError(f"download failed: {out_tail[-400:]}")
     if not audio:
@@ -195,11 +327,15 @@ def sync_one(account, item, dest_root, quality):
     # Keep Audible backups apart from everything else in the library:
     # <root>/Audible/<account>/<Title - Author>/<Title>.m4b (Joseph's ask,
     # 2026-09-02). The scanner walks subfolders, so the nesting is free.
-    dest = f"pcloud:{dest_root.strip('/')}/Audible/{account}/{folder}/{out.name}"
-    r = L.run(["rclone", "copyto", str(out), dest, "--retries", "5", "--low-level-retries", "20", "--stats", "0"], timeout=3 * 3600)
-    if r.returncode != 0:
-        raise RuntimeError(f"rclone upload failed: {(r.stderr or '').strip()[-300:]}")
-    rel = f"Audible/{account}/{folder}/{out.name}"
+    rel_dir = f"Audible/{account}/{folder}"
+    if rclone_has_remote("r2"):
+        upload_via_r2(account, asin, out, dest_root, rel_dir, out.stat().st_size)
+    else:
+        dest = f"pcloud:{dest_root.strip('/')}/{rel_dir}/{out.name}"
+        rc, tail = run_rclone(["copyto", str(out), dest, "--retries", "5", "--low-level-retries", "20"], 6 * 3600, "pCloud")
+        if rc != 0:
+            raise RuntimeError(f"rclone upload failed: {tail[-300:]}")
+    rel = f"{rel_dir}/{out.name}"
     rec = {"path": rel, "bytes": out.stat().st_size, "at": int(time.time() * 1000), "chapters": len(chapters)}
     synced_path = L.SYNCED_DIR / f"{account}.json"
     synced = L.load_json(synced_path, {})
