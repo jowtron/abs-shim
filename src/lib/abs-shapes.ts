@@ -224,7 +224,10 @@ function buildAudioFile(a: AudioFileRow, folder: LibraryFolderRow, item: Library
     error: null,
     format: a.format ?? 'mp4',
     duration: a.duration_seconds,
-    bitRate: a.bitrate,
+    // The m4b prober doesn't record a bitrate (20 of 23 rows were NULL on
+    // 2026-09-03); the average from size/duration is what Pholia's flip-side
+    // info panel wants to show anyway.
+    bitRate: a.bitrate ?? (a.size_bytes && a.duration_seconds ? Math.round((a.size_bytes * 8) / a.duration_seconds) : null),
     language: 'und',
     codec: a.codec,
     timeBase: a.sample_rate ? `1/${a.sample_rate}` : '1/1000',
