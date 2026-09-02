@@ -1830,7 +1830,7 @@ async function audibleLoadJobs() {
           // download), the job list every 20 s (state changes).
           log.style.display = '';
           audibleTailLog(j.id, log);
-          const logTimer = setInterval(() => audibleTailLog(j.id, log), 5000);
+          const logTimer = setInterval(() => audibleTailLog(j.id, log, j), 5000);
           audibleWatching.set(j.id, setTimeout(() => { clearInterval(logTimer); audibleWatching.delete(j.id); audibleLoadJobs(); }, 20000));
         }
       }
@@ -1840,11 +1840,25 @@ async function audibleLoadJobs() {
   }
 }
 
-async function audibleTailLog(id, el) {
+const audibleLanded = new Map(); // job id → books seen landing (from "done →" log lines)
+
+async function audibleTailLog(id, el, job) {
   try {
     const r = await api('/api/admin/audible/jobs/' + encodeURIComponent(id) + '/log?tail=4000');
     el.textContent = (r.content || '').replace(/^ERR: /gm, '').trim() || '(no output yet)';
     el.scrollTop = el.scrollHeight;
+    // Scan the library as each book lands (the handler logs "done →" per
+    // title), not only when the whole job ends — so they show up one by one.
+    if (job) {
+      const landed = ((r.content || '').match(/\] done → /g) || []).length;
+      if (landed > (audibleLanded.get(id) || 0)) {
+        audibleLanded.set(id, landed);
+        try {
+          const report = await api('/api/admin/libraries/' + encodeURIComponent(job.libraryId) + '/scan', { method: 'POST' });
+          if (report.added) { document.getElementById('audible-lib-status').textContent = 'Scan added ' + report.added + ' book(s) so far.'; refresh(); }
+        } catch (e) { console.warn('mid-sync scan', e); }
+      }
+    }
   } catch (e) {
     el.textContent = 'log unavailable: ' + e.message;
   }
