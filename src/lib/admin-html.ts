@@ -89,6 +89,10 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     .abb-browse-row { margin-top: 0.4rem; }
     .abb-browse-row select { flex: 1; min-width: 8rem; }
     .abb-cached { color: var(--muted); font-size: 0.75rem; margin-left: 0.4rem; }
+    .abb-inlib { color: #3fb950; font-size: 0.75rem; margin-left: 0.4rem; white-space: nowrap; }
+    .abb-cover[data-full] { cursor: zoom-in; }
+    .abb-lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; z-index: 60; cursor: zoom-out; padding: 1rem; }
+    .abb-lightbox img { max-width: 100%; max-height: 100%; border-radius: 6px; box-shadow: 0 8px 40px rgba(0,0,0,0.6); }
     .abb-more { margin: 0.5rem 0; }
     #abb-catalog-listings span { display: inline-block; margin: 0 0.5rem 0.15rem 0; white-space: nowrap; }
     .abb-details { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.75rem; font-size: 0.85rem; line-height: 1.45; }
@@ -1307,10 +1311,20 @@ function abbRenderResults(results, out) {
         img.className = 'abb-cover'; img.alt = ''; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
         img.src = res.cover;
         img.addEventListener('error', () => { img.style.visibility = 'hidden'; });
+        // Tap the thumbnail → the full-size source image in a lightbox.
+        img.dataset.full = res.coverOrig || res.cover;
+        img.addEventListener('click', () => abbLightbox(img.dataset.full));
         tr.children[0].appendChild(img);
       }
       tr.children[1].innerHTML = '<span class="abb-title" role="button" title="Show description"></span><a class="abb-ext" target="_blank" rel="noopener" title="Open on AudioBookBay">↗</a><div class="abb-sub"></div>';
       tr.children[1].querySelector('.abb-title').textContent = res.title;
+      if (res.inLibrary) {
+        const c = document.createElement('span');
+        c.className = 'abb-inlib';
+        c.title = 'A book grabbed from this release is already in the library';
+        c.textContent = '✓ In library';
+        tr.children[1].querySelector('.abb-ext').after(c);
+      }
       if (res.infoHash) {
         const c = document.createElement('span');
         c.className = 'abb-cached';
@@ -1327,7 +1341,8 @@ function abbRenderResults(results, out) {
       drow.innerHTML = '<td colspan="3"><div class="abb-details"></div></td>';
       if (res.url) tr.children[1].querySelector('.abb-title').addEventListener('click', () => abbToggleDetails(res, drow));
       const b = document.createElement('button');
-      b.textContent = 'Grab';
+      b.textContent = res.inLibrary ? 'Grab again' : 'Grab';
+      if (res.inLibrary) b.className = 'secondary';
       // Progress renders in a row directly under this result, not at the
       // bottom of the list, so it's obvious which grab is which.
       const prow = document.createElement('tr');
@@ -1348,6 +1363,22 @@ function abbRenderResults(results, out) {
       tb.appendChild(prow);
     }
   }
+}
+
+function abbLightbox(src) {
+  if (!src) return;
+  const box = document.createElement('div');
+  box.className = 'abb-lightbox';
+  const img = document.createElement('img');
+  img.alt = '';
+  img.referrerPolicy = 'no-referrer';
+  img.src = src;
+  box.appendChild(img);
+  const close = () => { box.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = (ev) => { if (ev.key === 'Escape') close(); };
+  box.addEventListener('click', close);
+  document.addEventListener('keydown', onKey);
+  document.body.appendChild(box);
 }
 
 // ─── Catalogue: browse by category + crawler status ─────────────────────────
@@ -2104,7 +2135,12 @@ async function fetchUrlToPcloud(folderId, url, relPath, listEl) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ relPath: started.relPath, registerAsBook: true }),
     });
-    if (saved.itemId) {
+    if (saved.alreadyInLibrary) {
+      // Re-grab of a book that's already here (same file on pCloud, same
+      // library row). Not a failure, not a fresh add — say so.
+      row.complete('Already in the library — nothing new');
+      return true;
+    } else if (saved.itemId) {
       row.complete('Saved & registered (' + saved.itemId + ')');
       return true;
     } else if (saved.registerError) {

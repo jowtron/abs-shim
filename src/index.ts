@@ -462,6 +462,25 @@ app.get('/account/', (c) => c.html(ADMIN_HTML));
 // other backends later). The URL is HMAC-signed by the adapter's resolveUrl;
 // signature + expiry are verified here, then the adapter fetches bytes from
 // its backend and streams them through. Range header is preserved end-to-end.
+// Resized AudioBookBay catalogue covers (migration 0008). Public: the id is
+// a catalogue row number and the content is a cover thumbnail, nothing
+// tenant-specific. Cached at the edge and immutable in the browser.
+app.get('/public/abb-cover/:file', async (c) => {
+  const m = /^(\d+)\.webp$/.exec(c.req.param('file'));
+  if (!m) return c.json({ error: 'Not found' }, 404);
+  const cache = caches.default;
+  const key = new Request(c.req.url, { method: 'GET' });
+  const hit = await cache.match(key);
+  if (hit) return hit;
+  const obj = await c.env.COVERS.get(`abbcovers/${m[1]}.webp`);
+  if (!obj) return c.json({ error: 'Not found' }, 404);
+  const res = new Response(obj.body, {
+    headers: { 'Content-Type': 'image/webp', 'Cache-Control': 'public, max-age=31536000, immutable', 'Access-Control-Allow-Origin': '*' },
+  });
+  c.executionCtx.waitUntil(cache.put(key, res.clone()));
+  return res;
+});
+
 app.get('/public/proxy/:folderId/*', async (c) => {
   const folderId = c.req.param('folderId');
   // Hono's wildcard captures the rest of the path; pull it out manually so

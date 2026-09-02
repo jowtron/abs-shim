@@ -6,6 +6,7 @@ import { abbLogin, abbSearch, abbMagnet, abbDetails, magnetFromHash, type AbbCoo
 import {
   catalogSearch, catalogBrowse, catalogFacets, catalogGet, rowToDetails, catalogRecordHash, catalogRecordDetails,
   upsertPosts, runCatalogTick, catalogStatus, catalogControl, sendReportNow, type CatalogAction,
+  withCoverUrls, coversPending, coverStore, coverFailed, coverStats,
 } from '../lib/abb-catalog';
 import { sealSecret, openSecret, secretsConfigured } from '../lib/secret-box';
 import {
@@ -76,6 +77,20 @@ async function abbCookie(env: Env, tenantId: string, force = false): Promise<str
 function folderNameFromTitle(title: string): string {
   return title.replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120) || 'audiobook';
 }
+
+// Flag results whose book is already in the caller's library. The grab flow
+// names the destination folder from the release title (folderNameFromTitle →
+// abbPlanDest), so a library item whose top folder matches means "you already
+// grabbed this" — good enough to badge, without a separate grab log.
+async function markInLibrary(env: Env, tenantId: string, results: AbbResult[]): Promise<AbbResult[]> {
+  if (!results.length) return results;
+  const rows = await env.DB.prepare('SELECT rel_path FROM library_items WHERE tenant_id = ?').bind(tenantId).all<{ rel_path: string }>();
+  const tops = new Set(rows.results.map((r) => (r.rel_path.split('/')[0] ?? '').toLowerCase()));
+  for (const r of results) r.inLibrary = tops.has(folderNameFromTitle(r.title).toLowerCase());
+  return results;
+}
+
+const originOf = (url: string) => new URL(url).origin;
 
 // ─── Settings ───────────────────────────────────────────────────────────────
 
@@ -183,7 +198,7 @@ abbRoutes.get('/search', async (c) => {
     }
     if (extras.length) c.executionCtx.waitUntil(upsertPosts(c.env, extras).catch(() => undefined));
   }
-  const results = [...cached, ...extras];
+  const results = await markInLibrary(c.env, c.get('tenantId'), withCoverUrls([...cached, ...extras], originOf(c.req.url)));
   return c.json({
     query: q, count: results.length, results,
     source: mode === 'cache' ? 'cache' : live instanceof Error ? 'cache' : mode === 'live' ? 'live' : 'both',
@@ -209,8 +224,35 @@ abbRoutes.get('/catalog/browse', async (c) => {
   if (cat) o.cat = cat;
   if (language) o.language = language;
   if (format) o.format = format;
-  const results = await catalogBrowse(c.env, o);
+  const results = await markInLibrary(c.env, c.get('tenantId'), withCoverUrls(await catalogBrowse(c.env, o), originOf(c.req.url)));
   return c.json({ page, limit, count: results.length, hasMore: results.length === limit, results });
+});
+
+// ─── Catalogue covers (resized off-Worker by scripts/abb-covers.py) ─────────
+
+abbRoutes.get('/catalog/covers/pending', async (c) => {
+  const limit = Number(c.req.query('limit') ?? '200') || 200;
+  return c.json({ ...(await coverStats(c.env)), pending: await coversPending(c.env, limit) });
+});
+
+// Body: the webp bytes. Stored as abbcovers/<id>.webp, served at /public/abb-cover/<id>.webp.
+abbRoutes.put('/catalog/covers/:id', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isInteger(id)) return c.json({ error: 'bad id' }, 400);
+  const body = await c.req.arrayBuffer();
+  const magic = new Uint8Array(body.slice(0, 12));
+  const isWebp = magic.length === 12 && String.fromCharCode(...magic.subarray(0, 4)) === 'RIFF' && String.fromCharCode(...magic.subarray(8, 12)) === 'WEBP';
+  if (!isWebp || body.byteLength > 512 * 1024) return c.json({ error: 'expected a webp under 512 KB' }, 400);
+  if (!(await coverStore(c.env, id, body))) return c.json({ error: 'no such post' }, 404);
+  return c.json({ ok: true, bytes: body.byteLength });
+});
+
+abbRoutes.post('/catalog/covers/:id/error', async (c) => {
+  const id = Number(c.req.param('id'));
+  const body = await c.req.json().catch(() => ({})) as { error?: string };
+  if (!Number.isInteger(id)) return c.json({ error: 'bad id' }, 400);
+  await coverFailed(c.env, id, String(body.error ?? 'unknown'));
+  return c.json({ ok: true });
 });
 
 // Manual tick (the cron runs one every 5 minutes). Runs after the response;

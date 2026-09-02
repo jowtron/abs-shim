@@ -190,6 +190,7 @@ export type CatalogRow = {
   language: string | null; format: string | null; bitrate: string | null; size_bytes: number | null;
   posted: string | null; info_hash: string | null; author: string | null; narrators: string | null;
   length: string | null; abridged: number | null; description: string | null; detail_fetched_at: number | null; detail_error: string | null;
+  cover_r2: number | null; cover_error: string | null;
 };
 
 const parseArr = (s: string | null): string[] => { try { const v = JSON.parse(s ?? '[]'); return Array.isArray(v) ? v.map(String) : []; } catch { return []; } };
@@ -204,7 +205,47 @@ export function rowToResult(r: CatalogRow): AbbResult {
     format: r.format, bitrate: r.bitrate, sizeBytes: r.size_bytes, posted: r.posted,
     categories, keywords: parseArr(r.keywords),
     infoHash: r.info_hash, author: r.author, narrators: parseArr(r.narrators), cached: true,
+    catalogId: r.id, coverOrig: r.cover, coverCached: !!r.cover_r2,
   };
+}
+
+// Swap the source cover for the shim-hosted webp where one exists (see
+// migration 0008 / scripts/abb-covers.py). Pholia is on another origin,
+// hence absolute URLs.
+export function withCoverUrls(results: AbbResult[], origin: string): AbbResult[] {
+  for (const r of results) {
+    if (r.coverCached && r.catalogId != null) r.cover = `${origin}/public/abb-cover/${r.catalogId}.webp`;
+  }
+  return results;
+}
+
+export const ABB_COVER_PREFIX = 'abbcovers/';
+
+export async function coversPending(env: Env, limit: number): Promise<Array<{ id: number; url: string; title: string }>> {
+  const rows = await env.DB.prepare(
+    `SELECT id, cover AS url, title FROM abb_posts WHERE cover IS NOT NULL AND cover_r2 IS NULL AND cover_error IS NULL
+       ORDER BY posted_ts DESC, id DESC LIMIT ?`,
+  ).bind(Math.min(Math.max(limit, 1), 1000)).all<{ id: number; url: string; title: string }>();
+  return rows.results;
+}
+
+export async function coverStore(env: Env, id: number, webp: ArrayBuffer): Promise<boolean> {
+  const row = await env.DB.prepare('SELECT id FROM abb_posts WHERE id = ?').bind(id).first<{ id: number }>();
+  if (!row) return false;
+  await env.COVERS.put(`${ABB_COVER_PREFIX}${id}.webp`, webp, { httpMetadata: { contentType: 'image/webp', cacheControl: 'public, max-age=31536000, immutable' } });
+  await env.DB.prepare('UPDATE abb_posts SET cover_r2 = ?, cover_error = NULL WHERE id = ?').bind(Date.now(), id).run();
+  return true;
+}
+
+export async function coverFailed(env: Env, id: number, error: string): Promise<void> {
+  await env.DB.prepare('UPDATE abb_posts SET cover_error = ? WHERE id = ?').bind(error.slice(0, 200), id).run();
+}
+
+export async function coverStats(env: Env): Promise<{ withCover: number; cached: number; failed: number }> {
+  const r = await env.DB.prepare(
+    'SELECT SUM(cover IS NOT NULL) AS withCover, SUM(cover_r2 IS NOT NULL) AS cached, SUM(cover_error IS NOT NULL) AS failed FROM abb_posts',
+  ).first<{ withCover: number; cached: number; failed: number }>();
+  return { withCover: r?.withCover ?? 0, cached: r?.cached ?? 0, failed: r?.failed ?? 0 };
 }
 
 // FTS5 query from free text: each word becomes a prefix term, all required.

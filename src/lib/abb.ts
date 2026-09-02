@@ -30,6 +30,10 @@ export type AbbResult = {
   author?: string | null;
   narrators?: string[];
   cached?: boolean;
+  catalogId?: number;
+  coverOrig?: string | null;   // the source image when `cover` is the shim-hosted webp
+  coverCached?: boolean;
+  inLibrary?: boolean;         // a book from this post already sits in the caller's library
 };
 
 export type AbbCookie = { cookie: string; expiresAt: number };

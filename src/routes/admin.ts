@@ -581,6 +581,7 @@ adminRoutes.post('/storage/folder/:folderId/upload/save', async (c) => {
   // instead of silently dropping the book.
   let itemId: string | undefined;
   let registerError: string | undefined;
+  let alreadyInLibrary = false;
   if (registerAsBook && /\.(m4b|m4a|aac|opus|ogg)$/i.test(relPath)) {
     try {
       // Pass through size from pCloud's upload_save response so audio_files
@@ -591,14 +592,16 @@ adminRoutes.post('/storage/folder/:folderId/upload/save', async (c) => {
       const result = await addBookByPath(c.env, loaded.folder.library_id, relPath, c.get('tenantId'), hints);
       if (result.itemId) itemId = result.itemId;
       if (!result.added && result.reason) registerError = result.reason;
+      if (!result.added && result.reason === 'Already in library') alreadyInLibrary = true;
     } catch (e) {
       registerError = (e as Error).message;
     }
   }
 
-  const out: { savedPath: string; size?: number; itemId?: string; registerError?: string } = {
+  const out: { savedPath: string; size?: number; itemId?: string; registerError?: string; alreadyInLibrary?: boolean } = {
     savedPath: saved.metadata?.path ?? absPath,
   };
+  if (alreadyInLibrary) out.alreadyInLibrary = true;
   if (saved.metadata?.size != null) out.size = saved.metadata.size;
   if (itemId) out.itemId = itemId;
   if (registerError) out.registerError = registerError;
@@ -782,6 +785,7 @@ adminRoutes.post('/storage/folder/:folderId/fetch-url/finish', async (c) => {
 
   let itemId: string | undefined;
   let registerError: string | undefined;
+  let alreadyInLibrary = false;
   if (registerAsBook && /\.(m4b|m4a|aac|opus|ogg)$/i.test(relPath)) {
     try {
       const hints: { sizeBytes?: number } = {};
@@ -789,11 +793,13 @@ adminRoutes.post('/storage/folder/:folderId/fetch-url/finish', async (c) => {
       const result = await addBookByPath(c.env, loaded.folder.library_id, relPath, c.get('tenantId'), hints);
       if (result.itemId) itemId = result.itemId;
       if (!result.added && result.reason) registerError = result.reason;
+      if (!result.added && result.reason === 'Already in library') alreadyInLibrary = true;
     } catch (e) {
       registerError = (e as Error).message;
     }
   }
-  const out: { savedPath: string; size?: number; itemId?: string; registerError?: string } = { savedPath: absPath };
+  const out: { savedPath: string; size?: number; itemId?: string; registerError?: string; alreadyInLibrary?: boolean } = { savedPath: absPath };
+  if (alreadyInLibrary) out.alreadyInLibrary = true;
   if (meta.size != null) out.size = meta.size;
   if (itemId) out.itemId = itemId;
   if (registerError) out.registerError = registerError;
