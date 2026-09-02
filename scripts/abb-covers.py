@@ -53,6 +53,10 @@ except ImportError:  # pragma: no cover
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 KEYCHAIN_SERVICE = "abs-shim-covers"
+# Cloudflare's bot rules on the shim's domain answer the default "Python-urllib"
+# agent with a 403 before the shim sees the request (looked like a lockout on
+# 2026-09-02). Identify ourselves as this tool instead.
+SHIM_UA = "abs-shim-covers/1.0"
 
 
 class Unauthorized(Exception):
@@ -68,6 +72,7 @@ def log(msg):
 def api(server, token, path, method="GET", body=None, content_type="application/json"):
     req = urllib.request.Request(server + path, method=method)
     req.add_header("Authorization", "Bearer " + token)
+    req.add_header("User-Agent", SHIM_UA)
     if body is not None:
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
@@ -85,6 +90,7 @@ def api(server, token, path, method="GET", body=None, content_type="application/
 def login(server, user, password):
     req = urllib.request.Request(server + "/login", method="POST", data=json.dumps({"username": user, "password": password}).encode())
     req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", SHIM_UA)
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)["user"]["token"]
 
@@ -268,7 +274,12 @@ def main():
                 if use_keychain:
                     keychain_set(args.user, password)
                 continue
-            sys.exit(f"login failed: HTTP {e.code} — wrong password? (delete it with: security delete-generic-password -s {KEYCHAIN_SERVICE})")
+            detail = ""
+            try:
+                detail = json.loads(e.read().decode()).get("error", "")
+            except Exception:  # noqa: BLE001
+                pass
+            sys.exit(f"login failed: HTTP {e.code} {detail} (stored password can be cleared with: security delete-generic-password -s {KEYCHAIN_SERVICE})")
         except (urllib.error.URLError, OSError) as e:
             if not args.loop:
                 sys.exit(f"cannot reach {server}: {e}")
