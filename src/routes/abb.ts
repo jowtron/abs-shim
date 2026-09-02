@@ -7,6 +7,7 @@ import {
   catalogSearch, catalogBrowse, catalogFacets, catalogGet, rowToDetails, catalogRecordHash, catalogRecordDetails,
   upsertPosts, runCatalogTick, catalogStatus, catalogControl, sendReportNow, type CatalogAction,
   withCoverUrls, coversPending, coverStore, coverFailed, coverStats,
+  detailClaim, detailSubmit, noteCoverStored, type DetailSubmission,
 } from '../lib/abb-catalog';
 import { sealSecret, openSecret, secretsConfigured } from '../lib/secret-box';
 import {
@@ -230,9 +231,13 @@ abbRoutes.get('/catalog/browse', async (c) => {
 
 // ─── Catalogue covers (resized off-Worker by scripts/abb-covers.py) ─────────
 
+// ?shard=&shards= partitions the backlog between several runners (the Mac
+// and/or the wharf nodes) so they don't resize the same covers.
 abbRoutes.get('/catalog/covers/pending', async (c) => {
   const limit = Number(c.req.query('limit') ?? '200') || 200;
-  return c.json({ ...(await coverStats(c.env)), pending: await coversPending(c.env, limit) });
+  const shards = Number(c.req.query('shards') ?? '1') || 1;
+  const shard = Number(c.req.query('shard') ?? '0') || 0;
+  return c.json({ ...(await coverStats(c.env)), pending: await coversPending(c.env, limit, shard, shards) });
 });
 
 // Body: the webp bytes. Stored as abbcovers/<id>.webp, served at /public/abb-cover/<id>.webp.
@@ -244,6 +249,8 @@ abbRoutes.put('/catalog/covers/:id', async (c) => {
   const isWebp = magic.length === 12 && String.fromCharCode(...magic.subarray(0, 4)) === 'RIFF' && String.fromCharCode(...magic.subarray(8, 12)) === 'WEBP';
   if (!isWebp || body.byteLength > 512 * 1024) return c.json({ error: 'expected a webp under 512 KB' }, 400);
   if (!(await coverStore(c.env, id, body))) return c.json({ error: 'no such post' }, 404);
+  const node = (c.req.query('node') ?? '').trim().slice(0, 40);
+  if (node) c.executionCtx.waitUntil(noteCoverStored(c.env, node).catch(() => undefined));
   return c.json({ ok: true, bytes: body.byteLength });
 });
 
@@ -276,6 +283,43 @@ abbRoutes.post('/catalog/control', async (c) => {
   if (!allowed.includes(action as CatalogAction)) return c.json({ error: 'unknown action' }, 400);
   await catalogControl(c.env, action as CatalogAction, typeof body.value === 'number' ? body.value : undefined);
   return c.json({ ok: true });
+});
+
+// ─── Detail backfill farmed out to wharf nodes ──────────────────────────────
+//
+// See the header comment on detailClaim in src/lib/abb-catalog.ts for why
+// this exists and why the node sends HTML rather than parsed fields. The
+// node client is wharf-project/abbcrawl/handlers/abb-detail-crawler.py.
+//
+// Owner-only: a submission becomes catalogue content every tenant sees, so
+// this isn't a route any member should be able to feed.
+abbRoutes.post('/catalog/details/claim', async (c) => {
+  if (c.get('tenantRole') !== 'owner') return c.json({ error: 'Only the tenant owner can run a crawl node' }, 403);
+  const body = await c.req.json().catch(() => ({})) as { node?: string; limit?: number };
+  const node = String(body.node ?? '').trim().slice(0, 40);
+  if (!node) return c.json({ error: 'node required' }, 400);
+  const items = await detailClaim(c.env, node, Number(body.limit ?? 10));
+  return c.json({ items, count: items.length });
+});
+
+// Body: { node, url, status, html } — or { node, url, error } for a fetch
+// that failed, or { node, url, release: true } to hand a leased row back
+// untouched (a node shutting down or backing off).
+abbRoutes.post('/catalog/details/submit', async (c) => {
+  if (c.get('tenantRole') !== 'owner') return c.json({ error: 'Only the tenant owner can run a crawl node' }, 403);
+  const body = await c.req.json().catch(() => ({})) as { node?: string } & Record<string, unknown>;
+  const node = String(body.node ?? '').trim().slice(0, 40);
+  if (!node) return c.json({ error: 'node required' }, 400);
+  const html = typeof body.html === 'string' ? body.html : undefined;
+  // ABB detail pages are ~100 KB; anything far past that is a mistake, not
+  // a page, and parsing it would burn the request's CPU budget.
+  if (html && html.length > 2 * 1024 * 1024) return c.json({ error: 'html too large' }, 413);
+  const sub: DetailSubmission = { url: String(body.url ?? '') };
+  if (html !== undefined) sub.html = html;
+  if (typeof body.status === 'number') sub.status = body.status;
+  if (typeof body.error === 'string') sub.error = body.error.slice(0, 200);
+  if (body.release === true) sub.release = true;
+  return c.json(await detailSubmit(c.env, node, sub));
 });
 
 // ?url= → blurb + "Written by / Read by / Format / Bit Rate / Length" from

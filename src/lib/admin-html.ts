@@ -2033,6 +2033,14 @@ async function abbLoadCatalog() {
     if (s.blockedTicks) lines.push('Backoff episodes so far: ' + s.blockedTicks);
     if (s.zeroParsePages) lines.push('⚠ ' + s.zeroParsePages + ' listing page(s) parsed to 0 posts — AudioBookBay\'s markup may have changed.');
     if (s.lastError) lines.push('Last error (' + abbAgo(s.lastErrorAt) + '): ' + s.lastError);
+    // wharf nodes burning down the detail backlog from their own IPs
+    // (wharf-project/abbcrawl). Silent when none have ever reported.
+    for (const n of st.nodes || []) {
+      lines.push('Node ' + n.node + ': ' + n.fetched.toLocaleString() + ' detail pages, ' + n.withHash.toLocaleString() + ' with a magnet'
+        + (n.errors ? ', ' + n.errors.toLocaleString() + ' errors' : '')
+        + (n.covers ? ' · ' + n.covers.toLocaleString() + ' covers' : '')
+        + ' · last seen ' + abbAgo(n.lastSeen) + (n.note ? ' · ' + n.note : ''));
+    }
     box.innerHTML = '';
     for (const t of lines) { if (!t) continue; const d = document.createElement('div'); d.textContent = t; box.appendChild(d); }
     const budget = document.getElementById('abb-budget');

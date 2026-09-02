@@ -70,10 +70,38 @@ function collectCookies(resp: Response): string {
     .join('; ');
 }
 
-async function abbFetch(path: string, cookie: string | null): Promise<string> {
-  const { status, html } = await abbFetchRaw(path, cookie);
-  if (status < 200 || status >= 300) throw new Error(`AudioBookBay HTTP ${status}`);
-  return html;
+// ABB sits behind Cloudflare and its origin goes slow in bursts: a transient
+// 522 (edge couldn't reach the origin) or a 20s timeout used to kill a whole
+// grab from Pholia mid-tap (observed 2026-09-03 resolving a post whose detail
+// page wasn't in the catalogue yet). Retry 5xx and network errors a couple of
+// times — same treatment pcloudFetchWithRetry gives pCloud's API.
+//
+// Only the interactive paths (search/resolve/details) go through here. The
+// crawler calls abbFetchRaw directly and must keep doing so: it has its own
+// fetch budget, 4s spacing and exponential backoff, and ABB firewalls IPs
+// that burst. Three attempts spread over seconds is nowhere near that rate.
+//
+// 4xx are real answers and are never retried — notably 404 (no such post) and
+// the 301-to-homepage ABB serves for a query containing a capital letter.
+async function abbFetch(path: string, cookie: string | null, attempts = 3): Promise<string> {
+  let lastErr: Error | null = null;
+  for (let i = 0; i < attempts; i++) {
+    if (i) await new Promise((r) => setTimeout(r, 1000 * 3 ** (i - 1)));
+    let status: number, html: string;
+    try {
+      ({ status, html } = await abbFetchRaw(path, cookie));
+    } catch (e) {
+      // AbortSignal.timeout() lands here, as does a dropped connection.
+      lastErr = new Error(`AudioBookBay network error: ${(e as Error).message}`);
+      console.warn(`ABB ${path} attempt ${i + 1}/${attempts} failed: ${(e as Error).message}`);
+      continue;
+    }
+    if (status >= 200 && status < 300) return html;
+    lastErr = new Error(`AudioBookBay HTTP ${status}`);
+    console.warn(`ABB ${path} attempt ${i + 1}/${attempts} HTTP ${status}`);
+    if (status < 500) break;
+  }
+  throw lastErr ?? new Error('AudioBookBay fetch failed');
 }
 
 // Status + body, for the crawler, which treats 404 as "end of listing"

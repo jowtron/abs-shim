@@ -224,11 +224,19 @@ export function withCoverUrls(results: AbbResult[], origin: string): AbbResult[]
 
 export const ABB_COVER_PREFIX = 'abbcovers/';
 
-export async function coversPending(env: Env, limit: number): Promise<Array<{ id: number; url: string; title: string }>> {
+// `shard`/`shards` let several cover runners share the backlog without
+// resizing the same image twice (scripts/abb-covers.py --shard/--shards, or
+// ABS_SHIM_SHARD/SHARDS in the wharf service's .env). No lease is needed the
+// way the detail crawler needs one: id % shards is a fixed partition, and a
+// duplicate PUT would only cost a wasted download, not corrupt anything.
+export async function coversPending(env: Env, limit: number, shard = 0, shards = 1): Promise<Array<{ id: number; url: string; title: string }>> {
+  const n = Math.min(Math.max(Math.round(shards) || 1, 1), 16);
+  const i = Math.min(Math.max(Math.round(shard) || 0, 0), n - 1);
   const rows = await env.DB.prepare(
     `SELECT id, cover AS url, title FROM abb_posts WHERE cover IS NOT NULL AND cover_r2 IS NULL AND cover_error IS NULL
+       AND (? = 1 OR id % ? = ?)
        ORDER BY posted_ts DESC, id DESC LIMIT ?`,
-  ).bind(Math.min(Math.max(limit, 1), 1000)).all<{ id: number; url: string; title: string }>();
+  ).bind(n, n, i, Math.min(Math.max(limit, 1), 1000)).all<{ id: number; url: string; title: string }>();
   return rows.results;
 }
 
@@ -332,6 +340,9 @@ export async function catalogRecordHash(env: Env, url: string, title: string, ha
   ]);
 }
 
+// `detail_claim_*` is cleared here too: a post whose details have landed is
+// no longer claimable, and leaving a stale lease behind would only confuse
+// the /admin node panel.
 export async function catalogRecordDetails(env: Env, d: AbbDetails, hash: string | null): Promise<void> {
   const now = Date.now();
   await env.DB.batch([
@@ -339,7 +350,8 @@ export async function catalogRecordDetails(env: Env, d: AbbDetails, hash: string
     env.DB.prepare(
       `UPDATE abb_posts SET author = ?, narrators = ?, length = ?, abridged = ?, description = ?,
          format = COALESCE(format, ?), bitrate = COALESCE(bitrate, ?),
-         info_hash = COALESCE(?, info_hash), detail_fetched_at = ?, detail_error = NULL WHERE url = ?`,
+         info_hash = COALESCE(?, info_hash), detail_fetched_at = ?, detail_error = NULL,
+         detail_claim_by = NULL, detail_claim_until = NULL WHERE url = ?`,
     ).bind(d.author, JSON.stringify(d.narrators), d.length, d.abridged == null ? null : d.abridged ? 1 : 0, d.description,
       d.format ? d.format.toLowerCase() : null, d.bitrate, hash ? hash.toLowerCase() : null, now, d.url),
   ]);
@@ -468,9 +480,14 @@ async function backfillPass(env: Env, t: Tick, pages: number): Promise<boolean> 
 // the details panel show).
 async function detailPass(env: Env, t: Tick, count: number): Promise<number> {
   if (count <= 0) return 0;
+  // Newest first, and never a post a wharf node currently holds (they work
+  // up from the oldest end — see detailClaim). Without the lease check the
+  // cron would re-fetch pages a node is already downloading.
   const rows = await env.DB.prepare(
-    'SELECT url, title FROM abb_posts WHERE detail_fetched_at IS NULL ORDER BY posted_ts DESC, id DESC LIMIT ?',
-  ).bind(count).all<{ url: string; title: string }>();
+    `SELECT url, title FROM abb_posts
+      WHERE detail_fetched_at IS NULL AND (detail_claim_until IS NULL OR detail_claim_until < ?)
+      ORDER BY posted_ts DESC, id DESC LIMIT ?`,
+  ).bind(Date.now(), count).all<{ url: string; title: string }>();
   let ok = 0;
   for (const row of rows.results) {
     const u = new URL(row.url);
@@ -612,11 +629,12 @@ export async function catalogStatus(env: Env): Promise<{
   stats: CrawlStats; counts: CatalogCounts;
   listings: Array<{ path: string; name: string; page: number; done: boolean; posts: number; added: number; error: string | null }>;
   reportDueAt: number;
+  nodes: NodeStat[];
 }> {
   const stats = await loadStats(env);
-  const [counts, listings] = await Promise.all([catalogCounts(env), listListings(env)]);
+  const [counts, listings, nodes] = await Promise.all([catalogCounts(env), listListings(env), listNodes(env)]);
   return {
-    stats, counts,
+    stats, counts, nodes,
     listings: listings.map((l) => ({ path: l.path, name: l.state.name, page: l.state.page, done: l.state.done, posts: l.state.posts, added: l.state.added, error: l.state.error })),
     reportDueAt: stats.startedAt + REPORT_AFTER_MS,
   };
@@ -644,6 +662,121 @@ export async function catalogControl(env: Env, action: CatalogAction, value?: nu
     }
   }
   await setState(env, 'stats', stats);
+}
+
+// ─── Distributed detail backfill (wharf nodes) ──────────────────────────────
+//
+// Cloudflare's egress is shared with every other Worker, so the cron tick
+// can only afford ~1 detail page a minute — 10k pending posts is a week of
+// crawling. Boxes with their own IP can do the same work in parallel: a
+// node claims a batch, fetches the pages at its own polite pace, and posts
+// each page's HTML back here to be parsed. Nothing about ABB's markup lives
+// on the node, so a parser fix still ships with the Worker.
+//
+// Reachability is not universal — measured 2026-09-03: stereo-nz 200 in
+// 2.1s, wharf-syd-1 200 in 2.3s, stereo-au never completes the TCP
+// handshake (ABB drops that AU consumer range, the same way it dropped this
+// Mac after a burst). Test a new node with one curl before adding it.
+//
+// Direction matters: nodes take the OLDEST pending posts, the cron takes
+// the newest. New arrivals — the ones somebody is most likely to search
+// for — stay on the low-latency path, the archive gets burned down from the
+// far end, and the two only collide once the backlog is gone.
+
+const CLAIM_LEASE_MS = 10 * 60 * 1000;  // a node gets this long per batch
+const CLAIM_MAX = 25;
+
+export type DetailClaim = { id: number; url: string; title: string };
+export type NodeStat = { node: string; lastSeen: number; claimed: number; fetched: number; withHash: number; errors: number; covers: number; note: string | null };
+
+// One row per node (`node:<name>`), not one shared blob: two nodes report
+// concurrently and a read-modify-write on a single key would lose counts.
+async function bumpNode(env: Env, node: string, d: Partial<Omit<NodeStat, 'node'>>): Promise<void> {
+  // `covers` post-dates the first nodes' rows, so default it after the spread.
+  const saved = await getState<NodeStat>(env, 'node:' + node);
+  const cur: NodeStat = { node, lastSeen: 0, claimed: 0, fetched: 0, withHash: 0, errors: 0, covers: 0, note: null, ...(saved ?? {}) };
+  cur.covers = cur.covers ?? 0;
+  await setState(env, 'node:' + node, {
+    ...cur, node, lastSeen: Date.now(),
+    claimed: cur.claimed + (d.claimed ?? 0),
+    fetched: cur.fetched + (d.fetched ?? 0),
+    withHash: cur.withHash + (d.withHash ?? 0),
+    errors: cur.errors + (d.errors ?? 0),
+    covers: cur.covers + (d.covers ?? 0),
+    note: d.note !== undefined ? d.note : cur.note,
+  } satisfies NodeStat);
+}
+
+// The cover runner reports which node it is on (?node= on the PUT) purely
+// so /admin can show both services' progress in one place; the covers
+// themselves are sharded by id, not assigned, so nothing depends on this.
+export async function noteCoverStored(env: Env, node: string): Promise<void> {
+  await bumpNode(env, node, { covers: 1 });
+}
+
+export async function listNodes(env: Env): Promise<NodeStat[]> {
+  const rows = await env.DB.prepare(`SELECT value FROM abb_crawl WHERE key LIKE 'node:%'`).all<{ value: string }>();
+  const out: NodeStat[] = [];
+  for (const r of rows.results) {
+    try { out.push(JSON.parse(r.value) as NodeStat); } catch { /* skip */ }
+  }
+  return out.sort((a, b) => b.lastSeen - a.lastSeen);
+}
+
+// Lease a batch. The UPDATE ... RETURNING is one statement, and D1
+// serialises writes, so two nodes claiming at the same instant cannot come
+// away with the same rows — which is the whole reason this isn't a plain
+// SELECT plus a follow-up UPDATE.
+export async function detailClaim(env: Env, node: string, limit: number): Promise<DetailClaim[]> {
+  const n = Math.min(Math.max(Math.round(limit) || 10, 1), CLAIM_MAX);
+  const now = Date.now();
+  const rows = await env.DB.prepare(
+    `UPDATE abb_posts SET detail_claim_by = ?, detail_claim_until = ?
+      WHERE id IN (
+        SELECT id FROM abb_posts
+         WHERE detail_fetched_at IS NULL AND (detail_claim_until IS NULL OR detail_claim_until < ?)
+         ORDER BY posted_ts ASC, id ASC LIMIT ?)
+      RETURNING id, url, title`,
+  ).bind(node, now + CLAIM_LEASE_MS, now, n).all<DetailClaim>();
+  if (rows.results.length) await bumpNode(env, node, { claimed: rows.results.length });
+  return rows.results;
+}
+
+// One page per call: parsing 100 KB of HTML costs real CPU, and a Worker
+// request has little of it. The node posts as it goes, so a crash loses at
+// most the page in flight and the rest of the lease simply expires.
+export type DetailSubmission = { url: string; status?: number; html?: string; error?: string; release?: boolean };
+
+export async function detailSubmit(env: Env, node: string, s: DetailSubmission): Promise<{ ok: boolean; hash: string | null; error?: string }> {
+  const url = (s.url ?? '').trim();
+  if (!url.startsWith(ABB_BASE)) return { ok: false, hash: null, error: 'not an ABB url' };
+  const clearLease = () => env.DB.prepare('UPDATE abb_posts SET detail_claim_by = NULL, detail_claim_until = NULL WHERE url = ?').bind(url).run();
+
+  // The node is handing a page back unfetched (shutting down, backing off).
+  if (s.release) {
+    await clearLease();
+    return { ok: true, hash: null };
+  }
+
+  // A fetch that failed is recorded the same way the cron records one:
+  // detail_fetched_at set so it isn't retried forever, detail_error saying
+  // why, and 'retry-errors' in /admin is what puts it back in the pool.
+  const failed = s.error ? s.error : (s.status != null && (s.status < 200 || s.status >= 300)) ? `HTTP ${s.status}` : null;
+  if (failed || !s.html) {
+    await env.DB.prepare(
+      'UPDATE abb_posts SET detail_fetched_at = ?, detail_error = ?, detail_claim_by = NULL, detail_claim_until = NULL WHERE url = ?',
+    ).bind(Date.now(), failed ?? 'node sent no html', url).run();
+    await bumpNode(env, node, { fetched: 1, errors: 1, note: failed ?? 'no html' });
+    return { ok: false, hash: null, error: failed ?? 'no html' };
+  }
+
+  let hash: string | null = null;
+  try { hash = parseMagnet(url, s.html).infoHash || null; } catch { /* no hash on the page — details still worth keeping */ }
+  const d = parseDetails(url, s.html);
+  await catalogRecordDetails(env, d, hash);
+  if (!hash) await env.DB.prepare('UPDATE abb_posts SET detail_error = ? WHERE url = ?').bind('no info hash on page', url).run();
+  await bumpNode(env, node, { fetched: 1, withHash: hash ? 1 : 0, errors: hash ? 0 : 1, note: null });
+  return { ok: true, hash };
 }
 
 // The home listing is registered on the first tick; categories are

@@ -43,6 +43,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -167,6 +168,16 @@ def to_webp(data, max_px, quality):
 
 # ─── passes ─────────────────────────────────────────────────────────────────
 
+def node_qs(args):
+    """?node=<name> so the shim can attribute the upload in /admin."""
+    return f"?node={urllib.parse.quote(args.node)}" if args.node else ""
+
+
+def shard_qs(args):
+    """Query suffix restricting a pass to this runner's slice of the backlog."""
+    return f"&shard={args.shard}&shards={args.shards}" if args.shards > 1 else ""
+
+
 def sample(sess, args, qualities):
     os.makedirs(args.out, exist_ok=True)
     pending = sess.call(f"/api/admin/abb/catalog/covers/pending?limit={args.sample}")["pending"]
@@ -194,7 +205,7 @@ def one_pass(sess, args, quality, limit):
     done = failed = 0
     t0 = time.time()
     while done + failed < limit:
-        st = sess.call(f"/api/admin/abb/catalog/covers/pending?limit={min(args.batch, limit - done - failed)}")
+        st = sess.call(f"/api/admin/abb/catalog/covers/pending?limit={min(args.batch, limit - done - failed)}{shard_qs(args)}")
         pending = st["pending"]
         if not pending:
             break
@@ -204,7 +215,7 @@ def one_pass(sess, args, quality, limit):
             try:
                 data = fetch_image(p["url"])
                 webp, _dims = to_webp(data, args.max, quality)
-                sess.call(f"/api/admin/abb/catalog/covers/{p['id']}", "PUT", webp, "image/webp")
+                sess.call(f"/api/admin/abb/catalog/covers/{p['id']}{node_qs(args)}", "PUT", webp, "image/webp")
                 return True, len(webp)
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 # Could be our network (lid just opened) rather than the cover: leave it pending.
@@ -255,8 +266,18 @@ def one_pass(sess, args, quality, limit):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--server", required=True, help="shim origin, e.g. https://abs-shim.jderrick.app")
-    ap.add_argument("--user", required=True)
+    # Env defaults so the wharf service (wharf-project/abbcrawl) can be
+    # configured entirely from the project .env with no args in project.toml.
+    ap.add_argument("--server", default=os.environ.get("ABS_SHIM_URL"), help="shim origin, e.g. https://abs-shim.jderrick.app")
+    ap.add_argument("--user", default=os.environ.get("ABS_SHIM_USER"))
+    # Sharding lets several runners share the backlog without doing the same
+    # covers twice: the shim hands back only posts where id % shards == shard.
+    # Defaults are one runner taking everything, which is what the Mac does.
+    # Purely a label: the shim counts covers per node so /admin can show the
+    # laptop's and each wharf node's progress side by side.
+    ap.add_argument("--node", default=os.environ.get("NODE_NAME"), help="name this runner reports as in /admin")
+    ap.add_argument("--shard", type=int, default=int(os.environ.get("ABS_SHIM_SHARD", "0")), help="this runner's index, 0-based")
+    ap.add_argument("--shards", type=int, default=int(os.environ.get("ABS_SHIM_SHARDS", "1")), help="how many runners share the backlog")
     ap.add_argument("--pass", dest="password", default=os.environ.get("ABS_SHIM_PASS"))
     ap.add_argument("--keychain", action="store_true", help="store/read the password in the macOS Keychain (default with --loop)")
     ap.add_argument("--quality", default="30", help="webp quality 1-100; comma-separated list in --sample mode")
@@ -273,6 +294,10 @@ def main():
 
     if not (args.sample or args.upload or args.loop):
         ap.error("pass --upload, --loop, or --sample N to preview quality first")
+    if not args.server or not args.user:
+        ap.error("--server and --user are required (or ABS_SHIM_URL / ABS_SHIM_USER in the environment)")
+    if args.shards < 1 or not (0 <= args.shard < args.shards):
+        ap.error(f"--shard must be 0..{max(args.shards - 1, 0)} with --shards {args.shards}")
     server = args.server.rstrip("/")
     qualities = [int(q) for q in str(args.quality).split(",")]
 
@@ -323,7 +348,8 @@ def main():
         print(f"Finished: {done} cached, {failed} failed.")
         return
 
-    log(f"runner started — quality {quality}, max {args.max}px, pass every {args.every:g} min. Ctrl-C to stop.")
+    shard = f", shard {args.shard + 1}/{args.shards}" if args.shards > 1 else ""
+    log(f"runner started — quality {quality}, max {args.max}px, pass every {args.every:g} min{shard}. Ctrl-C to stop.")
     while True:
         try:
             done, failed = one_pass(sess, args, quality, args.limit)

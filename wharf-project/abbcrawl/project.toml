@@ -1,0 +1,54 @@
+# wharf project "abbcrawl" — AudioBookBay detail-page backfill for ABS_shim.
+#
+# Deployed as an ON-DISK project (not registered handlers): its only unit of
+# work is a supervised long-running service, which lives in project.toml, so
+# there is nothing for the fleet's registered-handler flow to pin. Deploy by
+# copying this directory to /srv/wharf/projects/abbcrawl/ on the node,
+# writing .env, then `wharf reload-projects`.
+#
+# Nodes running it (2026-09-03): stereo-nz, wharf-syd-1. NOT stereo-au — ABB
+# drops that AU consumer range at TCP level (curl never completes the
+# handshake), so it can do this job from no IP it has. Test any new node with
+# a single `curl -A '<browser UA>' https://audiobookbay.lu/` before adding it;
+# do not loop-probe, ABB firewalls bursts.
+#
+# Layout:
+#   handlers/abb-detail-crawler.py   the service (see its docstring)
+#   .env                             SHIM_URL / SHIM_USER / SHIM_PASS / PACE_SECONDS
+name        = "abbcrawl"
+description = "Fetches AudioBookBay detail pages from this node's IP and posts them to the ABS_shim catalogue API for parsing."
+
+# No jobs are ever submitted to this project, so slots only need to cover the
+# service itself.
+[slots]
+total = 1
+
+# A service, not a schedule: the loop is continuous and self-pacing, and a
+# per-minute job would produce ~1400 job rows and log files a day for it.
+# wharfd restarts it across crashes and its own restarts; stdout lands in the
+# journal (journalctl -u wharfd -f).
+[[services]]
+name = "abb-detail-crawler"
+description = "Claims batches of un-fetched ABB posts from the shim, fetches each detail page one every PACE_SECONDS, posts the HTML back."
+command = "python3"
+args = ["handlers/abb-detail-crawler.py"]
+restart = "always"
+env_passthrough = ["SHIM_URL", "SHIM_USER", "SHIM_PASS", "NODE_NAME", "PACE_SECONDS", "BATCH", "IDLE_SLEEP"]
+
+# The cover runner Joseph used to keep open on his laptop (scripts/abb-covers.py
+# in the shim repo, copied here by deploy.sh — one source of truth, and it
+# needs Pillow, hence the venv). Covers come from image hosts (ibb, Amazon,
+# phototourl), never from ABB, so this has nothing to do with the crawler's
+# pacing and the two services don't interact.
+#
+# Both nodes run it, split by ABS_SHIM_SHARD/ABS_SHIM_SHARDS (id % shards),
+# so neither resizes the same cover twice. The backlog is small and bursty —
+# 751 pending on 2026-09-03 against 11,098 already cached — so a pass usually
+# finds nothing and sleeps.
+[[services]]
+name = "abb-covers"
+description = "Downloads catalogue covers, fits them into a 500px webp, PUTs them to the shim for R2 storage. One shard of the backlog per node."
+command = "venv/bin/python3"
+args = ["handlers/abb-covers.py", "--loop", "--every", "15"]
+restart = "always"
+env_passthrough = ["ABS_SHIM_URL", "ABS_SHIM_USER", "ABS_SHIM_PASS", "ABS_SHIM_SHARD", "ABS_SHIM_SHARDS", "NODE_NAME"]
