@@ -67,7 +67,9 @@ export async function streamAudio(
   audio: AudioFileRow,
   req: Request,
 ): Promise<Response> {
+  const t0 = Date.now();
   const stream = await resolveStreamUrl(env, folder, audio);
+  const tLink = Date.now() - t0;
   const provider = folder.provider ?? 'public_url';
 
   if (provider === 'pcloud_oauth') {
@@ -85,6 +87,10 @@ export async function streamAudio(
     } catch {
       upstream = await fetchWithHeaderTimeout(stream.url, fwd);
     }
+    // Cold-path timing for `wrangler tail`: where a slow first byte went
+    // (pCloud link resolution vs pCloud's own TTFB). Pholia's crash logs
+    // showed 8-12 s from loadstart to loadedmetadata on a resume (2026-09-03).
+    console.log(`audio cold ${audio.id} ${range ?? 'full'} link=${tLink}ms ttfb=${Date.now() - t0 - tLink}ms status=${upstream.status}`);
     // Don't pass through pCloud's CORS headers (the Worker already handles
     // CORS for its own origin) and drop Content-Encoding so the runtime
     // doesn't re-encode a stream pCloud already left raw.
