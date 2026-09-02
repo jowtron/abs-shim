@@ -151,10 +151,22 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     <h2>Sign in</h2>
     <p class="muted">Cookie session expired or missing. Sign in to continue.</p>
     <form id="login-form" class="row">
-      <input id="login-username" placeholder="username" autocomplete="username" required />
+      <input id="login-username" placeholder="username" autocomplete="username webauthn" required />
       <input id="login-password" placeholder="password" type="password" autocomplete="current-password" required />
       <button type="submit">Sign in</button>
+      <button type="button" class="secondary" id="login-passkey" style="display:none" title="Face ID / Touch ID / Windows Hello">Sign in with passkey</button>
     </form>
+  </div>
+
+  <div id="passkeys-card" class="card" style="display:none">
+    <h2>Passkeys</h2>
+    <p class="muted" style="margin-top:0">Sign in to this admin page with Face ID, Touch ID or Windows Hello instead of the password. A passkey is tied to this hostname and to the account you're signed in as now.</p>
+    <div id="passkeys-list" class="muted">Loading…</div>
+    <div class="upload-row" style="margin-top:0.5rem">
+      <input type="text" id="passkey-label" placeholder="Label (optional, e.g. iPhone)" style="max-width:16rem" />
+      <button class="secondary" id="passkey-add">Add a passkey for this device</button>
+    </div>
+    <div id="passkeys-status" class="muted" style="font-size:0.85rem"></div>
   </div>
 
   <div id="abb-card" class="card" style="display:none">
@@ -348,11 +360,15 @@ function showLoginForm() {
   document.getElementById('members-card').style.display = 'none';
   document.getElementById('all-users-card').style.display = 'none';
   document.getElementById('household-card').style.display = 'none';
+  document.getElementById('passkeys-card').style.display = 'none';
   document.getElementById('signout').style.display = 'none';
+  passkeyOfferLogin();
 }
 
 function hideLoginForm() {
   document.getElementById('login-card').style.display = 'none';
+  document.getElementById('passkeys-card').style.display = '';
+  passkeysLoad();
   document.getElementById('connections-card').style.display = '';
   document.getElementById('libraries-card').style.display = '';
   document.getElementById('cover-cache-card').style.display = '';
@@ -433,6 +449,134 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
     showError(err.message);
   }
 });
+
+// ─── Passkeys (WebAuthn) ────────────────────────────────────────────────────
+// Server side is src/routes/passkeys.ts (a port of Pholia's). Only offered
+// where the browser has a platform authenticator (Face ID / Touch ID / Hello).
+
+function b64uToBytes(s) {
+  const b = s.replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(b + '='.repeat((4 - (b.length % 4)) % 4));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function bytesToB64u(bytes) {
+  let bin = '';
+  const arr = new Uint8Array(bytes);
+  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function passkeyAvailable() {
+  if (!window.PublicKeyCredential) return false;
+  try { return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable(); } catch { return false; }
+}
+
+async function passkeyOfferLogin() {
+  const btn = document.getElementById('login-passkey');
+  btn.style.display = (await passkeyAvailable()) ? '' : 'none';
+}
+
+async function passkeySignIn() {
+  const btn = document.getElementById('login-passkey');
+  btn.disabled = true;
+  try {
+    const optsRes = await fetch('/api/auth/passkey/authenticate-options', { method: 'POST', credentials: 'include' });
+    if (!optsRes.ok) throw new Error('HTTP ' + optsRes.status);
+    const opts = await optsRes.json();
+    const cred = await navigator.credentials.get({ publicKey: {
+      challenge: b64uToBytes(opts.challenge).buffer, rpId: opts.rpId, allowCredentials: [],
+      userVerification: opts.userVerification, timeout: opts.timeout,
+    } });
+    if (!cred) throw new Error('No passkey chosen');
+    const r = cred.response;
+    const res = await fetch('/api/auth/passkey/authenticate', {
+      method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: cred.id, type: cred.type, response: {
+        authenticatorData: bytesToB64u(r.authenticatorData), clientDataJSON: bytesToB64u(r.clientDataJSON), signature: bytesToB64u(r.signature),
+      } }),
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'HTTP ' + res.status);
+    hideLoginForm();
+    refresh();
+  } catch (e) {
+    showError('Passkey sign-in failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function passkeysLoad() {
+  const list = document.getElementById('passkeys-list');
+  const add = document.getElementById('passkey-add');
+  if (!(await passkeyAvailable())) {
+    list.textContent = 'This browser has no platform authenticator (Face ID / Touch ID / Windows Hello), so passkeys can\'t be added from here.';
+    add.disabled = true;
+    return;
+  }
+  try {
+    const r = await api('/api/auth/passkey/list');
+    list.innerHTML = '';
+    if (!r.passkeys.length) { list.textContent = 'No passkeys yet for this account.'; return; }
+    for (const p of r.passkeys) {
+      const row = document.createElement('div');
+      row.className = 'upload-item';
+      row.innerHTML = '<span class="name"></span><span class="status"></span>';
+      row.querySelector('.name').textContent = p.label || 'Passkey';
+      row.querySelector('.status').textContent = ' · added ' + new Date(p.createdAt).toLocaleDateString() + (p.lastUsedAt ? ', last used ' + abbAgo(p.lastUsedAt) : '');
+      const del = document.createElement('button');
+      del.className = 'secondary row-btn';
+      del.textContent = 'Remove';
+      del.addEventListener('click', async () => {
+        if (!confirm('Remove this passkey? You can still sign in with the password.')) return;
+        await api('/api/auth/passkey/' + encodeURIComponent(p.id), { method: 'DELETE' });
+        passkeysLoad();
+      });
+      row.appendChild(del);
+      list.appendChild(row);
+    }
+  } catch (e) {
+    list.textContent = 'Couldn\'t load passkeys: ' + e.message;
+  }
+}
+
+async function passkeyRegister() {
+  const st = document.getElementById('passkeys-status');
+  const btn = document.getElementById('passkey-add');
+  btn.disabled = true;
+  st.textContent = '';
+  try {
+    const opts = await api('/api/auth/passkey/register-options', { method: 'POST' });
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: b64uToBytes(opts.challenge).buffer,
+      rp: opts.rp,
+      user: { id: b64uToBytes(opts.user.id).buffer, name: opts.user.name, displayName: opts.user.displayName },
+      pubKeyCredParams: opts.pubKeyCredParams,
+      authenticatorSelection: opts.authenticatorSelection,
+      excludeCredentials: (opts.excludeCredentials || []).map((c) => ({ ...c, id: b64uToBytes(c.id).buffer })),
+      timeout: opts.timeout,
+      attestation: opts.attestation,
+    } });
+    if (!cred) throw new Error('No credential returned');
+    const r = cred.response;
+    const out = await api('/api/auth/passkey/register', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: cred.id, type: cred.type, label: document.getElementById('passkey-label').value,
+        response: { attestationObject: bytesToB64u(r.attestationObject), clientDataJSON: bytesToB64u(r.clientDataJSON) } }),
+    });
+    st.textContent = 'Added passkey "' + out.label + '". Next time, use "Sign in with passkey".';
+    document.getElementById('passkey-label').value = '';
+    passkeysLoad();
+  } catch (e) {
+    st.textContent = 'Couldn\'t add a passkey: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('login-passkey').addEventListener('click', passkeySignIn);
+document.getElementById('passkey-add').addEventListener('click', passkeyRegister);
 
 function showError(msg) {
   const el = document.getElementById('error-banner');

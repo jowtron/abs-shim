@@ -16,6 +16,7 @@ import { itemRoutes } from './routes/items';
 import { authorRoutes } from './routes/authors';
 import { adminRoutes } from './routes/admin';
 import { abbRoutes } from './routes/abb';
+import { passkeyRoutes } from './routes/passkeys';
 import { runCatalogTick } from './lib/abb-catalog';
 import { signupRoutes } from './routes/signup';
 import { renderSignupHtml } from './lib/signup-html';
@@ -433,6 +434,7 @@ app.get('/api/me/listening-sessions', requireAuth, async (c) => {
 app.route('/api/libraries', libraryRoutes);
 app.route('/api/items', itemRoutes);
 app.route('/api/authors', authorRoutes);
+app.route('/api/auth/passkey', passkeyRoutes);
 app.route('/api/admin/abb', abbRoutes);
 app.route('/api/admin', adminRoutes);
 
