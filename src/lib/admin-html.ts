@@ -1311,9 +1311,12 @@ function abbRenderResults(results, out) {
         img.className = 'abb-cover'; img.alt = ''; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
         img.src = res.cover;
         img.addEventListener('error', () => { img.style.visibility = 'hidden'; });
-        // Tap the thumbnail → the full-size source image in a lightbox.
+        // Tap the thumbnail → the full-size linked image in a lightbox (the
+        // cached webp if that host is gone). A dead host on the thumbnail
+        // itself falls back the other way.
         img.dataset.full = res.coverOrig || res.cover;
-        img.addEventListener('click', () => abbLightbox(img.dataset.full));
+        img.addEventListener('click', () => abbLightbox(img.dataset.full, res.coverCached ? res.cover : null));
+        if (res.coverOrig && res.coverCached) img.addEventListener('error', () => { if (img.src !== res.coverOrig) img.src = res.coverOrig; }, { once: true });
         tr.children[0].appendChild(img);
       }
       tr.children[1].innerHTML = '<span class="abb-title" role="button" title="Show description"></span><a class="abb-ext" target="_blank" rel="noopener" title="Open on AudioBookBay">↗</a><div class="abb-sub"></div>';
@@ -1365,13 +1368,14 @@ function abbRenderResults(results, out) {
   }
 }
 
-function abbLightbox(src) {
+function abbLightbox(src, fallback) {
   if (!src) return;
   const box = document.createElement('div');
   box.className = 'abb-lightbox';
   const img = document.createElement('img');
   img.alt = '';
   img.referrerPolicy = 'no-referrer';
+  if (fallback && fallback !== src) img.addEventListener('error', () => { img.src = fallback; }, { once: true });
   img.src = src;
   box.appendChild(img);
   const close = () => { box.remove(); document.removeEventListener('keydown', onKey); };
