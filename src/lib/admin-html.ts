@@ -1738,13 +1738,35 @@ async function audibleLoadLibrary(refresh, live) {
   }
 }
 
+// Three groups: titles still to back up (open), already backed up and
+// not-downloadable (collapsed, with counts) — so the list is the to-do list.
 function audibleDrawLibrary() {
   const out = document.getElementById('audible-library');
   const q = document.getElementById('audible-filter').value.trim().toLowerCase();
   out.innerHTML = '';
+  const items = audibleItems.filter((i) => !q || ((i.title || '') + ' ' + (i.authors || []).join(' ') + ' ' + (i.series || '')).toLowerCase().includes(q));
+  const groups = [
+    { label: 'To back up', open: true, items: items.filter((i) => !i.synced && i.downloadable !== false && i.content_type !== 'Podcast') },
+    { label: 'Backed up', open: false, items: items.filter((i) => i.synced) },
+    { label: 'Not downloadable', open: false, items: items.filter((i) => !i.synced && (i.downloadable === false || i.content_type === 'Podcast')) },
+  ];
+  for (const g of groups) {
+    if (!g.items.length) continue;
+    const det = document.createElement('details');
+    det.open = g.open || !!q;
+    const sum = document.createElement('summary');
+    sum.style.cursor = 'pointer';
+    sum.textContent = g.label + ' (' + g.items.length + ')';
+    det.appendChild(sum);
+    det.appendChild(audibleTable(g.items));
+    out.appendChild(det);
+  }
+  if (!items.length) out.innerHTML = '<p class="muted">No titles match.</p>';
+}
+
+function audibleTable(items) {
   const table = document.createElement('table');
   const tb = document.createElement('tbody');
-  const items = audibleItems.filter((i) => !q || ((i.title || '') + ' ' + (i.authors || []).join(' ') + ' ' + (i.series || '')).toLowerCase().includes(q));
   for (const it of items) {
     const tr = document.createElement('tr');
     tr.innerHTML = '<td style="width:1.5rem"><input type="checkbox"></td><td style="width:40px"></td><td><div class="aud-title"></div><div class="aud-sub"></div></td><td style="width:1%; white-space:nowrap"></td>';
@@ -1773,8 +1795,7 @@ function audibleDrawLibrary() {
     tb.appendChild(tr);
   }
   table.appendChild(tb);
-  out.appendChild(table);
-  if (!items.length) out.innerHTML = '<p class="muted">No titles match.</p>';
+  return table;
 }
 
 async function audibleSync(asins) {
