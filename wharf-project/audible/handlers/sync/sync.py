@@ -130,7 +130,8 @@ def run_download(cmd, timeout):
     return p.returncode, "\n".join(tail)
 
 
-RCLONE_STATS_RE = re.compile(r"Transferred:\s*([\d.]+\s*[KMGT]?i?B?)\s*/\s*([\d.]+\s*[KMGT]?i?B?),\s*(\d+)%,\s*([\d.]+\s*[KMGT]?i?B/s),\s*ETA\s*(\S+)")
+# --stats-one-line prints "123 MiB / 797 MiB, 15%, 1.2 MiB/s, ETA 8m" (no "Transferred:" label).
+RCLONE_STATS_RE = re.compile(r"([\d.]+\s*[KMGT]?i?B?)\s*/\s*([\d.]+\s*[KMGT]?i?B?),\s*(\d+)%,\s*([\d.]+\s*[KMGT]?i?B/s),\s*ETA\s*(\S+)")
 
 
 def run_rclone(args, timeout, label):
