@@ -148,7 +148,15 @@ def fetch_image(url):
 def to_webp(data, max_px, quality):
     im = Image.open(io.BytesIO(data))
     im.load()
-    if im.mode not in ("RGB", "L"):
+    # Palette PNGs with transparency must go via RGBA (Pillow warns otherwise);
+    # any alpha is flattened onto white so the webp stays opaque and small.
+    if im.mode == "P":
+        im = im.convert("RGBA")
+    if im.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.getchannel("A"))
+        im = bg
+    elif im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
     if im.width > max_px or im.height > max_px:   # downscale only, never upscale
         im.thumbnail((max_px, max_px), Image.LANCZOS)
