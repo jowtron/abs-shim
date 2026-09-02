@@ -1691,14 +1691,28 @@ async function abbGrab(res, folderId, listEl) {
     }
     const plan = abbPlanDest(m.folderName, chosen);
     row.setStatus('Adding ' + plan.length + ' torrent(s) to Real-Debrid…');
-    // One torrent per file, a few at a time — RD caps active torrents and
-    // each add costs ~10 API calls.
+    // One torrent per file, two at a time — RD caps active torrents, each
+    // add costs ~10 API calls, and four in parallel drew a 429 (2026-09-02).
+    // A failed add gets its own Retry, which re-adds just that file and
+    // tracks it to the library on its own.
     const torrents = [];
-    for (let i = 0; i < plan.length; i += 4) {
-      const batch = plan.slice(i, i + 4);
-      const added = await Promise.all(batch.map((p) => abbAddTorrent(m.magnet, p.id).then((a) => ({ ...a, dest: p.dest })).catch((e) => ({ error: e.message, dest: p.dest }))));
+    const retryAdd = (p) => {
+      const r = appendUploadRow(listEl, '  ↳ ' + p.dest, '');
+      const retry = () => {
+        r.setStatus('Adding to Real-Debrid…');
+        abbAddTorrent(m.magnet, p.id)
+          .then((a) => { removeBtn(); return abbTrackTorrents([{ id: a.id, dest: p.dest }], folderId, listEl, r); })
+          .then(() => abbLoadRdList())
+          .catch((e) => r.fail('Add failed: ' + e.message));
+      };
+      let removeBtn = r.addButton('Retry', retry);
+      return r;
+    };
+    for (let i = 0; i < plan.length; i += 2) {
+      const batch = plan.slice(i, i + 2);
+      const added = await Promise.all(batch.map((p) => abbAddTorrent(m.magnet, p.id).then((a) => ({ ...a, dest: p.dest, plan: p })).catch((e) => ({ error: e.message, dest: p.dest, plan: p }))));
       for (const a of added) {
-        if (a.error) appendUploadRow(listEl, '  ↳ ' + a.dest, '').fail('Add failed: ' + a.error);
+        if (a.error) retryAdd(a.plan).fail('Add failed: ' + a.error);
         else torrents.push({ id: a.id, dest: a.dest });
       }
       row.setStatus('Added ' + torrents.length + ' / ' + plan.length + ' torrent(s)…');

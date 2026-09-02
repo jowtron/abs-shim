@@ -23,17 +23,31 @@ export type RdTorrentInfo = {
 };
 export type RdUnrestricted = { download: string; filename: string; filesize: number; mimeType?: string };
 
+// RD rate-limits per API key (429 too_many_requests) and a multi-file grab
+// adds several torrents in parallel at ~10 calls each — the 2026-09-02
+// Percy Jackson grab lost one of five files to exactly that. So a 429 (or
+// a transient 5xx) is retried with a growing pause before it surfaces.
+const RETRY_WAITS_MS = [1500, 3000, 6000];
+
 async function rd<T>(token: string, method: string, path: string, body?: Record<string, string>): Promise<T> {
   const init: RequestInit = { method, headers: { Authorization: `Bearer ${token}` } };
   if (body) {
     init.headers = { ...(init.headers as Record<string, string>), 'Content-Type': 'application/x-www-form-urlencoded' };
     init.body = new URLSearchParams(body);
   }
-  const resp = await fetch(RD_BASE + path, init);
-  if (resp.status === 204) return {} as T;
-  const data = await resp.json().catch(() => ({})) as { error?: string };
-  if (!resp.ok) throw new Error(`Real-Debrid ${resp.status}: ${data.error ?? resp.statusText}`);
-  return data as T;
+  for (let attempt = 0; ; attempt++) {
+    const resp = await fetch(RD_BASE + path, init);
+    if (resp.status === 204) return {} as T;
+    const data = await resp.json().catch(() => ({})) as { error?: string };
+    if (resp.ok) return data as T;
+    const wait = RETRY_WAITS_MS[attempt];
+    if (wait != null && (resp.status === 429 || resp.status === 502 || resp.status === 503)) {
+      const ra = Number(resp.headers.get('Retry-After'));
+      await new Promise((res) => setTimeout(res, Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 10_000) : wait));
+      continue;
+    }
+    throw new Error(`Real-Debrid ${resp.status}: ${data.error ?? resp.statusText}`);
+  }
 }
 
 export const rdUser = (token: string) => rd<{ username: string; premium: number; expiration: string; type: string }>(token, 'GET', '/user');
