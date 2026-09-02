@@ -23,6 +23,7 @@ is ~600 MB and Audible throttles, so budget minutes per title.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -86,6 +87,47 @@ def write_ffmeta(path, item, chapters):
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+PROGRESS_RE = re.compile(r"(\d{1,3})%\|[^|]*\|\s*([\d.]+\s*[KMGT]?i?B?)/([\d.]+\s*[KMGT]?i?B?)(?:\s*\[([^\]]*)\])?")
+
+
+def run_download(cmd, timeout):
+    """Run audible-cli's download with its progress bar on, and turn the
+    bar's redraws (\r-separated on stderr) into one log line every ~10 s or
+    5 %: "  42% · 252 MB / 600 MB · 8.7MB/s, 00:40 left". Returns
+    (returncode, tail_of_output)."""
+    p = subprocess.Popen(cmd, cwd=str(L.PROJECT), env=L.env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    tail, buf, last_t, last_pct = [], "", 0.0, -100
+    deadline = time.time() + timeout
+    while True:
+        ch = p.stdout.read(1)
+        if ch == "":
+            break
+        if ch in "\r\n":
+            line, buf = buf.strip(), ""
+            if not line:
+                continue
+            m = PROGRESS_RE.search(line)
+            if m:
+                pct = int(m.group(1))
+                now = time.time()
+                if pct >= last_pct + 5 or now - last_t >= 10 or pct == 100:
+                    extra = (m.group(4) or "").strip()
+                    rate = extra.split(",")[-1].strip() if "," in extra else extra
+                    eta = extra.split("<")[1].split(",")[0] if "<" in extra else ""
+                    L.log(f"  {pct:3d}% · {m.group(2).strip()} / {m.group(3).strip()}" + (f" · {rate}" if rate else "") + (f", {eta} left" if eta else ""))
+                    last_t, last_pct = now, pct
+            else:
+                tail.append(line)
+                tail = tail[-30:]
+        else:
+            buf += ch
+        if time.time() > deadline:
+            p.kill()
+            raise subprocess.TimeoutExpired(cmd, timeout)
+    p.wait()
+    return p.returncode, "\n".join(tail)
+
+
 def activation_bytes(account):
     r = L.run(["audible", "-P", account, "activation-bytes"], timeout=120)
     if r.returncode != 0:
@@ -103,14 +145,14 @@ def sync_one(account, item, dest_root, quality):
     work.mkdir(parents=True)
     L.log(f"[{asin}] downloading “{item.get('title')}”…")
     cmd = ["audible", "-P", account, "download", "--asin", asin, "--aax-fallback", "--cover", "--cover-size", "1215",
-           "--chapter", "--chapter-type", "flat", "-q", quality, "-o", str(work), "-y", "--no-progress",
+           "--chapter", "--chapter-type", "flat", "-q", quality, "-o", str(work), "-y",
            "--filename-mode", "asin_ascii", "--timeout", "120"]
-    r = L.run(cmd, timeout=DOWNLOAD_TIMEOUT)
+    rc, out_tail = run_download(cmd, DOWNLOAD_TIMEOUT)
     audio = [p for p in work.iterdir() if p.suffix.lower() in AUDIO_EXTS]
-    if r.returncode != 0 and not audio:
-        raise RuntimeError(f"download failed: {(r.stderr or r.stdout).strip()[-400:]}")
+    if rc != 0 and not audio:
+        raise RuntimeError(f"download failed: {out_tail[-400:]}")
     if not audio:
-        raise RuntimeError("download produced no audio file: " + (r.stdout or "").strip()[-300:])
+        raise RuntimeError("download produced no audio file: " + out_tail[-300:])
     src = audio[0]
     size_mb = src.stat().st_size / 1024 / 1024
     L.log(f"[{asin}] got {src.name} ({size_mb:.0f} MB); decrypting…")
