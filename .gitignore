@@ -14,3 +14,7 @@ dist/
 
 # wrangler r2 object get without --file/--pipe drops files in cwd.
 covers/
+
+# Python bytecode (scripts/)
+__pycache__/
+*.pyc
