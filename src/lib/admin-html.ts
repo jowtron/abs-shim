@@ -69,7 +69,13 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     .upload-row input[type=text] { flex: 1; min-width: 160px; }
     .upload-item { padding: 0.4rem 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 4px; margin: 0.25rem 0; font-size: 0.85rem; }
     .upload-item .name { font-weight: 500; word-break: break-all; }
-    .upload-item .row-btn { float: right; padding: 0.1rem 0.5rem; font-size: 0.75rem; margin-left: 0.5rem; }
+    /* Name + status wrap; the buttons sit in their own flex cell so they stay
+       on the row's right edge on a phone instead of floating under the
+       progress bar wherever the wrapped text left room. */
+    .upload-item .head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.2rem 0.5rem; }
+    .upload-item .head .actions { margin-left: auto; display: flex; gap: 0.35rem; flex-shrink: 0; }
+    .upload-item .head .actions:empty { display: none; }
+    .upload-item .row-btn { padding: 0.1rem 0.5rem; font-size: 0.75rem; }
     .spinner { display: inline-block; width: 0.8em; height: 0.8em; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: -0.1em; margin-right: 0.4em; }
     @keyframes spin { to { transform: rotate(360deg); } }
     .abb-cover { width: 44px; height: 44px; object-fit: cover; border-radius: 4px; background: var(--border); display: block; }
@@ -128,7 +134,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     .upload-item.ok { border-color: var(--ok); }
     .upload-item.ok .progress-bar > span { background: var(--ok); }
     .upload-item.err { border-color: var(--warn); }
-    .upload-item .status { color: var(--muted); margin-left: 0.5rem; }
+    .upload-item .status { color: var(--muted); }
     .upload-item.ok .status { color: var(--ok); }
     .upload-item.err .status { color: var(--warn); }
     .books-list { margin-top: 0.5rem; padding: 0.5rem; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; }
@@ -1816,7 +1822,10 @@ async function audibleSync(asins) {
   }
 }
 
-const audibleWatching = new Map();
+const audibleLogOpen = new Map(); // job id → the user's Log toggle (unset = open while the job runs)
+const audibleLogEls = new Map();  // job id → the log <div> currently in the DOM
+let audibleJobsAutoOpened = false;
+let audiblePollTimer = null;
 
 async function audibleLoadJobs() {
   const list = document.getElementById('audible-jobs-list');
@@ -1824,19 +1833,32 @@ async function audibleLoadJobs() {
   try {
     const r = await api('/api/admin/audible/jobs');
     list.innerHTML = '';
-    const active = r.jobs.filter((j) => j.state === 'running' || j.state === 'pending').length;
-    count.textContent = r.jobs.length ? '(' + active + ' active)' : '';
+    audibleLogEls.clear();
+    const activeJobs = r.jobs.filter((j) => j.state === 'running' || j.state === 'pending');
+    count.textContent = r.jobs.length ? '(' + activeJobs.length + ' active)' : '';
     // A sync in progress is the thing you came back to look at: open the
-    // section on (re)load instead of leaving it collapsed.
-    if (active) document.getElementById('audible-jobs').open = true;
-    if (!r.jobs.length) { list.textContent = 'No sync jobs yet.'; return; }
+    // section the first time one shows up — but only once, or closing it by
+    // hand gets undone by the next 20 s refresh.
+    if (activeJobs.length && !audibleJobsAutoOpened) { document.getElementById('audible-jobs').open = true; audibleJobsAutoOpened = true; }
+    if (!r.jobs.length) { list.textContent = 'No sync jobs yet.'; audibleWatch([]); return; }
     for (const j of r.jobs) {
+      const running = j.state === 'running' || j.state === 'pending';
       const row = appendUploadRow(list, j.account + ': ' + (j.count === 'all' ? 'everything' : j.count + ' title' + (j.count === 1 ? '' : 's')) + ' · ' + new Date(j.startedAt).toLocaleString(), j.state);
       const log = document.createElement('div');
       log.className = 'aud-log';
-      log.style.display = 'none';
-      row.addButton('Log', () => { log.style.display = log.style.display === 'none' ? '' : 'none'; if (log.style.display === '') audibleTailLog(j.id, log); });
+      // The list is rebuilt every 20 s while a job runs; remember the
+      // user's Log choice per job so the panel doesn't pop open and shut.
+      const show = audibleLogOpen.has(j.id) ? audibleLogOpen.get(j.id) : running;
+      log.style.display = show ? '' : 'none';
+      audibleLogEls.set(j.id, log);
+      row.addButton('Log', () => {
+        const open = log.style.display === 'none';
+        log.style.display = open ? '' : 'none';
+        audibleLogOpen.set(j.id, open);
+        if (open) audibleTailLog(j.id, log, running ? j : undefined);
+      });
       list.appendChild(log);
+      if (show) audibleTailLog(j.id, log, running ? j : undefined);
       if (j.state === 'succeeded') {
         const res = j.result || {};
         row.complete('Done: ' + (res.done || []).length + ' backed up, ' + (res.failed || []).length + ' failed, ' + (res.skipped || []).length + ' already there');
@@ -1846,19 +1868,30 @@ async function audibleLoadJobs() {
       } else {
         row.setStatus(j.state + '…');
         row.addButton('Cancel', async () => { await api('/api/admin/audible/jobs/' + encodeURIComponent(j.id) + '/cancel', { method: 'POST' }); audibleLoadJobs(); });
-        if (!audibleWatching.has(j.id)) {
-          // While a job runs: the log every 5 s (progress lines from the
-          // download), the job list every 20 s (state changes).
-          log.style.display = '';
-          audibleTailLog(j.id, log);
-          const logTimer = setInterval(() => audibleTailLog(j.id, log, j), 5000);
-          audibleWatching.set(j.id, setTimeout(() => { clearInterval(logTimer); audibleWatching.delete(j.id); audibleLoadJobs(); }, 20000));
-        }
       }
     }
+    audibleWatch(activeJobs);
   } catch (e) {
     list.textContent = 'Couldn\'t load jobs: ' + e.message;
   }
+}
+
+// One poll for every running job: the open logs every 5 s (progress lines
+// from the download / upload), the job list every 20 s (state changes). It
+// looks the log element up by job id on each tick, so a rebuilt list keeps
+// being tailed instead of leaving a timer pointed at a detached <div>.
+function audibleWatch(activeJobs) {
+  if (audiblePollTimer) { clearInterval(audiblePollTimer); audiblePollTimer = null; }
+  if (!activeJobs.length) return;
+  let ticks = 0;
+  audiblePollTimer = setInterval(() => {
+    ticks++;
+    if (ticks % 4 === 0) { audibleLoadJobs(); return; }
+    for (const j of activeJobs) {
+      const el = audibleLogEls.get(j.id);
+      if (el && el.isConnected && el.style.display !== 'none') audibleTailLog(j.id, el, j);
+    }
+  }, 5000);
 }
 
 const audibleLanded = new Map(); // job id → books seen landing (from "done →" log lines)
@@ -1866,8 +1899,10 @@ const audibleLanded = new Map(); // job id → books seen landing (from "done �
 async function audibleTailLog(id, el, job) {
   try {
     const r = await api('/api/admin/audible/jobs/' + encodeURIComponent(id) + '/log?tail=4000');
-    el.textContent = (r.content || '').replace(/^ERR: /gm, '').trim() || '(no output yet)';
-    el.scrollTop = el.scrollHeight;
+    const text = (r.content || '').replace(/^ERR: /gm, '').trim() || '(no output yet)';
+    // Only re-render (and snap to the bottom) when something new arrived,
+    // so scrolling up through the log isn't undone every 5 s.
+    if (el.textContent !== text) { el.textContent = text; el.scrollTop = el.scrollHeight; }
     // Scan the library as each book lands (the handler logs "done →" per
     // title), not only when the whole job ends — so they show up one by one.
     if (job) {
@@ -2718,7 +2753,7 @@ function appendUploadRow(listEl, name, initialStatus) {
   const el = document.createElement('div');
   el.className = 'upload-item';
   el.innerHTML =
-    '<span class="name"></span><span class="status"></span>' +
+    '<div class="head"><span class="name"></span><span class="status"></span><span class="actions"></span></div>' +
     '<div class="progress-bar"><span></span></div>';
   el.querySelector('.name').textContent = name;
   el.querySelector('.status').textContent = initialStatus ? ' · ' + initialStatus : '';
@@ -2748,7 +2783,7 @@ function appendUploadRow(listEl, name, initialStatus) {
       b.className = 'secondary row-btn';
       b.textContent = label;
       b.addEventListener('click', onClick);
-      el.appendChild(b);
+      el.querySelector('.actions').appendChild(b);
       return () => b.remove();
     },
   };
