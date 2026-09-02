@@ -159,26 +159,24 @@ export const ADMIN_HTML = String.raw`<!doctype html>
   </div>
 
   <div id="passkeys-card" class="card" style="display:none">
-    <h2>Passkeys</h2>
-    <p class="muted" style="margin-top:0">Sign in to this admin page with Face ID, Touch ID or Windows Hello instead of the password. A passkey is tied to this hostname and to the account you're signed in as now.</p>
+    <details id="passkeys-details">
+    <summary style="cursor:pointer; font-weight:600">🔑 Passkeys <span id="passkeys-count" class="muted" style="font-weight:normal"></span></summary>
+    <p class="muted" style="margin-top:0.5rem">Sign in to this admin page with Face ID, Touch ID or Windows Hello instead of the password. A passkey is tied to this hostname and to the account you're signed in as now.</p>
     <div id="passkeys-list" class="muted">Loading…</div>
     <div class="upload-row" style="margin-top:0.5rem">
       <input type="text" id="passkey-label" placeholder="Label (optional, e.g. iPhone)" style="max-width:16rem" />
       <button class="secondary" id="passkey-add">Add a passkey for this device</button>
     </div>
     <div id="passkeys-status" class="muted" style="font-size:0.85rem"></div>
+    </details>
   </div>
 
   <div id="abb-card" class="card" style="display:none">
     <h2>AudioBookBay → Real-Debrid</h2>
-    <p class="muted" style="margin-top:0">Search AudioBookBay, send a release to Real-Debrid, and have pCloud fetch the finished files straight into a library. Multi-file releases are added one file at a time so nothing arrives as a rar.</p>
+    <p class="muted" style="margin-top:0">Search AudioBookBay, send a release to Real-Debrid, and have pCloud fetch the finished files straight into a library. Multi-file releases are added one file at a time so nothing arrives as a rar. No AudioBookBay account is needed: the info hash is public and that's all Real-Debrid wants.</p>
     <details id="abb-settings">
-      <summary>Accounts</summary>
+      <summary>Real-Debrid account</summary>
       <div class="upload-row" style="margin-top:0.5rem">
-        <input type="text" id="abb-user" placeholder="AudioBookBay username" autocomplete="off" />
-        <input type="password" id="abb-pass" placeholder="AudioBookBay password" autocomplete="new-password" />
-      </div>
-      <div class="upload-row">
         <input type="password" id="abb-rd" placeholder="Real-Debrid API token (real-debrid.com/apitoken)" autocomplete="new-password" />
         <button id="abb-save">Save</button>
         <button class="secondary" id="abb-test">Test</button>
@@ -518,6 +516,9 @@ async function passkeysLoad() {
   try {
     const r = await api('/api/auth/passkey/list');
     list.innerHTML = '';
+    document.getElementById('passkeys-count').textContent = r.passkeys.length ? '(' + r.passkeys.length + ')' : '(none yet — set one up)';
+    // Stays expanded until the account has a passkey; a key icon after that.
+    if (!document.getElementById('passkeys-details').dataset.touched) document.getElementById('passkeys-details').open = !r.passkeys.length;
     if (!r.passkeys.length) { list.textContent = 'No passkeys yet for this account.'; return; }
     for (const p of r.passkeys) {
       const row = document.createElement('div');
@@ -576,6 +577,7 @@ async function passkeyRegister() {
 }
 
 document.getElementById('login-passkey').addEventListener('click', passkeySignIn);
+document.getElementById('passkeys-details').addEventListener('toggle', (ev) => { ev.target.dataset.touched = '1'; });
 document.getElementById('passkey-add').addEventListener('click', passkeyRegister);
 
 function showError(msg) {
@@ -1342,20 +1344,18 @@ async function abbLoadSettings() {
   const st = document.getElementById('abb-settings-status');
   try {
     const s = await api('/api/admin/abb/settings');
-    document.getElementById('abb-user').value = s.abbUsername || '';
-    document.getElementById('abb-pass').placeholder = s.abbPasswordSet ? 'AudioBookBay password (saved — leave blank to keep)' : 'AudioBookBay password';
     document.getElementById('abb-rd').placeholder = s.rdTokenSet ? 'Real-Debrid API token (saved — leave blank to keep)' : 'Real-Debrid API token (real-debrid.com/apitoken)';
     if (!s.canEdit) {
-      for (const id of ['abb-user', 'abb-pass', 'abb-rd', 'abb-save']) document.getElementById(id).disabled = true;
-      st.textContent = 'Only the tenant owner can change these accounts.';
+      for (const id of ['abb-rd', 'abb-save']) document.getElementById(id).disabled = true;
+      st.textContent = 'Only the tenant owner can change this.';
     } else if (s.encryptionConfigured === false) {
       document.getElementById('abb-settings').open = true;
       st.textContent = 'The server has no SETTINGS_KEY secret, so credentials can\'t be stored. Run: openssl rand -base64 32 | npx wrangler secret put SETTINGS_KEY';
     } else if (!s.rdTokenSet) {
       document.getElementById('abb-settings').open = true;
-      st.textContent = 'Add a Real-Debrid API token to grab releases. The AudioBookBay login is optional (needed only for member-only pages).';
+      st.textContent = 'Add a Real-Debrid API token to grab releases.';
     } else {
-      st.textContent = 'Real-Debrid token saved' + (s.abbUsername ? ', AudioBookBay login saved as ' + s.abbUsername : '') + '.';
+      st.textContent = 'Real-Debrid token saved.';
     }
   } catch (e) {
     st.textContent = 'Could not load settings: ' + e.message;
@@ -1370,13 +1370,11 @@ async function abbSaveSettings() {
     await api('/api/admin/abb/settings', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        abbUsername: document.getElementById('abb-user').value,
-        abbPassword: document.getElementById('abb-pass').value,
-        rdToken: document.getElementById('abb-rd').value,
-      }),
+      // Only the Real-Debrid token; the ABB login fields were dropped from the
+      // UI on 2026-09-02 (the hash is public, a member login adds nothing).
+      // Blank fields are left alone server-side, so any stored login stays.
+      body: JSON.stringify({ rdToken: document.getElementById('abb-rd').value }),
     });
-    document.getElementById('abb-pass').value = '';
     document.getElementById('abb-rd').value = '';
     st.textContent = 'Saved.';
     await abbLoadSettings();
