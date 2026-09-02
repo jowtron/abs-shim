@@ -1721,7 +1721,8 @@ async function audibleLoadLibrary(refresh) {
     audibleItems = r.items || [];
     audibleSelected = new Set();
     const synced = audibleItems.filter((i) => i.synced).length;
-    st.textContent = audibleItems.length + ' titles, ' + synced + ' backed up' + (r.fetched_at ? ' · library as of ' + new Date(r.fetched_at).toLocaleString() : '');
+    const nodl = audibleItems.filter((i) => !i.synced && (i.downloadable === false || i.content_type === 'Podcast')).length;
+    st.textContent = audibleItems.length + ' titles, ' + synced + ' backed up' + (nodl ? ', ' + nodl + ' not downloadable' : '') + (r.fetched_at ? ' · library as of ' + new Date(r.fetched_at).toLocaleString() : '');
     if (!audibleItems.length && !refresh) { out.innerHTML = '<p class="muted">Library not fetched yet.</p>'; audibleLoadLibrary(true); return; }
     audibleDrawLibrary();
   } catch (e) {
@@ -1748,6 +1749,14 @@ function audibleDrawLibrary() {
     tr.querySelector('.aud-sub').textContent = [(it.authors || []).join(', '), (it.narrators || []).length ? 'read by ' + it.narrators.join(', ') : null, it.series ? it.series + (it.series_sequence ? ' #' + it.series_sequence : '') : null, hrs, it.purchase_date ? 'bought ' + it.purchase_date.slice(0, 10) : null].filter(Boolean).join(' · ');
     if (it.synced) { const s = document.createElement('span'); s.className = 'aud-synced'; s.textContent = '✓ backed up'; s.title = it.synced.path; tr.children[3].appendChild(s); }
     else if (it.content_type === 'Podcast') { tr.children[3].innerHTML = '<span class="muted" style="font-size:0.8rem">podcast</span>'; cb.disabled = true; }
+    else if (it.downloadable === false) {
+      // Audible's customer_rights says streaming-only (Originals marked
+      // "Performance", episodic "Show"s, Plus-catalogue titles): nothing to fetch.
+      const n = document.createElement('span'); n.className = 'muted'; n.style.fontSize = '0.8rem';
+      n.textContent = 'not downloadable (Audible ' + (it.content_type || 'streaming-only') + ')';
+      n.title = 'Audible only allows this title to be streamed in its own app, so it can\'t be backed up.';
+      tr.children[3].appendChild(n); cb.disabled = true;
+    }
     tb.appendChild(tr);
   }
   table.appendChild(tb);
