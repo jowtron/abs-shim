@@ -1,0 +1,37 @@
+name: accounts
+description: "List linked Audible accounts with library and sync counts (read-only)."
+
+mode_allowed: [async]
+idempotent: true
+
+timeout_ms: 15000
+max_memory_mb: 64
+cpu_quota_pct: 50
+
+env_passthrough: []
+
+input_schema:
+  type: object
+  additionalProperties: false
+  properties: {}
+
+output_schema:
+  type: object
+  required: ["ok", "accounts"]
+  properties:
+    ok: { type: boolean }
+    accounts:
+      type: array
+      items:
+        type: object
+        properties:
+          account: { type: string }
+          marketplace: { type: string }
+          customer_name: { type: ["string", "null"] }
+          added_at: { type: ["integer", "null"] }
+          library_count: { type: integer }
+          library_fetched_at: { type: ["integer", "null"] }
+          synced_count: { type: integer }
+    pending:
+      type: array
+      items: { type: string }

@@ -87,6 +87,12 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     #abb-results .abb-ext { color: var(--muted); font-size: 0.8rem; margin-left: 0.4rem; text-decoration: none; }
     .abb-details-row td { padding: 0 0.5rem 0.6rem 0.5rem; }
     .abb-browse-row { margin-top: 0.4rem; }
+    #audible-library table { width: 100%; }
+    #audible-library td { vertical-align: middle; padding: 0.25rem 0.4rem; }
+    #audible-library .aud-cover { width: 40px; height: 40px; object-fit: cover; border-radius: 4px; background: var(--border); display: block; }
+    #audible-library .aud-sub { color: var(--muted); font-size: 0.8rem; }
+    #audible-library .aud-synced { color: #3fb950; font-size: 0.8rem; white-space: nowrap; }
+    .aud-log { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0.6rem; font: 0.75rem/1.4 ui-monospace, Menlo, monospace; white-space: pre-wrap; max-height: 12rem; overflow-y: auto; margin-top: 0.3rem; }
     .abb-browse-row select { flex: 1; min-width: 8rem; }
     .abb-cached { color: var(--muted); font-size: 0.75rem; margin-left: 0.4rem; }
     .abb-inlib { color: #3fb950; font-size: 0.75rem; margin-left: 0.4rem; white-space: nowrap; }
@@ -227,6 +233,50 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     </details>
   </div>
 
+  <div id="audible-card" class="card" style="display:none">
+    <h2>Audible</h2>
+    <p class="muted" style="margin-top:0">Back up Audible purchases into the library. Each account signs in through Amazon's own page in your browser (2-factor and all) — nothing but a one-time code reaches the server. Books are downloaded, decrypted and remuxed to m4b with chapters and cover on a wharf node, then uploaded to the library's pCloud folder.</p>
+    <div id="audible-accounts" class="muted">Loading…</div>
+    <details id="audible-add" style="margin-top:0.5rem">
+      <summary>Add an Audible account</summary>
+      <div class="upload-row" style="margin-top:0.5rem">
+        <input type="text" id="audible-acct" placeholder="Short name, e.g. joseph or mum" style="max-width:14rem" pattern="[a-z0-9][a-z0-9-]{0,31}" />
+        <select id="audible-market">
+          <option value="au">Audible Australia</option><option value="us">Audible US</option><option value="uk">Audible UK</option><option value="ca">Canada</option>
+          <option value="de">Germany</option><option value="fr">France</option><option value="it">Italy</option><option value="es">Spain</option><option value="jp">Japan</option><option value="in">India</option><option value="br">Brazil</option>
+        </select>
+        <button class="secondary" id="audible-start">Get sign-in link</button>
+      </div>
+      <div id="audible-step2" style="display:none; margin-top:0.5rem">
+        <p class="muted" style="margin:0.3rem 0">1. Open the link below and sign in to Amazon (use the account whose books you want). 2. You'll end on an Amazon <b>error page</b> — that's expected. 3. Copy that page's full address from the address bar and paste it here.</p>
+        <p style="margin:0.3rem 0; overflow-wrap:anywhere"><a id="audible-login-link" target="_blank" rel="noopener"></a></p>
+        <div class="upload-row">
+          <input type="text" id="audible-response" placeholder="Paste the address of the page you ended on (https://www.amazon…/ap/maplanding?…)" />
+          <button id="audible-finish">Link account</button>
+        </div>
+      </div>
+      <div id="audible-add-status" class="muted" style="font-size:0.85rem"></div>
+    </details>
+    <div id="audible-library-wrap" style="display:none; margin-top:0.75rem">
+      <div class="upload-row">
+        <select id="audible-lib-account"></select>
+        <select id="audible-target"></select>
+        <input type="text" id="audible-filter" placeholder="Filter titles…" style="max-width:14rem" />
+        <button class="secondary" id="audible-refresh" title="Re-fetch the library from Audible">Refresh from Audible</button>
+      </div>
+      <div class="upload-row" style="margin-top:0.4rem">
+        <button id="audible-sync-selected">Sync selected</button>
+        <button class="secondary" id="audible-sync-missing">Sync everything not yet backed up</button>
+        <span id="audible-lib-status" class="muted" style="font-size:0.85rem"></span>
+      </div>
+      <div id="audible-library" style="margin-top:0.5rem"></div>
+    </div>
+    <details id="audible-jobs" style="margin-top:0.75rem">
+      <summary>Sync jobs <span id="audible-jobs-count" class="muted"></span></summary>
+      <div id="audible-jobs-list" class="upload-list muted">Not loaded.</div>
+    </details>
+  </div>
+
   <div id="connections-card" class="card">
     <h2>Cloud connections</h2>
     <div id="connections-body" class="muted">Loading…</div>
@@ -359,6 +409,7 @@ function showLoginForm() {
   document.getElementById('all-users-card').style.display = 'none';
   document.getElementById('household-card').style.display = 'none';
   document.getElementById('passkeys-card').style.display = 'none';
+  document.getElementById('audible-card').style.display = 'none';
   document.getElementById('signout').style.display = 'none';
   passkeyOfferLogin();
 }
@@ -1303,6 +1354,7 @@ function renderAbb(status, libraries) {
   }
   if (prev) target.value = prev;
   card.style.display = target.options.length ? 'block' : 'none';
+  audibleRender(status, libraries);
   if (abbWired) return;
   abbWired = true;
 
@@ -1525,6 +1577,265 @@ function abbLightbox(src, fallback) {
   box.addEventListener('click', close);
   document.addEventListener('keydown', onKey);
   document.body.appendChild(box);
+}
+
+// ─── Audible (wharf-backed) ─────────────────────────────────────────────────
+// Routes in src/routes/audible.ts; the work runs on the "audible" wharf
+// project. Accounts are instance-wide; the routes are owner-only, so the
+// card simply hides itself on a 403/503.
+
+let audibleWired = false;
+let audibleItems = [];
+let audibleSelected = new Set();
+
+function audibleRender(status, libraries) {
+  const target = document.getElementById('audible-target');
+  const prev = target.value;
+  target.innerHTML = '';
+  for (const f of status.folders || []) {
+    if (f.provider !== 'pcloud_oauth') continue;
+    const opt = document.createElement('option');
+    opt.value = f.libraryId;
+    opt.textContent = 'into ' + (f.libraryName || f.libraryId) + ' (pCloud ' + ((f.config && f.config.rootPath) || '/') + ')';
+    target.appendChild(opt);
+  }
+  if (prev) target.value = prev;
+  if (!target.options.length) return;
+  if (!audibleWired) {
+    audibleWired = true;
+    document.getElementById('audible-start').addEventListener('click', audibleStart);
+    document.getElementById('audible-finish').addEventListener('click', audibleFinish);
+    document.getElementById('audible-refresh').addEventListener('click', () => audibleLoadLibrary(true));
+    document.getElementById('audible-lib-account').addEventListener('change', () => audibleLoadLibrary(false));
+    document.getElementById('audible-filter').addEventListener('input', audibleDrawLibrary);
+    document.getElementById('audible-sync-selected').addEventListener('click', () => audibleSync([...audibleSelected]));
+    document.getElementById('audible-sync-missing').addEventListener('click', () => audibleSync(audibleItems.filter((i) => !i.synced && i.downloadable !== false && i.content_type !== 'Podcast').map((i) => i.asin)));
+    document.getElementById('audible-jobs').addEventListener('toggle', (ev) => { if (ev.target.open) audibleLoadJobs(); });
+  }
+  audibleLoadAccounts();
+}
+
+async function audibleLoadAccounts() {
+  const card = document.getElementById('audible-card');
+  const box = document.getElementById('audible-accounts');
+  try {
+    const r = await api('/api/admin/audible/accounts');
+    card.style.display = '';
+    box.innerHTML = '';
+    if (!r.accounts.length) {
+      box.textContent = 'No Audible accounts linked yet.';
+      document.getElementById('audible-add').open = true;
+      document.getElementById('audible-library-wrap').style.display = 'none';
+      return;
+    }
+    const sel = document.getElementById('audible-lib-account');
+    const prevAcct = sel.value;
+    sel.innerHTML = '';
+    for (const a of r.accounts) {
+      const row = document.createElement('div');
+      row.className = 'upload-item';
+      row.innerHTML = '<span class="name"></span><span class="status"></span>';
+      row.querySelector('.name').textContent = a.account + (a.customer_name ? ' — ' + a.customer_name : '') + ' (' + (a.marketplace || '').toUpperCase() + ')';
+      row.querySelector('.status').textContent = ' · ' + (a.library_count ? a.library_count + ' titles, ' : 'library not fetched, ') + a.synced_count + ' backed up';
+      const del = document.createElement('button');
+      del.className = 'secondary row-btn';
+      del.textContent = 'Unlink';
+      del.addEventListener('click', async () => {
+        if (!confirm('Unlink ' + a.account + '? Books already backed up stay in the library.')) return;
+        await api('/api/admin/audible/accounts/' + encodeURIComponent(a.account), { method: 'DELETE' });
+        audibleLoadAccounts();
+      });
+      row.appendChild(del);
+      box.appendChild(row);
+      const opt = document.createElement('option');
+      opt.value = a.account;
+      opt.textContent = a.account;
+      sel.appendChild(opt);
+    }
+    if (prevAcct) sel.value = prevAcct;
+    document.getElementById('audible-library-wrap').style.display = '';
+    audibleLoadLibrary(false);
+    audibleLoadJobs();
+  } catch (e) {
+    // 403 (not owner) / 503 (no wharf) → keep the card hidden; anything else, show why.
+    if (/HTTP (403|503)/.test(e.message)) { card.style.display = 'none'; return; }
+    card.style.display = '';
+    box.textContent = 'Couldn\'t reach the Audible service: ' + e.message;
+  }
+}
+
+async function audibleStart() {
+  const st = document.getElementById('audible-add-status');
+  const btn = document.getElementById('audible-start');
+  const account = document.getElementById('audible-acct').value.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(account)) { st.textContent = 'Give the account a short name: lowercase letters, digits, dashes.'; return; }
+  btn.disabled = true;
+  st.textContent = 'Preparing a sign-in link…';
+  try {
+    const r = await api('/api/admin/audible/accounts/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ account, marketplace: document.getElementById('audible-market').value }) });
+    const a = document.getElementById('audible-login-link');
+    a.href = r.login_url;
+    a.textContent = 'Open Amazon sign-in for “' + account + '” ↗';
+    document.getElementById('audible-step2').style.display = '';
+    st.textContent = 'Link is valid for 15 minutes.';
+  } catch (e) {
+    st.textContent = 'Failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function audibleFinish() {
+  const st = document.getElementById('audible-add-status');
+  const btn = document.getElementById('audible-finish');
+  const account = document.getElementById('audible-acct').value.trim().toLowerCase();
+  const url = document.getElementById('audible-response').value.trim();
+  if (!url) { st.textContent = 'Paste the address of the page Amazon left you on.'; return; }
+  btn.disabled = true;
+  st.textContent = 'Registering with Audible…';
+  try {
+    const r = await api('/api/admin/audible/accounts/finish', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ account, response_url: url }) });
+    st.textContent = 'Linked ' + r.account + (r.customer_name ? ' (' + r.customer_name + ')' : '') + '. Fetching the library…';
+    document.getElementById('audible-step2').style.display = 'none';
+    document.getElementById('audible-response').value = '';
+    document.getElementById('audible-acct').value = '';
+    await audibleLoadAccounts();
+    document.getElementById('audible-lib-account').value = r.account;
+    await audibleLoadLibrary(true);
+    document.getElementById('audible-add').open = false;
+  } catch (e) {
+    st.textContent = 'Failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function audibleLoadLibrary(refresh) {
+  const account = document.getElementById('audible-lib-account').value;
+  const st = document.getElementById('audible-lib-status');
+  const out = document.getElementById('audible-library');
+  if (!account) return;
+  st.textContent = refresh ? 'Fetching from Audible (can take a minute for a big library)…' : 'Loading…';
+  try {
+    const r = await api('/api/admin/audible/library?account=' + encodeURIComponent(account) + (refresh ? '&refresh=1' : ''));
+    audibleItems = r.items || [];
+    audibleSelected = new Set();
+    const synced = audibleItems.filter((i) => i.synced).length;
+    st.textContent = audibleItems.length + ' titles, ' + synced + ' backed up' + (r.fetched_at ? ' · library as of ' + new Date(r.fetched_at).toLocaleString() : '');
+    if (!audibleItems.length && !refresh) { out.innerHTML = '<p class="muted">Library not fetched yet.</p>'; audibleLoadLibrary(true); return; }
+    audibleDrawLibrary();
+  } catch (e) {
+    st.textContent = 'Failed: ' + e.message;
+  }
+}
+
+function audibleDrawLibrary() {
+  const out = document.getElementById('audible-library');
+  const q = document.getElementById('audible-filter').value.trim().toLowerCase();
+  out.innerHTML = '';
+  const table = document.createElement('table');
+  const tb = document.createElement('tbody');
+  const items = audibleItems.filter((i) => !q || ((i.title || '') + ' ' + (i.authors || []).join(' ') + ' ' + (i.series || '')).toLowerCase().includes(q));
+  for (const it of items) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td style="width:1.5rem"><input type="checkbox"></td><td style="width:40px"></td><td><div class="aud-title"></div><div class="aud-sub"></div></td><td style="width:1%; white-space:nowrap"></td>';
+    const cb = tr.querySelector('input');
+    cb.checked = audibleSelected.has(it.asin);
+    cb.addEventListener('change', () => { if (cb.checked) audibleSelected.add(it.asin); else audibleSelected.delete(it.asin); document.getElementById('audible-sync-selected').textContent = 'Sync selected' + (audibleSelected.size ? ' (' + audibleSelected.size + ')' : ''); });
+    if (it.cover) { const img = document.createElement('img'); img.className = 'aud-cover'; img.loading = 'lazy'; img.alt = ''; img.src = it.cover; tr.children[1].appendChild(img); }
+    tr.querySelector('.aud-title').textContent = it.title + (it.subtitle ? ': ' + it.subtitle : '');
+    const hrs = it.runtime_min ? Math.round(it.runtime_min / 6) / 10 + ' h' : null;
+    tr.querySelector('.aud-sub').textContent = [(it.authors || []).join(', '), (it.narrators || []).length ? 'read by ' + it.narrators.join(', ') : null, it.series ? it.series + (it.series_sequence ? ' #' + it.series_sequence : '') : null, hrs, it.purchase_date ? 'bought ' + it.purchase_date.slice(0, 10) : null].filter(Boolean).join(' · ');
+    if (it.synced) { const s = document.createElement('span'); s.className = 'aud-synced'; s.textContent = '✓ backed up'; s.title = it.synced.path; tr.children[3].appendChild(s); }
+    else if (it.content_type === 'Podcast') { tr.children[3].innerHTML = '<span class="muted" style="font-size:0.8rem">podcast</span>'; cb.disabled = true; }
+    tb.appendChild(tr);
+  }
+  table.appendChild(tb);
+  out.appendChild(table);
+  if (!items.length) out.innerHTML = '<p class="muted">No titles match.</p>';
+}
+
+async function audibleSync(asins) {
+  const st = document.getElementById('audible-lib-status');
+  if (!asins.length) { st.textContent = 'Nothing selected.'; return; }
+  const account = document.getElementById('audible-lib-account').value;
+  const libraryId = document.getElementById('audible-target').value;
+  try {
+    const r = await api('/api/admin/audible/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ account, asins, libraryId }) });
+    st.textContent = 'Sync job started (' + asins.length + ' title' + (asins.length === 1 ? '' : 's') + ').';
+    audibleSelected = new Set();
+    document.getElementById('audible-sync-selected').textContent = 'Sync selected';
+    document.getElementById('audible-jobs').open = true;
+    audibleLoadJobs();
+    void r;
+  } catch (e) {
+    st.textContent = 'Couldn\'t start: ' + e.message;
+  }
+}
+
+const audibleWatching = new Map();
+
+async function audibleLoadJobs() {
+  const list = document.getElementById('audible-jobs-list');
+  const count = document.getElementById('audible-jobs-count');
+  try {
+    const r = await api('/api/admin/audible/jobs');
+    list.innerHTML = '';
+    count.textContent = r.jobs.length ? '(' + r.jobs.filter((j) => j.state === 'running' || j.state === 'pending').length + ' active)' : '';
+    if (!r.jobs.length) { list.textContent = 'No sync jobs yet.'; return; }
+    for (const j of r.jobs) {
+      const row = appendUploadRow(list, j.account + ': ' + (j.count === 'all' ? 'everything' : j.count + ' title' + (j.count === 1 ? '' : 's')) + ' · ' + new Date(j.startedAt).toLocaleString(), j.state);
+      const log = document.createElement('div');
+      log.className = 'aud-log';
+      log.style.display = 'none';
+      row.addButton('Log', () => { log.style.display = log.style.display === 'none' ? '' : 'none'; if (log.style.display === '') audibleTailLog(j.id, log); });
+      list.appendChild(log);
+      if (j.state === 'succeeded') {
+        const res = j.result || {};
+        row.complete('Done: ' + (res.done || []).length + ' backed up, ' + (res.failed || []).length + ' failed, ' + (res.skipped || []).length + ' already there');
+        if (!j.scanned) audibleAfterSync(j);
+      } else if (j.state === 'failed' || j.state === 'cancelled' || j.state === 'interrupted') {
+        row.fail(j.state + (j.error ? ': ' + String(j.error).split('\n')[0].slice(0, 160) : ''));
+      } else {
+        row.setStatus(j.state + '…');
+        row.addButton('Cancel', async () => { await api('/api/admin/audible/jobs/' + encodeURIComponent(j.id) + '/cancel', { method: 'POST' }); audibleLoadJobs(); });
+        if (!audibleWatching.has(j.id)) {
+          audibleWatching.set(j.id, setTimeout(() => { audibleWatching.delete(j.id); audibleLoadJobs(); }, 15000));
+          log.style.display = '';
+          audibleTailLog(j.id, log);
+        }
+      }
+    }
+  } catch (e) {
+    list.textContent = 'Couldn\'t load jobs: ' + e.message;
+  }
+}
+
+async function audibleTailLog(id, el) {
+  try {
+    const r = await api('/api/admin/audible/jobs/' + encodeURIComponent(id) + '/log?tail=4000');
+    el.textContent = (r.content || '').replace(/^ERR: /gm, '').trim() || '(no output yet)';
+    el.scrollTop = el.scrollHeight;
+  } catch (e) {
+    el.textContent = 'log unavailable: ' + e.message;
+  }
+}
+
+// A finished sync landed m4b files on pCloud; scan the target library so
+// they register (same tail as an AudioBookBay grab), once per job.
+async function audibleAfterSync(j) {
+  try {
+    await api('/api/admin/audible/jobs/' + encodeURIComponent(j.id) + '/scanned', { method: 'POST' });
+    const res = j.result || {};
+    if ((res.done || []).length) {
+      const report = await api('/api/admin/libraries/' + encodeURIComponent(j.libraryId) + '/scan', { method: 'POST' });
+      document.getElementById('audible-lib-status').textContent = 'Library scan added ' + (report.added || 0) + ' book(s).';
+      audibleLoadLibrary(false);
+      refresh();
+    }
+  } catch (e) {
+    console.warn('post-sync scan', e);
+  }
 }
 
 // ─── Catalogue: browse by category + crawler status ─────────────────────────

@@ -22,6 +22,14 @@ enabled = true
 [triggers]
 crons = ["*/2 * * * *"]
 
+# wharf-router service binding: the Audible importer (src/routes/audible.ts)
+# submits jobs to the "audible" wharf project through the router, which
+# forwards them to whichever island hosts the project (stereo-au today).
+# Bearer token: `wrangler secret put ROUTER_TOKEN` (from wharf-installs sops).
+[[services]]
+binding = "WHARF_ROUTER"
+service = "wharf-router"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "abs-shim-db"

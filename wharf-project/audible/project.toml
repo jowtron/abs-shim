@@ -1,0 +1,27 @@
+# wharf project "audible" — Audible library import for ABS_shim.
+#
+# Deployed to /srv/wharf/projects/audible/ on an island (stereo-au today;
+# the shim reaches it through wharf-router by project id, so moving it is a
+# router route change). Directory name MUST stay "audible" — the router
+# forwards project_id unchanged.
+#
+# Layout on the island (everything portable, nothing outside the dir):
+#   venv/            python venv with audible-cli (+ the `audible` library)
+#   bin/ffmpeg       static build (decrypts aax/aaxc, remuxes to m4b)
+#   bin/rclone       static build; remote config in data/rclone.conf
+#   data/cli/        audible-cli config dir: config.toml + <account>.json auth files
+#   data/accounts.json, data/library/<account>.json, data/synced/<account>.json
+#   data/pending/<account>.json   in-flight browser logins (5 min)
+#   data/dl/<account>/<asin>/     per-book working dir, removed after upload
+#
+# Handlers (handlers/<name>/<name>.py + .yaml): auth_start, auth_finish,
+# accounts, remove_account, library, sync. Shared code in handlers/_lib.
+name        = "audible"
+description = "Audible library backup: browser-assisted account login, library listing, download + decrypt to m4b, upload to the pCloud audiobook library."
+
+max_queue_depth = 8
+
+# One sync at a time — a book is ~0.5–1.5 GB on disk while it's being
+# decrypted, and Audible throttles parallel downloads anyway.
+[slots]
+total = 1

@@ -17,6 +17,7 @@ import { authorRoutes } from './routes/authors';
 import { adminRoutes } from './routes/admin';
 import { abbRoutes } from './routes/abb';
 import { passkeyRoutes } from './routes/passkeys';
+import { audibleRoutes } from './routes/audible';
 import { runCatalogTick } from './lib/abb-catalog';
 import { signupRoutes } from './routes/signup';
 import { renderSignupHtml } from './lib/signup-html';
@@ -436,6 +437,7 @@ app.route('/api/items', itemRoutes);
 app.route('/api/authors', authorRoutes);
 app.route('/api/auth/passkey', passkeyRoutes);
 app.route('/api/admin/abb', abbRoutes);
+app.route('/api/admin/audible', audibleRoutes);
 app.route('/api/admin', adminRoutes);
 
 // Public self-serve signup (approval-gated). The API lives under /api/signup;

@@ -1,0 +1,69 @@
+name: sync
+description: "Download selected Audible titles (or all), decrypt/remux to m4b with chapters + cover, upload into the pCloud audiobook library. Long-running; progress in the job log."
+
+mode_allowed: [async]
+idempotent: true
+
+# Sequential per title; a big pile of long books can take hours.
+timeout_ms: 21600000
+max_memory_mb: 1024
+cpu_quota_pct: 200
+
+env_passthrough: []
+
+input_schema:
+  type: object
+  additionalProperties: false
+  required: ["account", "dest_root"]
+  properties:
+    account:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9-]{0,31}$"
+    asins:
+      description: "ASINs to sync, or the string \"all\"."
+      oneOf:
+        - type: array
+          items: { type: string }
+          maxItems: 500
+        - type: string
+          enum: ["all"]
+    dest_root:
+      type: string
+      description: "pCloud path of the audiobook library root, e.g. \"Public Folder/audiobooks\"."
+    force:
+      type: boolean
+      default: false
+      description: "Re-download titles already recorded as synced."
+    quality:
+      type: string
+      enum: [best, high, normal]
+      default: best
+
+output_schema:
+  type: object
+  required: ["ok"]
+  properties:
+    ok: { type: boolean }
+    error: { type: string }
+    account: { type: string }
+    done:
+      type: array
+      items:
+        type: object
+        properties:
+          asin: { type: string }
+          title: { type: ["string", "null"] }
+          path: { type: string }
+          bytes: { type: integer }
+          chapters: { type: integer }
+    failed:
+      type: array
+      items:
+        type: object
+        properties:
+          asin: { type: string }
+          title: { type: ["string", "null"] }
+          error: { type: string }
+    skipped:
+      type: array
+      items: { type: string }

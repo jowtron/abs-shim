@@ -1,0 +1,52 @@
+name: library
+description: "An account's Audible library (cached; refresh=true re-fetches from Audible), each title with its sync state."
+
+mode_allowed: [async]
+idempotent: true
+
+timeout_ms: 300000
+max_memory_mb: 256
+cpu_quota_pct: 50
+
+env_passthrough: []
+
+input_schema:
+  type: object
+  additionalProperties: false
+  required: ["account"]
+  properties:
+    account:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9-]{0,31}$"
+    refresh:
+      type: boolean
+      default: false
+
+output_schema:
+  type: object
+  required: ["ok"]
+  properties:
+    ok: { type: boolean }
+    error: { type: string }
+    account: { type: string }
+    fetched_at: { type: integer }
+    items:
+      type: array
+      items:
+        type: object
+        properties:
+          asin: { type: string }
+          title: { type: ["string", "null"] }
+          subtitle: { type: ["string", "null"] }
+          authors: { type: array, items: { type: string } }
+          narrators: { type: array, items: { type: string } }
+          runtime_min: { type: ["integer", "null"] }
+          purchase_date: { type: ["string", "null"] }
+          release_date: { type: ["string", "null"] }
+          cover: { type: ["string", "null"] }
+          series: { type: ["string", "null"] }
+          series_sequence: { type: ["string", "null"] }
+          finished: { type: boolean }
+          content_type: { type: ["string", "null"] }
+          downloadable: { type: boolean }
+          synced: { type: ["object", "null"] }

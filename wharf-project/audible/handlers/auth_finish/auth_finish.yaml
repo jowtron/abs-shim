@@ -1,0 +1,33 @@
+name: auth_finish
+description: "Complete an Audible login: exchange the pasted Amazon redirect URL for device credentials and store the account's auth file."
+
+mode_allowed: [async]
+idempotent: false
+
+timeout_ms: 60000
+max_memory_mb: 128
+cpu_quota_pct: 50
+
+env_passthrough: []
+
+input_schema:
+  type: object
+  additionalProperties: false
+  required: ["account", "response_url"]
+  properties:
+    account:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9-]{0,31}$"
+    response_url:
+      type: string
+      description: "The full address of the Amazon page the browser ended on (contains openid.oa2.authorization_code=)."
+
+output_schema:
+  type: object
+  required: ["ok"]
+  properties:
+    ok: { type: boolean }
+    error: { type: string }
+    account: { type: string }
+    marketplace: { type: string }
+    customer_name: { type: ["string", "null"] }

@@ -7,6 +7,11 @@ export type Env = {
   ARCHIVE_EXTRACT: DurableObjectNamespace;
   ASSETS: Fetcher; // Cloudflare static-assets binding for the bundled ABS web UI.
   COVERS: R2Bucket; // Persistent cover cache — see src/routes/items.ts.
+  // wharf-router service binding + its bearer (secret) — the Audible
+  // importer submits jobs through it; see src/lib/wharf.ts. Optional: the
+  // Audible routes answer 503 when either is missing.
+  WHARF_ROUTER?: Fetcher;
+  ROUTER_TOKEN?: string;
   // Secrets (set via `wrangler secret put`):
   JWT_SECRET?: string;
   // AES-256-GCM key (base64, 32 bytes) for per-tenant secrets in D1 — see src/lib/secret-box.ts.

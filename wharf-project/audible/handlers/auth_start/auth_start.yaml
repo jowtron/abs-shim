@@ -1,0 +1,36 @@
+name: auth_start
+description: "Begin a browser-assisted Audible login: returns the Amazon login URL for the user to open; auth_finish takes the redirect URL they land on."
+
+mode_allowed: [async]
+idempotent: false
+
+timeout_ms: 30000
+max_memory_mb: 128
+cpu_quota_pct: 50
+
+env_passthrough: []
+
+input_schema:
+  type: object
+  additionalProperties: false
+  required: ["account"]
+  properties:
+    account:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9-]{0,31}$"
+      description: "Short slug for this Audible account, e.g. joseph or mum."
+    marketplace:
+      type: string
+      enum: [au, us, uk, ca, de, fr, it, es, jp, in, br]
+      default: au
+
+output_schema:
+  type: object
+  required: ["ok"]
+  properties:
+    ok: { type: boolean }
+    error: { type: string }
+    account: { type: string }
+    marketplace: { type: string }
+    login_url: { type: string }
+    expires_at: { type: integer }
