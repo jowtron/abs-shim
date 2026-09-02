@@ -6,7 +6,10 @@ idempotent: true
 
 # Sequential per title; a big pile of long books can take hours.
 timeout_ms: 21600000
-max_memory_mb: 1024
+# 4 GB, not 1: the 2026-09-02 first run was OOM-killed (cgroup limit) 12 min
+# into a ~29 h title — the download's dirty page cache is charged to the
+# job's cgroup on top of the python process. The box has 7 GB.
+max_memory_mb: 4096
 cpu_quota_pct: 200
 
 env_passthrough: []
