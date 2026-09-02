@@ -1,0 +1,38 @@
+# wharf project "abbcovers" — catalogue cover resizing for ABS_shim.
+#
+# The runner Joseph used to keep open on his laptop: pulls posts whose cover
+# isn't cached yet, fits each into a 500 px webp, PUTs it to the shim, which
+# stores it in R2. Workers can't resize images and Cloudflare transformations
+# would cost ~$20 for the catalogue, hence a box.
+#
+# Separate from ../abbcrawl on purpose. This one imports Pillow and decodes
+# several images at once, so its peak RSS is a few hundred MB; wharfd's whole
+# cgroup is capped per box (stereo-nz: 128 MB, wharf-syd-1: 448 MB). Running
+# both on stereo-nz OOM-killed wharfd 75 times in an hour on 2026-09-03 and
+# took netprobe and cfpbx-stereo's ESL forwarder down with it each time.
+# Deploy this one ONLY to a box whose MemoryMax has room for it — check with
+#   systemctl show wharfd -p MemoryMax -p MemoryCurrent
+#
+# Covers come from image hosts (ibb, Amazon, phototourl), never from ABB, so
+# none of the crawler's pacing rules apply here.
+#
+# Layout:
+#   handlers/abb-covers.py   copy of the shim repo's scripts/abb-covers.py
+#   venv/                    Pillow
+#   .env                     ABS_SHIM_URL / USER / PASS / SHARD / SHARDS
+name        = "abbcovers"
+description = "Downloads AudioBookBay catalogue covers, fits them into a 500px webp, and PUTs them to the shim for R2 storage."
+
+[slots]
+total = 1
+
+# --workers 2 and a 60-cover batch rather than the script's laptop defaults
+# (4 / 200): the point is a small steady trickle inside a shared cgroup, and
+# the backlog is a few hundred images plus ~60 new posts a day.
+[[services]]
+name = "abb-covers"
+description = "One pass every 15 minutes over this node's shard of the un-cached covers."
+command = "venv/bin/python3"
+args = ["handlers/abb-covers.py", "--loop", "--every", "15", "--workers", "2", "--batch", "60"]
+restart = "always"
+env_passthrough = ["ABS_SHIM_URL", "ABS_SHIM_USER", "ABS_SHIM_PASS", "ABS_SHIM_SHARD", "ABS_SHIM_SHARDS", "NODE_NAME"]
