@@ -552,7 +552,7 @@ adminRoutes.post('/storage/folder/:folderId/upload/chunk', async (c) => {
 });
 
 // Step 3: finalize. Saves the assembled bytes to <rootPath>/<relPath> in
-// pCloud. If the saved file looks like an audiobook (.m4b/.m4a/.aac),
+// pCloud. If the saved file looks like an audiobook (.m4b/.m4a/.aac/.opus/.ogg),
 // automatically registers it via addBookByPath so it shows up in the library
 // without a separate scan step.
 //
@@ -581,7 +581,7 @@ adminRoutes.post('/storage/folder/:folderId/upload/save', async (c) => {
   // instead of silently dropping the book.
   let itemId: string | undefined;
   let registerError: string | undefined;
-  if (registerAsBook && /\.(m4b|m4a|aac)$/i.test(relPath)) {
+  if (registerAsBook && /\.(m4b|m4a|aac|opus|ogg)$/i.test(relPath)) {
     try {
       // Pass through size from pCloud's upload_save response so audio_files
       // gets a real size_bytes on first insert (without this, single-file
@@ -782,7 +782,7 @@ adminRoutes.post('/storage/folder/:folderId/fetch-url/finish', async (c) => {
 
   let itemId: string | undefined;
   let registerError: string | undefined;
-  if (registerAsBook && /\.(m4b|m4a|aac)$/i.test(relPath)) {
+  if (registerAsBook && /\.(m4b|m4a|aac|opus|ogg)$/i.test(relPath)) {
     try {
       const hints: { sizeBytes?: number } = {};
       if (meta.size != null) hints.sizeBytes = meta.size;

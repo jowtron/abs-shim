@@ -2,6 +2,7 @@ import type { Env } from '../types';
 import { getAdapter, type FolderRow } from '../storage/factory';
 import { ListingNotSupportedError, type RemoteEntry } from '../storage/adapter';
 import { probeM4b } from '../prober/m4b';
+import { probeOgg } from '../prober/ogg';
 import { probeMp3, type Mp3Probe } from '../prober/mp3';
 import { deriveSeries } from '../lib/series';
 import { invalidateIdMap } from '../lib/ids';
@@ -108,7 +109,7 @@ export async function runScan(env: Env, libraryId: string, tenantId: string): Pr
           known.add(itemRel);
         } else if (files.length === 1) {
           const f = files[0]!;
-          const out = await probeM4bBook({ env, adapter, folder, file: f, itemRel });
+          const out = await probeBook({ env, adapter, folder, file: f, itemRel });
           if (out === 'added') { report.added++; known.add(itemRel); }
           else report.skipped++;
         } else {
@@ -146,7 +147,7 @@ async function collectAudioFiles(adapter: Awaited<ReturnType<typeof getAdapter>>
     const entries = await adapter.listFolder(cur);
     for (const e of entries) {
       if (e.isDir) queue.push(e.relPath);
-      else if (/\.(m4b|m4a|aac|mp3)$/i.test(e.relPath)) out.push(e);
+      else if (/\.(m4b|m4a|aac|mp3|opus|ogg)$/i.test(e.relPath)) out.push(e);
     }
   }
   return out;
@@ -170,7 +171,84 @@ async function probeBook(args: SingleFileArgs): Promise<'added' | 'skipped'> {
       itemRel: args.itemRel, files: [args.file],
     });
   }
+  if (isOgg(args.file.relPath)) return probeOggBook(args);
   return probeM4bBook(args);
+}
+
+export const isOgg = (path: string): boolean => /\.(opus|ogg)$/i.test(path);
+
+// Single-file Opus/Vorbis book (the 2026-09-02 Percy Jackson grab was five
+// of these and none showed up: the scanner only knew m4b/m4a/aac/mp3).
+// Same rows as probeM4bBook minus the moov cache — Ogg has no moov, and
+// iOS streams it fine with plain Range requests.
+async function probeOggBook(args: SingleFileArgs): Promise<'added' | 'skipped'> {
+  const { env, adapter, folder, file, itemRel } = args;
+  const probeUrl = await adapter.resolveProbeUrl(file.relPath, file.providerId ?? null);
+  const probe = await probeOgg(probeUrl.url);
+
+  const filename = file.relPath.split('/').pop() ?? file.relPath;
+  const title = probe.tags['TITLE'] ?? probe.tags['ALBUM'] ?? filename.replace(/\.(opus|ogg)$/i, '');
+  const author = probe.tags['ARTIST'] ?? probe.tags['ALBUMARTIST'] ?? probe.tags['AUTHOR'] ?? null;
+  const album = probe.tags['ALBUM'] ?? null;
+  // ffmpeg maps an m4b's ©wrt (narrator) to COMPOSER when it converts.
+  const narrator = probe.tags['NARRATOR'] ?? probe.tags['PERFORMER'] ?? probe.tags['COMPOSER'] ?? null;
+  const yearNum = probe.tags['DATE'] ? Number(probe.tags['DATE']!.slice(0, 4)) : NaN;
+  const year = Number.isFinite(yearNum) ? yearNum : null;
+  const series = deriveSeries({
+    tags: probe.tags, title, author, album,
+    folderName: itemRel === file.relPath ? null : (itemRel.split('/').pop() ?? itemRel),
+  });
+
+  const itemId = `it-${crypto.randomUUID().slice(0, 12)}`;
+  const audioId = `af-${crypto.randomUUID().slice(0, 12)}`;
+  const now = Date.now();
+  const isFile = file.relPath === itemRel ? 1 : 0;
+  const ino = (Math.floor(Math.random() * 0xffffffff)).toString();
+  const audioIno = (Math.floor(Math.random() * 0xffffffff)).toString();
+  const stableUrl = adapter.provider === 'public_url' ? (await adapter.resolveUrl(file.relPath)).url : '';
+  const totalDuration = probe.durationSeconds ?? 0;
+  const chapterInserts = probe.chapters.map((ch, i) => {
+    const next = probe.chapters[i + 1];
+    return env.DB.prepare(
+      `INSERT INTO chapters (library_item_id, chapter_index, title, start_seconds, end_seconds) VALUES (?, ?, ?, ?, ?)`,
+    ).bind(itemId, i, ch.title, ch.start, next ? next.start : totalDuration);
+  });
+  const mime = probe.codec === 'opus' ? 'audio/ogg; codecs=opus' : 'audio/ogg';
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO library_items
+         (id, library_id, folder_id, tenant_id, ino, rel_path, is_file, media_type, is_missing, is_invalid, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'book', 0, 0, ?, ?)`,
+    ).bind(itemId, folder.library_id, folder.id, folder.tenant_id, ino, itemRel, isFile, now, now),
+    env.DB.prepare(
+      `INSERT INTO book_metadata
+         (library_item_id, tenant_id, title, title_ignore_prefix, subtitle, author_name, narrator_name,
+          series_name, series_sequence, description, isbn, asin, language, publish_year,
+          publisher, genres, tags, explicit, abridged, cover_url)
+       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', 0, 0, NULL)`,
+    ).bind(itemId, folder.tenant_id, title, sortKey(title), author, narrator, series?.name ?? null, series?.sequence ?? null, year, album),
+    env.DB.prepare(
+      `INSERT INTO audio_files
+         (id, library_item_id, tenant_id, index_no, filedn_url, ino, duration_seconds, size_bytes,
+          mime_type, format, codec, bitrate, sample_rate, channels, added_at,
+          rel_path, provider_file_id, moov_offset, moov_size)
+       VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 'ogg', ?, NULL, ?, ?, ?, ?, ?, NULL, NULL)`,
+    ).bind(
+      audioId, itemId, folder.tenant_id, stableUrl, audioIno, totalDuration,
+      file.sizeBytes ?? probe.sizeBytes ?? 0, mime, probe.codec, probe.sampleRate, probe.channels, now,
+      file.relPath, file.providerId ?? null,
+    ),
+    ...chapterInserts,
+  ]);
+
+  if (probe.cover) {
+    try {
+      await env.COVERS.put(`covers/${itemId}`, probe.cover.bytes, { httpMetadata: { contentType: probe.cover.mimeType } });
+    } catch { /* non-fatal: the cover route re-probes on first request */ }
+  }
+  invalidateIdMap();
+  return 'added';
 }
 
 // Probe one m4b/m4a/aac file and insert all the metadata rows. Returns
@@ -458,6 +536,9 @@ export async function reprobeItem(env: Env, itemId: string, tenantId: string): P
   if (audio.format === 'mp3' || /\.mp3$/i.test(audio.rel_path ?? '')) {
     return reprobeMp3Item(env, adapter, itemId, item.rel_path);
   }
+  if (audio.format === 'ogg' || isOgg(audio.rel_path ?? '')) {
+    return reprobeOggItem(env, adapter, itemId, item.rel_path, audio);
+  }
   const probeUrl = audio.rel_path
     ? await adapter.resolveProbeUrl(audio.rel_path, audio.provider_file_id)
     : { url: audio.filedn_url };
@@ -583,6 +664,53 @@ function mp3ChapterStmts(env: Env, itemId: string, relPaths: string[], probes: M
 
 function isUniqueViolation(e: unknown): boolean {
   return /UNIQUE constraint failed/i.test((e as Error)?.message ?? '');
+}
+
+// Opus/Vorbis re-probe: chapters rebuilt from CHAPTERnnn comments, duration
+// refreshed, series filled if NULL, cover refreshed from METADATA_BLOCK_PICTURE.
+async function reprobeOggItem(
+  env: Env, adapter: Awaited<ReturnType<typeof getAdapter>>, itemId: string, itemRel: string,
+  audio: { id: string; rel_path: string | null; provider_file_id: string | null; filedn_url: string; duration_seconds: number },
+): Promise<{ itemId: string; chapters: number; durationSeconds: number | null; coverRefreshed: boolean; series?: string }> {
+  const probeUrl = audio.rel_path
+    ? await adapter.resolveProbeUrl(audio.rel_path, audio.provider_file_id)
+    : { url: audio.filedn_url };
+  const probe = await probeOgg(probeUrl.url);
+  const totalDuration = probe.durationSeconds ?? audio.duration_seconds ?? 0;
+  const stmts: D1PreparedStatement[] = [env.DB.prepare('DELETE FROM chapters WHERE library_item_id = ?').bind(itemId)];
+  const meta = await env.DB.prepare(
+    'SELECT title, author_name, publisher, series_name FROM book_metadata WHERE library_item_id = ?',
+  ).bind(itemId).first<{ title: string; author_name: string | null; publisher: string | null; series_name: string | null }>();
+  let seriesSet: string | null = null;
+  if (meta && !meta.series_name) {
+    const series = deriveSeries({
+      tags: probe.tags, title: meta.title, author: meta.author_name, album: meta.publisher,
+      folderName: itemRel === audio.rel_path ? null : (itemRel.split('/').pop() ?? itemRel),
+    });
+    if (series) {
+      seriesSet = series.sequence ? `${series.name} #${series.sequence}` : series.name;
+      stmts.push(env.DB.prepare('UPDATE book_metadata SET series_name = ?, series_sequence = ? WHERE library_item_id = ?')
+        .bind(series.name, series.sequence, itemId));
+    }
+  }
+  probe.chapters.forEach((ch, i) => {
+    const next = probe.chapters[i + 1];
+    stmts.push(env.DB.prepare(
+      `INSERT INTO chapters (library_item_id, chapter_index, title, start_seconds, end_seconds) VALUES (?, ?, ?, ?, ?)`,
+    ).bind(itemId, i, ch.title, ch.start, next ? next.start : totalDuration));
+  });
+  if (probe.durationSeconds && Math.abs(probe.durationSeconds - audio.duration_seconds) > 0.5) {
+    stmts.push(env.DB.prepare('UPDATE audio_files SET duration_seconds = ? WHERE id = ?').bind(probe.durationSeconds, audio.id));
+  }
+  await env.DB.batch(stmts);
+  let coverRefreshed = false;
+  if (probe.cover) {
+    try {
+      await env.COVERS.put(`covers/${itemId}`, probe.cover.bytes, { httpMetadata: { contentType: probe.cover.mimeType } });
+      coverRefreshed = true;
+    } catch { /* non-fatal */ }
+  }
+  return { itemId, chapters: probe.chapters.length, durationSeconds: probe.durationSeconds, coverRefreshed, ...(seriesSet ? { series: seriesSet } : {}) };
 }
 
 // mp3 re-probe: every file again (CHAP frames, durations), chapters rebuilt
