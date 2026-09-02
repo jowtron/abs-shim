@@ -21,7 +21,9 @@ description = "Audible library backup: browser-assisted account login, library l
 
 max_queue_depth = 8
 
-# One sync at a time — a book is ~0.5–1.5 GB on disk while it's being
-# decrypted, and Audible throttles parallel downloads anyway.
+# Slots are project-wide: with 1, a running sync queued every accounts/
+# library lookup behind it and the /admin card timed out (2026-09-02).
+# 3 = one sync plus room for the quick handlers; a second concurrent sync
+# is possible but harmless (211 GB free, Audible throttles per download).
 [slots]
-total = 1
+total = 3
