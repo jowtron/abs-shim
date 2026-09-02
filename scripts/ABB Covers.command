@@ -7,7 +7,7 @@
 #
 # Edit SHIM_USER below if your shim username isn't "root".
 SHIM_URL="https://abs-shim.jderrick.app"
-SHIM_USER="root"
+SHIM_USER="jderrick"
 
 cd "$(dirname "$0")" || exit 1
 if ! python3 -c "import PIL" 2>/dev/null; then

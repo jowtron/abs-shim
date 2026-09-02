@@ -39,8 +39,11 @@ const FRESH_PAGES = 3;      // home pages walked newest-first until a page has n
 const LISTING_CAP = 500;    // ABB's hard pagination wall
 const REPORT_AFTER_MS = 14 * 24 * 3600 * 1000;
 const TICK_STALE_MS = 12 * 60 * 1000; // a tick older than this is assumed dead (cron overlap guard)
-const BLOCK_SIGNALS_TO_BACK_OFF = 2;  // timeouts / 403 / 429 / 503 in one tick before we stop
-const BACKOFF_BASE_MS = 2 * 3600 * 1000;
+// Three signals, not two: after 168 clean ticks the first backoff (2026-09-02
+// 10:31Z) was two 20 s timeouts on a slow patch, not a block — a 2 h pause
+// for that was too trigger-happy. A real block fails every fetch.
+const BLOCK_SIGNALS_TO_BACK_OFF = 3;  // timeouts / 403 / 429 / 503 in one tick before we stop
+const BACKOFF_BASE_MS = 30 * 60 * 1000;  // 30 min, doubling per consecutive episode
 const BACKOFF_MAX_MS = 24 * 3600 * 1000;
 
 export type ListingState = {
@@ -581,10 +584,11 @@ export async function runCatalogTick(env: Env, opts: { force?: boolean } = {}): 
     stats.backoffUntil = Date.now() + wait;
     stats.backoffLevel++;
     stats.blockedTicks++;
-    noteError(t, `backing off ${Math.round(wait / 3600000)}h: ${blocked}`);
+    const waitText = wait >= 3600000 ? `${Math.round(wait / 3600000)}h` : `${Math.round(wait / 60000)}min`;
+    noteError(t, `backing off ${waitText}: ${blocked}`);
     await sendPushover(env, {
       title: 'ABB catalogue crawler backing off',
-      message: `AudioBookBay stopped answering (${blocked}). Pausing the crawler for ${Math.round(wait / 3600000)}h (episode ${stats.backoffLevel}). Live search may be affected too if the egress IP is blocked.`,
+      message: `AudioBookBay stopped answering (${blocked}). Pausing the crawler for ${waitText} (episode ${stats.backoffLevel}). It resumes by itself; a real block shows up as repeated episodes.`,
       url: (env.PUBLIC_ORIGIN ?? 'https://abs-shim.jderrick.app') + '/admin', urlTitle: 'Open /admin',
     }).catch(() => undefined);
   } else if (t.fetches > 0 && t.blockSignals === 0) {

@@ -100,6 +100,11 @@ def keychain_get(user):
         return None
 
 
+def keychain_delete(user):
+    subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", user],
+                   capture_output=True)
+
+
 def keychain_set(user, password):
     subprocess.run(["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", user, "-w", password],
                    check=True, capture_output=True)
@@ -249,11 +254,20 @@ def main():
             log("password stored in the Keychain (service abs-shim-covers)")
 
     # First login: retry until the network is there (the runner may start before Wi-Fi).
+    # A wrong password (401) throws the stored one away and asks again.
     while True:
         try:
             sess = Session(server, args.user, password)
             break
         except urllib.error.HTTPError as e:
+            if e.code == 401 and sys.stdin.isatty():
+                log("login failed: wrong password for " + args.user)
+                if use_keychain:
+                    keychain_delete(args.user)
+                password = getpass.getpass(f"shim password for {args.user}: ")
+                if use_keychain:
+                    keychain_set(args.user, password)
+                continue
             sys.exit(f"login failed: HTTP {e.code} — wrong password? (delete it with: security delete-generic-password -s {KEYCHAIN_SERVICE})")
         except (urllib.error.URLError, OSError) as e:
             if not args.loop:
