@@ -170,10 +170,15 @@ abbRoutes.post('/settings/test', async (c) => {
 // an old title teaches the cache about it.
 //   ?mode=cache  → catalogue only (instant, offline-safe)
 //   ?mode=live   → ABB only (the pre-catalogue behaviour)
+//   ?lang=English → only that language, in BOTH halves. ABB's search has no
+//     language parameter, so live hits are filtered on the language its own
+//     result rows print. Both UIs default to English (12,065 of 12,370
+//     catalogued posts); '' means any.
 abbRoutes.get('/search', async (c) => {
   const q = (c.req.query('q') ?? '').trim();
   const pages = Number(c.req.query('pages') ?? '1') || 1;
   const mode = c.req.query('mode') ?? 'both';
+  const lang = (c.req.query('lang') ?? '').trim();
   if (!q) return c.json({ error: 'q required' }, 400);
   let cookie: string | null = null;
   if (mode !== 'cache') {
@@ -181,7 +186,7 @@ abbRoutes.get('/search', async (c) => {
       cookie = await abbCookie(c.env, c.get('tenantId'));
     } catch { /* anonymous search still works */ }
   }
-  const cachedP: Promise<AbbResult[]> = mode === 'live' ? Promise.resolve([]) : catalogSearch(c.env, q, 60).catch(() => []);
+  const cachedP: Promise<AbbResult[]> = mode === 'live' ? Promise.resolve([]) : catalogSearch(c.env, q, 60, 0, lang).catch(() => []);
   const liveP: Promise<AbbResult[] | Error> = mode === 'cache'
     ? Promise.resolve([])
     : abbSearch(q, pages, cookie).catch((e: Error) => e);
@@ -197,11 +202,16 @@ abbRoutes.get('/search', async (c) => {
       seen.add(r.url);
       extras.push({ ...r, cached: false });
     }
+    // Everything ABB returned still goes into the catalogue — the language
+    // filter is about what this search shows, not about what we learn.
     if (extras.length) c.executionCtx.waitUntil(upsertPosts(c.env, extras).catch(() => undefined));
   }
-  const results = await markInLibrary(c.env, c.get('tenantId'), withCoverUrls([...cached, ...extras], originOf(c.req.url)));
+  const shown = lang ? extras.filter((r) => (r.language ?? '').toLowerCase() === lang.toLowerCase()) : extras;
+  const results = await markInLibrary(c.env, c.get('tenantId'), withCoverUrls([...cached, ...shown], originOf(c.req.url)));
   return c.json({
-    query: q, count: results.length, results,
+    query: q, count: results.length, results, language: lang || null,
+    // What the filter hid, so the UI can offer "N more in other languages".
+    filteredOut: lang ? (extras.length - shown.length) : 0,
     source: mode === 'cache' ? 'cache' : live instanceof Error ? 'cache' : mode === 'live' ? 'live' : 'both',
     ...(live instanceof Error ? { liveError: live.message } : {}),
   });

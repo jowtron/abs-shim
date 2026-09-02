@@ -107,6 +107,31 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     .abb-lightbox img { max-width: 100%; max-height: 100%; border-radius: 6px; box-shadow: 0 8px 40px rgba(0,0,0,0.6); }
     .abb-more { margin: 0.5rem 0; }
     #abb-catalog-listings span { display: inline-block; margin: 0 0.5rem 0.15rem 0; white-space: nowrap; }
+    /* Catalogue dashboard: four counters, then one row per worker. Numbers
+       that should be climbing are green when they climbed since the panel
+       was opened, and "awaiting details" is green when it FELL — the arrow
+       says which way is good, so a stalled backfill reads as grey at a
+       glance without having to remember which direction each one wants. */
+    .cat-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr)); gap: 0.5rem; margin: 0.6rem 0; }
+    .cat-tile { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.6rem; }
+    .cat-tile .n { font-size: 1.35rem; font-weight: 600; line-height: 1.1; font-variant-numeric: tabular-nums; }
+    .cat-tile .lbl { color: var(--muted); font-size: 0.78rem; margin-top: 0.1rem; }
+    .cat-tile .d { font-size: 0.75rem; margin-top: 0.25rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .cat-tile .d.good { color: var(--ok); }
+    .cat-tile .d.bad { color: var(--warn); }
+    .cat-tile.alarm { border-color: var(--warn); }
+    .cat-tile.alarm .n { color: var(--warn); }
+    .cat-bar { height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; margin-top: 0.35rem; }
+    .cat-bar > i { display: block; height: 100%; background: var(--accent); }
+    .cat-workers { font-size: 0.82rem; margin-top: 0.5rem; }
+    .cat-workers td { padding: 0.3rem 0.4rem; vertical-align: top; }
+    .cat-workers .who { white-space: nowrap; font-weight: 500; }
+    .cat-workers .dot { display: inline-block; width: 0.55em; height: 0.55em; border-radius: 50%; margin-right: 0.4em; background: var(--muted); }
+    .cat-workers .dot.live { background: var(--ok); }
+    .cat-workers .dot.stale { background: var(--warn); }
+    .cat-workers .dot.dead { background: #d11; }
+    .cat-note { color: var(--muted); font-size: 0.8rem; line-height: 1.45; margin: 0.4rem 0 0; }
+    .cat-note b { color: var(--fg); font-weight: 600; }
     .abb-details { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.75rem; font-size: 0.85rem; line-height: 1.45; }
     .abb-details .meta { color: var(--muted); margin-bottom: 0.4rem; }
     .abb-details p { margin: 0 0 0.5rem 0; }
@@ -200,6 +225,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
         <input type="text" id="abb-q" placeholder="Search AudioBookBay… (title, author)" />
         <button type="button" class="search-clear" id="abb-clear" aria-label="Clear search" title="Clear">×</button>
       </span>
+      <select id="abb-search-lang" title="Language — applies to both the catalogue and the live AudioBookBay search"><option value="">Any language</option></select>
       <select id="abb-target"></select>
       <button id="abb-search">Search</button>
     </div>
@@ -222,9 +248,15 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     </details>
     <details id="abb-catalog" style="margin-top:0.5rem">
       <summary>Catalogue <span id="abb-catalog-count" class="muted"></span></summary>
-      <p class="muted" style="margin:0.4rem 0">A local copy of AudioBookBay's listings, built up by a cron tick every 5 minutes (~50 page fetches each). Search answers from it first and adds live results; a cached release goes straight to Real-Debrid without touching AudioBookBay. Each listing on ABB stops at 500 pages, so the backfill reaches roughly a year back in busy categories and everything from now on.</p>
-      <div id="abb-catalog-status" class="muted">Not loaded.</div>
-      <div id="abb-catalog-listings" class="muted" style="font-size:0.8rem; margin-top:0.4rem"></div>
+      <p class="muted" style="margin:0.4rem 0">A local copy of AudioBookBay's listings. Search answers from it first and adds live results; a cached release goes straight to Real-Debrid without touching AudioBookBay. Each listing on ABB stops at 500 pages, so the catalogue reaches roughly a year back in busy categories, plus everything from now on.</p>
+      <div id="abb-cat-tiles" class="cat-tiles"></div>
+      <p id="abb-cat-explain" class="cat-note"></p>
+      <table class="cat-workers"><tbody id="abb-cat-workers"></tbody></table>
+      <div id="abb-catalog-status" class="muted" style="font-size:0.82rem; margin-top:0.5rem">Not loaded.</div>
+      <details id="abb-cat-listings-box" style="margin-top:0.4rem">
+        <summary class="muted" style="font-size:0.82rem; cursor:pointer"><span id="abb-cat-listings-sum">Listings</span></summary>
+        <div id="abb-catalog-listings" class="muted" style="font-size:0.8rem; margin-top:0.3rem"></div>
+      </details>
       <div class="upload-row" style="margin-top:0.5rem; flex-wrap:wrap">
         <button class="secondary" id="abb-catalog-refresh">Refresh</button>
         <button class="secondary" data-catalog="run">Run a tick now</button>
@@ -1375,7 +1407,8 @@ function renderAbb(status, libraries) {
   document.getElementById('abb-cat').addEventListener('change', () => abbBrowse(1));
   abbLoadFacets();
   document.getElementById('abb-catalog-refresh').addEventListener('click', abbLoadCatalog);
-  document.getElementById('abb-catalog').addEventListener('toggle', (ev) => { if (ev.target.open) abbLoadCatalog(); });
+  document.getElementById('abb-catalog').addEventListener('toggle', (ev) => { if (ev.target.open) abbLoadCatalog(); abbCatalogPolling(); });
+  document.addEventListener('visibilitychange', abbCatalogPolling);
   for (const b of document.querySelectorAll('#abb-catalog [data-catalog]')) b.addEventListener('click', () => abbCatalogAction(b.dataset.catalog, b));
   document.getElementById('abb-budget').addEventListener('change', (ev) => abbCatalogAction('set-budget', ev.target, Number(ev.target.value)));
   abbLoadCatalog();
@@ -1471,9 +1504,11 @@ async function abbDoSearch() {
     // server-side (title from dn=) and inspects it like any release.
     const r = /^magnet:\?/i.test(q)
       ? { results: [{ title: abbMagnetTitle(q), url: null, magnet: q, cover: null, format: null, bitrate: null, sizeBytes: null, language: '', posted: null }] }
-      : await api('/api/admin/abb/search?q=' + encodeURIComponent(q));
+      : await api('/api/admin/abb/search?q=' + encodeURIComponent(q) + '&lang=' + encodeURIComponent(document.getElementById('abb-search-lang').value));
     if (!r.results.length) {
-      out.innerHTML = '<p class="muted">0 results. (If a known title returns nothing, AudioBookBay\'s page layout may have changed.)</p>';
+      out.innerHTML = r.language
+        ? '<p class="muted">0 results in ' + r.language + '. Set the language picker to "Any language" to search everything.</p>'
+        : '<p class="muted">0 results. (If a known title returns nothing, AudioBookBay\'s page layout may have changed.)</p>';
       return;
     }
     out.innerHTML = '';
@@ -1481,6 +1516,12 @@ async function abbDoSearch() {
       const p = document.createElement('p');
       p.className = 'muted';
       p.textContent = 'AudioBookBay didn\'t answer (' + r.liveError + ') — showing the catalogue only.';
+      out.appendChild(p);
+    }
+    if (r.filteredOut) {
+      const p = document.createElement('p');
+      p.className = 'muted';
+      p.textContent = r.filteredOut + ' live result(s) hidden by the ' + r.language + ' filter.';
       out.appendChild(p);
     }
     abbRenderResults(r.results, out);
@@ -1961,7 +2002,17 @@ async function abbLoadFacets() {
     };
     fill('abb-cat', f.categories, (n) => n);
     fill('abb-lang', f.languages, (n) => n);
+    fill('abb-search-lang', f.languages, (n) => n);
     fill('abb-fmt', f.formats, (n) => n.toUpperCase());
+    // Default both language pickers to English on the first load: 12,065 of
+    // 12,370 catalogued posts are English, and a foreign re-post of a popular
+    // title otherwise outranks the one you wanted. Any later choice sticks,
+    // because fill() restores the current value.
+    for (const id of ['abb-search-lang', 'abb-lang']) {
+      const sel = document.getElementById(id);
+      if (!sel.value && !sel.dataset.touched && [...sel.options].some((o) => o.value === 'English')) sel.value = 'English';
+      sel.addEventListener('change', () => { sel.dataset.touched = '1'; }, { once: true });
+    }
     document.getElementById('abb-cat').options[0].textContent = 'Latest (all categories, ' + f.total.toLocaleString() + ')';
   } catch (e) {
     console.warn('catalog facets', e);
@@ -2013,51 +2064,223 @@ function abbAgo(ts) {
   return Math.round(s / 86400) + 'd ago';
 }
 
+// Snapshot of the previous poll and of the first one since the panel was
+// opened. Rates come from the first sample (stable) and the arrows from it
+// too, so a 10s poll that happens to land between two writes doesn't flip
+// a counter to grey.
+let abbCatFirst = null;
+let abbCatTimer = null;
+
+function catTile(v, label, opts) {
+  const o = opts || {};
+  const d = document.createElement('div');
+  d.className = 'cat-tile' + (o.alarm ? ' alarm' : '');
+  const n = document.createElement('div');
+  n.className = 'n';
+  n.textContent = typeof v === 'number' ? v.toLocaleString() : v;
+  d.appendChild(n);
+  const l = document.createElement('div');
+  l.className = 'lbl';
+  l.textContent = label;
+  d.appendChild(l);
+  if (o.delta != null) {
+    const e = document.createElement('div');
+    // "good" is direction-aware: up for things that should climb, down for
+    // the backlog. Flat stays muted.
+    const moved = o.delta !== 0;
+    const good = o.down ? o.delta < 0 : o.delta > 0;
+    e.className = 'd' + (moved ? (good ? ' good' : ' bad') : '');
+    const sign = o.delta > 0 ? '+' : o.delta < 0 ? '−' : '';
+    const bits = [];
+    if (moved) bits.push(sign + Math.abs(o.delta).toLocaleString() + (o.per ? ' · ' + o.per : ''));
+    else bits.push('no change yet');
+    if (o.extra) bits.push(o.extra);
+    e.textContent = bits.join(' · ');
+    d.appendChild(e);
+  } else if (o.extra) {
+    const e = document.createElement('div');
+    e.className = 'd';
+    e.textContent = o.extra;
+    d.appendChild(e);
+  }
+  if (o.bar != null) {
+    const b = document.createElement('div');
+    b.className = 'cat-bar';
+    const i = document.createElement('i');
+    i.style.width = Math.max(0, Math.min(100, o.bar)) + '%';
+    b.appendChild(i);
+    d.appendChild(b);
+  }
+  return d;
+}
+
+// "1.4/min", or nothing when we haven't watched long enough to mean it.
+function catRate(delta, ms) {
+  if (!delta || ms < 45000) return '';
+  const perMin = Math.abs(delta) / (ms / 60000);
+  return (perMin >= 10 ? Math.round(perMin) : perMin.toFixed(1)) + '/min';
+}
+
+function catEta(remaining, delta, ms) {
+  if (!remaining || delta >= 0 || ms < 60000) return '';
+  const perMs = Math.abs(delta) / ms;
+  const mins = remaining / perMs / 60000;
+  if (mins < 90) return '~' + Math.round(mins) + ' min left';
+  if (mins < 2880) return '~' + Math.round(mins / 60) + ' h left';
+  return '~' + Math.round(mins / 1440) + ' days left';
+}
+
+function catWorkerRow(name, what, detail, lastSeen, now) {
+  const tr = document.createElement('tr');
+  const age = lastSeen ? now - lastSeen : Infinity;
+  const td1 = document.createElement('td');
+  td1.className = 'who';
+  const dot = document.createElement('span');
+  dot.className = 'dot ' + (age < 120000 ? 'live' : age < 900000 ? 'stale' : 'dead');
+  td1.appendChild(dot);
+  td1.appendChild(document.createTextNode(name));
+  tr.appendChild(td1);
+  const td2 = document.createElement('td');
+  td2.textContent = what;
+  tr.appendChild(td2);
+  const td3 = document.createElement('td');
+  td3.className = 'muted';
+  td3.style.whiteSpace = 'nowrap';
+  td3.textContent = detail;
+  tr.appendChild(td3);
+  return tr;
+}
+
 async function abbLoadCatalog() {
   const box = document.getElementById('abb-catalog-status');
   const lst = document.getElementById('abb-catalog-listings');
   const count = document.getElementById('abb-catalog-count');
   try {
     const st = await api('/api/admin/abb/catalog/status');
-    const c = st.counts, s = st.stats;
+    const c = st.counts, s = st.stats, cov = st.covers || { withCover: 0, cached: 0, failed: 0 };
+    const now = st.now || Date.now();
+    const nodes = st.nodes || [];
+    const nodeFetched = nodes.reduce((a, n) => a + (n.fetched || 0), 0);
+    const nodeCovers = nodes.reduce((a, n) => a + (n.covers || 0), 0);
+    const snap = { t: now, total: c.total, withHash: c.withHash, pending: c.pending, covers: cov.cached, nodeFetched: nodeFetched, nodeCovers: nodeCovers };
+    if (!abbCatFirst) abbCatFirst = snap;
+    const base = abbCatFirst;
+    const ms = Math.max(0, snap.t - base.t);
+
     count.textContent = c.total ? '(' + c.total.toLocaleString() + ' posts)' : '';
-    const done = st.listings.filter((l) => l.done).length;
+
+    // ── the four numbers ──
+    const tiles = document.getElementById('abb-cat-tiles');
+    tiles.innerHTML = '';
+    const dTotal = snap.total - base.total;
+    const dHash = snap.withHash - base.withHash;
+    const dPending = snap.pending - base.pending;
+    const dCovers = snap.covers - base.covers;
+    tiles.appendChild(catTile(c.total, 'posts cached', { delta: dTotal, per: catRate(dTotal, ms) }));
+    tiles.appendChild(catTile(c.withHash, 'with a magnet', {
+      delta: dHash, per: catRate(dHash, ms),
+      extra: c.total ? Math.round(c.withHash / c.total * 100) + '% of posts' : '',
+      bar: c.total ? c.withHash / c.total * 100 : 0,
+    }));
+    tiles.appendChild(catTile(c.pending, 'awaiting details', {
+      delta: dPending, down: true, per: catRate(dPending, ms),
+      extra: catEta(c.pending, dPending, ms),
+    }));
+    tiles.appendChild(catTile(cov.cached, 'covers cached', {
+      delta: dCovers, per: catRate(dCovers, ms),
+      extra: (cov.withCover - cov.cached - cov.failed).toLocaleString() + ' to go',
+      bar: cov.withCover ? cov.cached / cov.withCover * 100 : 0,
+    }));
+
+    // ── what those numbers mean (asked for it more than once) ──
+    const ex = document.getElementById('abb-cat-explain');
+    ex.innerHTML = '';
+    const p1 = document.createElement('span');
+    p1.innerHTML = 'Every post is <b>listed</b> first — title, cover, size, from the category pages — and only later <b>opened</b> to read its info hash, which is what "with a magnet" counts and what Real-Debrid needs. That second visit is one page fetch per post, hence the gap: ' + c.pending.toLocaleString() + ' posts still await it. A post without a magnet still shows in search; grabbing it just costs one live fetch first.';
+    ex.appendChild(p1);
+
+    // ── who is doing the work ──
+    const wt = document.getElementById('abb-cat-workers');
+    wt.innerHTML = '';
     const running = s.tickStartedAt && (!s.lastTick || s.tickStartedAt > s.lastTick);
-    const lines = [
-      c.total.toLocaleString() + ' posts cached · ' + c.withHash.toLocaleString() + ' with a magnet · ' + c.pending.toLocaleString() + ' awaiting details' + (c.errors ? ' · ' + c.errors + ' detail errors' : ''),
-      'Listings: ' + done + '/' + st.listings.length + ' backfilled · ' + s.pagesFetched.toLocaleString() + ' pages fetched over ' + s.ticks + ' ticks',
-      (s.paused ? 'PAUSED · ' : '') + (running ? 'Tick running (started ' + abbAgo(s.tickStartedAt) + ')' : 'Last tick ' + abbAgo(s.lastTick) + (s.lastTickMs ? ' (' + Math.round(s.lastTickMs / 1000) + 's)' : '')) + ' · ' + (s.budget || 6) + ' fetches per 2-minute tick',
-      s.backoffUntil && s.backoffUntil > Date.now() ? '⚠ BACKING OFF until ' + new Date(s.backoffUntil).toLocaleString() + ' — AudioBookBay stopped answering (episode ' + s.backoffLevel + '). Live search may be affected while the egress IP is blocked.' : null,
-      'Check-in push ' + (s.reportSentAt ? 'sent ' + abbAgo(s.reportSentAt) : 'due ' + new Date(st.reportDueAt).toLocaleDateString()),
-    ];
-    if (s.blockedTicks) lines.push('Backoff episodes so far: ' + s.blockedTicks);
-    if (s.zeroParsePages) lines.push('⚠ ' + s.zeroParsePages + ' listing page(s) parsed to 0 posts — AudioBookBay\'s markup may have changed.');
-    if (s.lastError) lines.push('Last error (' + abbAgo(s.lastErrorAt) + '): ' + s.lastError);
-    // wharf nodes burning down the detail backlog from their own IPs
-    // (wharf-project/abbcrawl). Silent when none have ever reported.
-    for (const n of st.nodes || []) {
-      lines.push('Node ' + n.node + ': ' + n.fetched.toLocaleString() + ' detail pages, ' + n.withHash.toLocaleString() + ' with a magnet'
-        + (n.errors ? ', ' + n.errors.toLocaleString() + ' errors' : '')
-        + (n.covers ? ' · ' + n.covers.toLocaleString() + ' covers' : '')
-        + ' · last seen ' + abbAgo(n.lastSeen) + (n.note ? ' · ' + n.note : ''));
+    const cronWhat = 'listing pages + newest detail pages';
+    const cronDetail = (s.paused ? 'PAUSED' : running ? 'tick running' : 'tick ' + abbAgo(s.lastTick)) + ' · ' + (s.budget || 6) + ' fetches / 2 min';
+    wt.appendChild(catWorkerRow('Cloudflare cron', cronWhat, cronDetail, s.lastTick, now));
+    for (const n of nodes) {
+      const parts = [n.fetched.toLocaleString() + ' detail pages'];
+      if (n.covers) parts.push(n.covers.toLocaleString() + ' covers');
+      if (n.errors) parts.push(n.errors.toLocaleString() + ' errors');
+      wt.appendChild(catWorkerRow(n.node, parts.join(' · '), abbAgo(n.lastSeen) + (n.note ? ' · ' + n.note : ''), n.lastSeen, now));
     }
+    if (!nodes.length) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 3;
+      td.className = 'muted';
+      td.textContent = 'No wharf nodes have reported yet (wharf-project/abbcrawl).';
+      tr.appendChild(td);
+      wt.appendChild(tr);
+    }
+
+    // ── warnings and housekeeping ──
+    const lines = [];
+    if (s.backoffUntil && s.backoffUntil > Date.now()) {
+      lines.push('⚠ BACKING OFF until ' + new Date(s.backoffUntil).toLocaleString() + ' — AudioBookBay stopped answering (episode ' + s.backoffLevel + '). Live search may be affected while the egress IP is blocked.');
+    }
+    if (s.zeroParsePages) lines.push('⚠ ' + s.zeroParsePages + ' page(s) returned HTTP 200 with no posts where there should have been some — AudioBookBay\'s markup may have changed.');
+    if (c.errors) lines.push(c.errors.toLocaleString() + ' posts whose detail page failed (dead post, or ABB was down) — "Retry errors" puts them back in the queue.');
+    if (s.lastError) lines.push('Last error (' + abbAgo(s.lastErrorAt) + '): ' + s.lastError);
+    lines.push('Check-in push ' + (s.reportSentAt ? 'sent ' + abbAgo(s.reportSentAt) : 'due ' + new Date(st.reportDueAt).toLocaleDateString()) + ' · panel refreshes every 10s while it\'s open');
     box.innerHTML = '';
-    for (const t of lines) { if (!t) continue; const d = document.createElement('div'); d.textContent = t; box.appendChild(d); }
-    const budget = document.getElementById('abb-budget');
-    if (document.activeElement !== budget) budget.value = s.budget || 6;
-    document.querySelector('#abb-catalog [data-catalog="clear-backoff"]').style.display = s.backoffUntil && s.backoffUntil > Date.now() ? '' : 'none';
+    for (const t of lines) {
+      const d = document.createElement('div');
+      d.textContent = t;
+      if (t.charAt(0) === '⚠') d.className = 'warn';
+      box.appendChild(d);
+    }
+
+    // ── listings backfill ──
+    const done = st.listings.filter((l) => l.done).length;
+    document.getElementById('abb-cat-listings-sum').textContent =
+      'Listings: ' + done + ' of ' + st.listings.length + ' walked to the end · ' + s.pagesFetched.toLocaleString() + ' pages over ' + s.ticks.toLocaleString() + ' ticks';
     lst.innerHTML = '';
+    const intro = document.createElement('p');
+    intro.className = 'cat-note';
+    intro.textContent = 'AudioBookBay shows its posts through ' + st.listings.length + ' listings (Latest, plus a page per category and language). Each is walked oldest-ward 9 posts at a time until ABB\'s 500-page wall or a 404 — that is what "walked to the end" counts. Most posts appear in several listings, so pages fetched is much larger than posts cached.';
+    lst.appendChild(intro);
     for (const l of st.listings) {
       const sp = document.createElement('span');
       sp.textContent = (l.done ? '✓ ' : l.page ? '… ' : '· ') + l.name + (l.page ? ' p' + l.page : '') + (l.error ? ' ⚠' : '');
-      if (l.error) sp.title = l.error;
+      if (l.error) { sp.className = 'warn'; sp.title = 'Stopped on an error, retried next tick: ' + l.error; }
+      else if (l.done) sp.title = 'Finished' + (l.ended ? ' (' + l.ended + ')' : ' (reached a 404 or ABB\'s 500-page wall)') + ' · ' + l.posts.toLocaleString() + ' posts seen, ' + l.added.toLocaleString() + ' new';
+      else if (l.page) sp.title = 'In progress at page ' + l.page;
+      else sp.title = 'Not started yet';
       lst.appendChild(sp);
     }
+
+    const budget = document.getElementById('abb-budget');
+    if (document.activeElement !== budget) budget.value = s.budget || 6;
+    document.querySelector('#abb-catalog [data-catalog="clear-backoff"]').style.display = s.backoffUntil && s.backoffUntil > Date.now() ? '' : 'none';
     document.querySelector('#abb-catalog [data-catalog="pause"]').style.display = s.paused ? 'none' : '';
     document.querySelector('#abb-catalog [data-catalog="resume"]').style.display = s.paused ? '' : 'none';
   } catch (e) {
     box.textContent = 'Couldn\'t load: ' + e.message;
   }
+}
+
+// Poll while the panel is open and the tab is in front — the numbers are the
+// point of the panel, and it used to only refresh when the whole page was
+// re-shown. Stops on close so a forgotten tab isn't hitting D1 all day.
+function abbCatalogPolling() {
+  const open = document.getElementById('abb-catalog').open;
+  const want = open && document.visibilityState === 'visible';
+  if (want && !abbCatTimer) {
+    abbCatTimer = setInterval(abbLoadCatalog, 10000);
+  } else if (!want && abbCatTimer) {
+    clearInterval(abbCatTimer);
+    abbCatTimer = null;
+  }
+  if (!open) abbCatFirst = null;   // next open starts its own baseline
 }
 
 async function abbCatalogAction(action, btn, value) {

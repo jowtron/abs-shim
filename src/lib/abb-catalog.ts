@@ -55,6 +55,9 @@ export type ListingState = {
   added: number;            // posts that were new to the catalogue
   lastFirstUrl: string | null; // wall detection: page N+1 repeating page N's first post
   error: string | null;
+  // How a finished listing finished, when it wasn't a clean 404. Not an
+  // error — /admin shows a ⚠ for `error` only.
+  ended?: string;
   finishedAt: number | null;
 };
 
@@ -267,15 +270,21 @@ export function ftsQuery(q: string): string | null {
   return toks.length ? toks.map((t) => `"${t}"*`).join(' ') : null;
 }
 
-export async function catalogSearch(env: Env, q: string, limit = 50, offset = 0): Promise<AbbResult[]> {
+// `language` matches ABB's own label ('English', 'Spanish', …) and is what
+// both UIs default to English with — 12,065 of 12,370 catalogued posts are
+// English, so the handful of foreign-language re-posts of a popular title
+// used to bury the one people wanted. A post whose language didn't parse
+// (NULL) is excluded by a filter, deliberately: unknown is not English.
+export async function catalogSearch(env: Env, q: string, limit = 50, offset = 0, language?: string): Promise<AbbResult[]> {
   const match = ftsQuery(q);
   if (!match) return [];
+  const lang = language?.trim() ?? '';
   const rows = await env.DB.prepare(
     `SELECT p.* FROM abb_posts_fts f JOIN abb_posts p ON p.id = f.rowid
-       WHERE abb_posts_fts MATCH ?
+       WHERE abb_posts_fts MATCH ?${lang ? ' AND p.language = ? COLLATE NOCASE' : ''}
        ORDER BY bm25(abb_posts_fts, 10.0, 6.0, 3.0, 1.0), p.posted_ts DESC
        LIMIT ? OFFSET ?`,
-  ).bind(match, limit, offset).all<CatalogRow>();
+  ).bind(...(lang ? [match, lang] : [match]), limit, offset).all<CatalogRow>();
   return rows.results.map(rowToResult);
 }
 
@@ -397,16 +406,19 @@ async function paced(t: Tick, path: string): Promise<{ status: number; html: str
 class BudgetExhausted extends Error {}
 
 // One listing page → parsed posts (or null when the page doesn't exist).
-async function fetchListingPage(t: Tick, path: string, page: number): Promise<{ posts: AbbResult[]; html: string } | null> {
+// `alarmOnEmpty` is false deep inside a listing walk: ABB is *supposed* to
+// answer past-the-end with a 404, but in practice several listings simply
+// serve an empty 200, and counting those as markup drift lit the /admin
+// alarm four times for listings that had merely finished (2026-09-03). On
+// page 1 and on the fresh pass an empty page can't mean "the end" — that's
+// where real drift shows up, and that's where we still shout.
+async function fetchListingPage(t: Tick, path: string, page: number, alarmOnEmpty = false): Promise<{ posts: AbbResult[]; html: string } | null> {
   const p = page > 1 ? `${path}page/${page}/` : path;
   const { status, html } = await paced(t, p);
   if (status === 404) return null;
   if (status < 200 || status >= 300) throw new Error(`HTTP ${status} on ${p}`);
   const posts = parseResults(html);
-  if (!posts.length && html.length > 5000) {
-    // ABB answers a real end-of-listing with a 404, so a 200 with no posts
-    // is either the site's markup changing or a challenge page. Count it so
-    // /admin can show the alarm.
+  if (!posts.length && html.length > 5000 && alarmOnEmpty) {
     t.stats.zeroParsePages++;
     noteError(t, `parser found 0 posts on ${p} (HTTP 200, ${html.length} bytes)`);
   }
@@ -421,7 +433,7 @@ async function freshPass(env: Env, t: Tick, known: Set<string>): Promise<void> {
   if (t.stats.lastFresh && Date.now() - t.stats.lastFresh < FRESH_EVERY_MS) return;
   t.stats.lastFresh = Date.now();
   for (let page = 1; page <= FRESH_PAGES; page++) {
-    const r = await fetchListingPage(t, '/', page);
+    const r = await fetchListingPage(t, '/', page, true);
     if (!r || !r.posts.length) break;
     if (page === 1) await discoverListings(env, r.html, known);
     const added = await upsertPosts(env, r.posts);
@@ -444,7 +456,7 @@ async function backfillPass(env: Env, t: Tick, pages: number): Promise<boolean> 
     if (page > LISTING_CAP) { st.done = true; st.finishedAt = Date.now(); break; }
     let r: { posts: AbbResult[]; html: string } | null;
     try {
-      r = await fetchListingPage(t, cur.path, page);
+      r = await fetchListingPage(t, cur.path, page, page === 1);
     } catch (e) {
       if (e instanceof BlockedError || e instanceof BudgetExhausted) { await save(); throw e; }
       st.error = (e as Error).message;
@@ -457,7 +469,7 @@ async function backfillPass(env: Env, t: Tick, pages: number): Promise<boolean> 
       // ABB's 500-page wall (pages beyond it echo the last real page).
       st.done = true;
       st.finishedAt = Date.now();
-      if (r && !r.posts.length) st.error = 'parser found 0 posts';
+      if (r && !r.posts.length) st.ended = 'last page was empty';
       break;
     }
     st.page = page;
@@ -627,16 +639,24 @@ export async function runCatalogTick(env: Env, opts: { force?: boolean } = {}): 
 
 export async function catalogStatus(env: Env): Promise<{
   stats: CrawlStats; counts: CatalogCounts;
-  listings: Array<{ path: string; name: string; page: number; done: boolean; posts: number; added: number; error: string | null }>;
+  listings: Array<{ path: string; name: string; page: number; done: boolean; posts: number; added: number; error: string | null; ended: string | null }>;
   reportDueAt: number;
   nodes: NodeStat[];
+  covers: { withCover: number; cached: number; failed: number };
+  now: number;
 }> {
   const stats = await loadStats(env);
-  const [counts, listings, nodes] = await Promise.all([catalogCounts(env), listListings(env), listNodes(env)]);
+  const [counts, listings, nodes, covers] = await Promise.all([catalogCounts(env), listListings(env), listNodes(env), coverStats(env)]);
   return {
-    stats, counts, nodes,
-    listings: listings.map((l) => ({ path: l.path, name: l.state.name, page: l.state.page, done: l.state.done, posts: l.state.posts, added: l.state.added, error: l.state.error })),
+    stats, counts, nodes, covers,
+    listings: listings.map((l) => ({
+      path: l.path, name: l.state.name, page: l.state.page, done: l.state.done,
+      posts: l.state.posts, added: l.state.added, error: l.state.error, ended: l.state.ended ?? null,
+    })),
     reportDueAt: stats.startedAt + REPORT_AFTER_MS,
+    // Lets the dashboard compute rates against the server's clock instead of
+    // the browser's, which can be minutes off.
+    now: Date.now(),
   };
 }
 
