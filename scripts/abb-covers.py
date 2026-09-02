@@ -44,7 +44,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from PIL import Image
@@ -210,8 +210,16 @@ def one_pass(sess, args, quality, limit):
                 return False, msg
 
         skipped = 0
+        batch_done = 0
+        batch_t0 = time.time()
+        last_print = 0.0
+        total_pending = st['withCover'] - st['cached'] - st['failed']
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            for p, (ok, info) in zip(pending, ex.map(work, pending)):
+            futures = {ex.submit(work, p): p for p in pending}
+            for fut in as_completed(futures):
+                p = futures[fut]
+                ok, info = fut.result()
+                batch_done += 1
                 if ok:
                     done += 1
                 elif ok is None:
@@ -219,7 +227,17 @@ def one_pass(sess, args, quality, limit):
                 else:
                     failed += 1
                     log(f"  {p['id']} failed: {info}")
-        log(f"  ok {done}, failed {failed}, {time.time() - t0:.0f}s")
+                # One line, rewritten in place every ~3s: batch progress, overall progress, rate, ETA.
+                now = time.time()
+                if now - last_print >= 3 or batch_done == len(pending):
+                    last_print = now
+                    rate = (done + failed) / max(now - t0, 1)
+                    left = max(total_pending - (done + failed), 0)
+                    eta = f"{left / rate / 60:.0f} min" if rate > 0 else "?"
+                    sys.stdout.write(f"\r  {batch_done}/{len(pending)} this batch · {st['cached'] + done}/{st['withCover']} overall · {rate:.1f}/s · ~{eta} left   ")
+                    sys.stdout.flush()
+        sys.stdout.write("\n")
+        log(f"  batch done in {time.time() - batch_t0:.0f}s — ok {done}, failed {failed} so far this run")
         if skipped == len(pending):
             # Everything hit the network — don't spin, let the caller sleep.
             raise ConnectionError("network unavailable")
