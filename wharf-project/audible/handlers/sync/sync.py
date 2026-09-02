@@ -13,7 +13,7 @@ Per title, sequentially (one slot, ~1 GB of scratch at a time):
      m4b with the library's tags, chapters written as an ffmetadata file
      (so they land as a Nero chpl atom, which the shim's prober reads),
      and the cover attached
-  3. rclone copyto → pcloud:<dest_root>/<Title - Author>/<Title>.m4b
+  3. rclone copyto → pcloud:<dest_root>/Audible/<account>/<Title - Author>/<Title>.m4b
   4. record in data/synced/<account>.json, delete the working dir
 
 Progress goes to stderr (the shim tails the job log); the result JSON is
@@ -150,11 +150,14 @@ def sync_one(account, item, dest_root, quality):
         raise RuntimeError(f"ffmpeg failed: {(r.stderr or '').strip()[-400:]}")
     L.log(f"[{asin}] m4b ready ({out.stat().st_size / 1024 / 1024:.0f} MB, {len(chapters)} chapters); uploading…")
 
-    dest = f"pcloud:{dest_root.strip('/')}/{folder}/{out.name}"
+    # Keep Audible backups apart from everything else in the library:
+    # <root>/Audible/<account>/<Title - Author>/<Title>.m4b (Joseph's ask,
+    # 2026-09-02). The scanner walks subfolders, so the nesting is free.
+    dest = f"pcloud:{dest_root.strip('/')}/Audible/{account}/{folder}/{out.name}"
     r = L.run(["rclone", "copyto", str(out), dest, "--retries", "5", "--low-level-retries", "20", "--stats", "0"], timeout=3 * 3600)
     if r.returncode != 0:
         raise RuntimeError(f"rclone upload failed: {(r.stderr or '').strip()[-300:]}")
-    rel = f"{folder}/{out.name}"
+    rel = f"Audible/{account}/{folder}/{out.name}"
     rec = {"path": rel, "bytes": out.stat().st_size, "at": int(time.time() * 1000), "chapters": len(chapters)}
     synced_path = L.SYNCED_DIR / f"{account}.json"
     synced = L.load_json(synced_path, {})
