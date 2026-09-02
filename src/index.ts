@@ -50,7 +50,10 @@ app.use('*', cors({
   // Range is not CORS-safelisted — without it in allowHeaders, Safari blocks
   // every cross-origin fetch() that sets a Range header (Pholia's download /
   // auto-cache paths) at preflight, even though native <audio> loads work.
-  allowHeaders: ['Authorization', 'Content-Type', 'Range'],
+  // X-Playback-Session-Id / If-Range: iOS adds them to media requests, and
+  // a Service Worker that re-issues such a request with fetch() gets a
+  // preflight carrying them (Pholia's partial-cache bridge, 2026-09-03).
+  allowHeaders: ['Authorization', 'Content-Type', 'Range', 'If-Range', 'Accept', 'X-Playback-Session-Id'],
   exposeHeaders: ['Content-Range', 'Accept-Ranges'],
 }));
 
