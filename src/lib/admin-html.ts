@@ -1790,7 +1790,11 @@ async function audibleLoadJobs() {
   try {
     const r = await api('/api/admin/audible/jobs');
     list.innerHTML = '';
-    count.textContent = r.jobs.length ? '(' + r.jobs.filter((j) => j.state === 'running' || j.state === 'pending').length + ' active)' : '';
+    const active = r.jobs.filter((j) => j.state === 'running' || j.state === 'pending').length;
+    count.textContent = r.jobs.length ? '(' + active + ' active)' : '';
+    // A sync in progress is the thing you came back to look at: open the
+    // section on (re)load instead of leaving it collapsed.
+    if (active) document.getElementById('audible-jobs').open = true;
     if (!r.jobs.length) { list.textContent = 'No sync jobs yet.'; return; }
     for (const j of r.jobs) {
       const row = appendUploadRow(list, j.account + ': ' + (j.count === 'all' ? 'everything' : j.count + ' title' + (j.count === 1 ? '' : 's')) + ' · ' + new Date(j.startedAt).toLocaleString(), j.state);
