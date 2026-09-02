@@ -324,10 +324,17 @@ app.patch('/api/me/progress/batch/update', requireAuth, async (c) => {
   return c.body(null, 200);
 });
 
-// In-flight session sync. ABS clients POST currentTime + timeListening every
+// In-flight session sync. ABS clients POST currentTime + timeListened every
 // few seconds while playing. We mirror it into the session row + bump the
 // per-item progress so the position survives reload. Body is `{currentTime,
-// timeListening, duration?}`.
+// timeListened, duration?}` — real ABS spells it timeListened (Pholia,
+// ShelfPlayer); the old timeListening spelling is still accepted. It's the
+// delta since the client's last sync, so it accumulates on the row.
+function listenedDelta(body: Record<string, unknown>): number {
+  const v = typeof body['timeListened'] === 'number' ? body['timeListened'] : body['timeListening'];
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
+}
+
 app.post('/api/session/:id/sync', requireAuth, async (c) => {
   const userRow = c.get('user');
   const sid = c.req.param('id');
@@ -338,14 +345,14 @@ app.post('/api/session/:id/sync', requireAuth, async (c) => {
 
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const currentTime = typeof body['currentTime'] === 'number' ? body['currentTime'] : 0;
-  const timeListening = typeof body['timeListening'] === 'number' ? body['timeListening'] : 0;
+  const timeListened = listenedDelta(body);
   const now = Date.now();
 
   await c.env.DB.prepare(
     `UPDATE listening_sessions
-       SET current_time_seconds = ?, time_listening_seconds = ?, updated_at = ?
+       SET current_time_seconds = ?, time_listening_seconds = time_listening_seconds + ?, updated_at = ?
        WHERE id = ?`,
-  ).bind(currentTime, timeListening, now, sid).run();
+  ).bind(currentTime, timeListened, now, sid).run();
 
   // Mirror into media_progress so the next /login or /api/me reflects position.
   if (session.library_item_id && session.duration_seconds > 0) {
@@ -368,16 +375,16 @@ app.post('/api/session/:id/close', requireAuth, async (c) => {
   const sid = c.req.param('id');
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const currentTime = typeof body['currentTime'] === 'number' ? body['currentTime'] : null;
-  const timeListening = typeof body['timeListening'] === 'number' ? body['timeListening'] : null;
+  const timeListened = listenedDelta(body);
   const now = Date.now();
 
   await c.env.DB.prepare(
     `UPDATE listening_sessions
        SET current_time_seconds = COALESCE(?, current_time_seconds),
-           time_listening_seconds = COALESCE(?, time_listening_seconds),
+           time_listening_seconds = time_listening_seconds + ?,
            closed_at = ?, updated_at = ?
        WHERE id = ? AND user_id = ?`,
-  ).bind(currentTime, timeListening, now, now, sid, userRow.id).run();
+  ).bind(currentTime, timeListened, now, now, sid, userRow.id).run();
   return c.body(null, 200);
 });
 
