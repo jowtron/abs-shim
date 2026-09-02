@@ -219,6 +219,7 @@ def one_pass(sess, args, quality, limit):
 
         skipped = 0
         batch_done = 0
+        done_at_start = done   # st['cached'] already counts earlier batches of this run
         batch_t0 = time.time()
         last_print = 0.0
         total_pending = st['withCover'] - st['cached'] - st['failed']
@@ -242,7 +243,7 @@ def one_pass(sess, args, quality, limit):
                     rate = (done + failed) / max(now - t0, 1)
                     left = max(total_pending - (done + failed), 0)
                     eta = f"{left / rate / 60:.0f} min" if rate > 0 else "?"
-                    sys.stdout.write(f"\r  {batch_done}/{len(pending)} this batch · {st['cached'] + done}/{st['withCover']} overall · {rate:.1f}/s · ~{eta} left   ")
+                    sys.stdout.write(f"\r  {batch_done}/{len(pending)} this batch · {st['cached'] + (done - done_at_start)}/{st['withCover']} overall · {rate:.1f}/s · ~{eta} left   ")
                     sys.stdout.flush()
         sys.stdout.write("\n")
         log(f"  batch done in {time.time() - batch_t0:.0f}s — ok {done}, failed {failed} so far this run")
