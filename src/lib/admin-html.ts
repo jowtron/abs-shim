@@ -1809,9 +1809,12 @@ async function audibleLoadJobs() {
         row.setStatus(j.state + '…');
         row.addButton('Cancel', async () => { await api('/api/admin/audible/jobs/' + encodeURIComponent(j.id) + '/cancel', { method: 'POST' }); audibleLoadJobs(); });
         if (!audibleWatching.has(j.id)) {
-          audibleWatching.set(j.id, setTimeout(() => { audibleWatching.delete(j.id); audibleLoadJobs(); }, 15000));
+          // While a job runs: the log every 5 s (progress lines from the
+          // download), the job list every 20 s (state changes).
           log.style.display = '';
           audibleTailLog(j.id, log);
+          const logTimer = setInterval(() => audibleTailLog(j.id, log), 5000);
+          audibleWatching.set(j.id, setTimeout(() => { clearInterval(logTimer); audibleWatching.delete(j.id); audibleLoadJobs(); }, 20000));
         }
       }
     }
