@@ -66,6 +66,8 @@ ShelfPlayer uses strict Swift Codable — one field type mismatch fails the enti
 - `media.tracks` is required for playback — built from audioFiles with cumulative `startOffset` in `buildTracks()`.
 - `/api/*` paths MUST return JSON 404, never the SPA index.html — strict clients parse HTML 200 as garbage and go offline.
 - See `~/.claude/projects/-Users-joseph-Claude-Code-ABS-shim/memory/reference_shelfplayer_quirks.md` for the full debugging methodology.
+- Session sync bodies use `timeListened` (real ABS spelling; Pholia and ShelfPlayer send it) — `listenedDelta()` in `src/index.ts` also accepts the old `timeListening`. It's a per-sync delta, so it's ADDED to `listening_sessions.time_listening_seconds`.
+- CORS `allowHeaders` must keep `X-Playback-Session-Id` (plus `If-Range`, `Accept`): Pholia's service worker re-issues iOS media requests as CORS fetches when it serves a partially cached book, and iOS adds that header to every media request. Without it the preflight fails and playback dies at the cache edge. iOS also requires every response in one media load to have the same CORS status, so the shim's file route must behave identically for CORS and no-cors requests (it does — don't add Origin-dependent branches).
 
 When adding a new client integration: open `wrangler tail --format pretty` and use `gh api repos/<owner>/<repo>/contents/<path> --jq '.content' | base64 -d` to read Swift Codable structs. Diff the strict types against `src/lib/abs-shapes.ts` output.
 
