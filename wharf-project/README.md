@@ -16,7 +16,7 @@ the cap differs per box:
 
 ```sh
 ssh <host> "systemctl show wharfd -p MemoryMax -p MemoryCurrent"
-# stereo-nz    536870912  (512 MB)   ← raised 2026-09-03
+# stereo-nz    536870912  (512 MB)   ← raised 2026-09-03; runs both, peaks ~103 MB
 # stereo-au    536870912  (512 MB)   ← raised 2026-09-03
 # wharf-syd-1  469762048  (448 MB)
 # incrediblepbx 134217728 (128 MB)   ← correct: that box really has 451 MB
@@ -65,8 +65,10 @@ an IP that bursts (≈50 pages in 3 min got the dev Mac dropped, 2026-09-02).
 - **Covers** are partitioned by `id % ABS_SHIM_SHARDS == ABS_SHIM_SHARD`, so
   extra runners can be added without resizing anything twice. No lease: the
   partition is fixed, and a duplicate PUT would waste a download, not corrupt
-  anything. Only syd runs it today, so it's shard 0 of 1 — an unsharded Mac
-  run alongside it duplicates the work.
+  anything. Both nodes run it as of 2026-09-03 (nz = shard 0, syd = shard 1):
+  one runner stopped keeping up once the listing backfill started adding ~30
+  posts a minute, each with a cover. An unsharded Mac run alongside them
+  duplicates the work.
 - Pacing is per node: `PACE_SECONDS=8` ≈ 7 pages/min each, well under the
   rate that got an IP firewalled. Three consecutive failures and a node
   hands its batch back and sleeps 30 min, doubling to 6 h.

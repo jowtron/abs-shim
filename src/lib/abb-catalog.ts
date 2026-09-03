@@ -707,21 +707,28 @@ const CLAIM_LEASE_MS = 10 * 60 * 1000;  // a node gets this long per batch
 const CLAIM_MAX = 25;
 
 export type DetailClaim = { id: number; url: string; title: string };
-export type NodeStat = { node: string; lastSeen: number; claimed: number; fetched: number; withHash: number; errors: number; covers: number; note: string | null };
+// `noHash` is counted apart from `errors` on purpose: a page that loads fine
+// but carries no info hash is ABB's doing, not a failure of ours, and lumping
+// the two together made a healthy node look sick (9 "errors" on stereo-nz on
+// 2026-09-03 were 7 hashless pages plus 2 timeouts).
+export type NodeStat = { node: string; lastSeen: number; claimed: number; fetched: number; withHash: number; noHash: number; errors: number; covers: number; note: string | null };
 
 // One row per node (`node:<name>`), not one shared blob: two nodes report
 // concurrently and a read-modify-write on a single key would lose counts.
 async function bumpNode(env: Env, node: string, d: Partial<Omit<NodeStat, 'node'>>): Promise<void> {
   // `covers` post-dates the first nodes' rows, so default it after the spread.
   const saved = await getState<NodeStat>(env, 'node:' + node);
-  const cur: NodeStat = { node, lastSeen: 0, claimed: 0, fetched: 0, withHash: 0, errors: 0, covers: 0, note: null, ...(saved ?? {}) };
+  const cur: NodeStat = { node, lastSeen: 0, claimed: 0, fetched: 0, withHash: 0, noHash: 0, errors: 0, covers: 0, note: null, ...(saved ?? {}) };
+  // Fields added after the first nodes started reporting.
   cur.covers = cur.covers ?? 0;
+  cur.noHash = cur.noHash ?? 0;
   await setState(env, 'node:' + node, {
     ...cur, node, lastSeen: Date.now(),
     claimed: cur.claimed + (d.claimed ?? 0),
     fetched: cur.fetched + (d.fetched ?? 0),
     withHash: cur.withHash + (d.withHash ?? 0),
     errors: cur.errors + (d.errors ?? 0),
+    noHash: cur.noHash + (d.noHash ?? 0),
     covers: cur.covers + (d.covers ?? 0),
     note: d.note !== undefined ? d.note : cur.note,
   } satisfies NodeStat);
@@ -795,7 +802,7 @@ export async function detailSubmit(env: Env, node: string, s: DetailSubmission):
   const d = parseDetails(url, s.html);
   await catalogRecordDetails(env, d, hash);
   if (!hash) await env.DB.prepare('UPDATE abb_posts SET detail_error = ? WHERE url = ?').bind('no info hash on page', url).run();
-  await bumpNode(env, node, { fetched: 1, withHash: hash ? 1 : 0, errors: hash ? 0 : 1, note: null });
+  await bumpNode(env, node, { fetched: 1, withHash: hash ? 1 : 0, noHash: hash ? 0 : 1, note: null });
   return { ok: true, hash };
 }
 

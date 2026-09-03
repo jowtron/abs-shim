@@ -125,6 +125,15 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     .cat-bar > i { display: block; height: 100%; background: var(--accent); }
     .cat-workers { font-size: 0.82rem; margin-top: 0.5rem; }
     .cat-workers td { padding: 0.3rem 0.4rem; vertical-align: top; }
+    /* On a phone the three columns squeeze "612 detail pages · 147 covers"
+       into a 5-character gutter. Stack each worker into one block instead. */
+    @media (max-width: 560px) {
+      .cat-workers, .cat-workers tbody, .cat-workers tr, .cat-workers td { display: block; width: auto; }
+      .cat-workers tr { border-bottom: 1px solid var(--border); padding: 0.35rem 0; }
+      .cat-workers td { border: 0; padding: 0 0 0.1rem 0; }
+      .cat-workers td:first-child { font-weight: 600; }
+      .cat-workers td:not(:first-child) { padding-left: 1.1rem; }
+    }
     .cat-workers .who { white-space: nowrap; font-weight: 500; }
     .cat-workers .dot { display: inline-block; width: 0.55em; height: 0.55em; border-radius: 50%; margin-right: 0.4em; background: var(--muted); }
     .cat-workers .dot.live { background: var(--ok); }
@@ -2209,7 +2218,9 @@ async function abbLoadCatalog() {
     for (const n of nodes) {
       const parts = [n.fetched.toLocaleString() + ' detail pages'];
       if (n.covers) parts.push(n.covers.toLocaleString() + ' covers');
-      if (n.errors) parts.push(n.errors.toLocaleString() + ' errors');
+      // A hashless page is ABB's doing, not a fault — kept out of the error count.
+      if (n.noHash) parts.push(n.noHash.toLocaleString() + ' with no hash');
+      if (n.errors) parts.push(n.errors.toLocaleString() + (n.errors === 1 ? ' error' : ' errors'));
       wt.appendChild(catWorkerRow(n.node, parts.join(' · '), abbAgo(n.lastSeen) + (n.note ? ' · ' + n.note : ''), n.lastSeen, now));
     }
     if (!nodes.length) {
