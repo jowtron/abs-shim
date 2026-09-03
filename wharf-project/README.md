@@ -16,16 +16,30 @@ the cap differs per box:
 
 ```sh
 ssh <host> "systemctl show wharfd -p MemoryMax -p MemoryCurrent"
-# stereo-nz    134217728  (128 MB)   ← fits abbcrawl only
-# wharf-syd-1  469762048  (448 MB)   ← fits both
+# stereo-nz    536870912  (512 MB)   ← raised 2026-09-03
+# stereo-au    536870912  (512 MB)   ← raised 2026-09-03
+# wharf-syd-1  469762048  (448 MB)
+# incrediblepbx 134217728 (128 MB)   ← correct: that box really has 451 MB
 ```
 
 Deploying both to stereo-nz on 2026-09-03 OOM-killed wharfd **75 times in an
 hour** — and every kill restarted that node's other services too (netprobe,
-and cfpbx-stereo's ESL forwarder). The box has 7.3 GB of RAM; the 128 MB cap
-is a leftover from the 450 MB VPS profile the unit was copied from. Raising it
-is a systemd change on a box that carries PBX traffic, so it's Joseph's call,
-not something to do in passing.
+and cfpbx-stereo's ESL forwarder). The cap was 128 MB on a box with 7.3 GB of
+RAM: wharf's installer ships one profile sized for the 450 MB PBX VPS, and
+both stereo boxes inherited it. Both are now 512 MB via a drop-in:
+
+```
+/etc/systemd/system/wharfd.service.d/20-memory.conf
+[Service]
+MemoryMax=512M
+```
+
+A drop-in rather than an edit to the shipped unit, so a wharf update keeps it
+and `rm` on that one file reverts. `GOMEMLIMIT=64MiB` in the shipped unit is
+Go's soft target for wharfd's own heap and is deliberately left alone — the
+headroom is for the services wharfd supervises. Note that *job* handlers are
+capped separately (`systemd-run --scope`, e.g. audible's `max_memory_mb`), so
+they don't spend this budget; `[[services]]` processes do.
 
 The shim routes they use: `POST /api/admin/abb/catalog/details/{claim,submit}`
 (owner-only) and `GET/PUT /api/admin/abb/catalog/covers/*`.
