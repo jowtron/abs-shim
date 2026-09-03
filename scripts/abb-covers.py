@@ -211,24 +211,58 @@ def one_pass(sess, args, quality, limit):
             break
         log(f"[{st['cached']}/{st['withCover']} cached, {st['failed']} failed] processing {len(pending)}…")
 
+        def mark(p, msg):
+            """Record a permanent failure so the shim stops handing it back."""
+            try:
+                sess.call(f"/api/admin/abb/catalog/covers/{p['id']}/error", "POST", {"error": msg})
+            except Exception:  # noqa: BLE001
+                pass
+            return False, msg
+
         def work(p):
+            # Three steps, three failure meanings — they used to share one
+            # try/except, and since UnidentifiedImageError and HTTPError are
+            # both OSError subclasses, a dead link and a corrupt JPEG were
+            # both filed as "our network is flaky, try again next pass". They
+            # never went away, so every batch refilled with the same corpses
+            # and roughly one image in sixty got through (2026-09-03).
             try:
                 data = fetch_image(p["url"])
-                webp, _dims = to_webp(data, args.max, quality)
-                sess.call(f"/api/admin/abb/catalog/covers/{p['id']}{node_qs(args)}", "PUT", webp, "image/webp")
-                return True, len(webp)
+            except urllib.error.HTTPError as e:
+                # MUST come before URLError, which is its base class. The host
+                # answered — 403 (hotlink/UA blocked), 404 (dead image), 523
+                # (Cloudflare can't reach the origin) — so this is the cover's
+                # problem, not ours, and retrying it every pass forever is what
+                # jammed the runner: by 2026-09-03 a growing pool of permanent
+                # 403s sat at the head of every batch and only ~1 image in 60
+                # got through. Record it so the shim stops handing it back;
+                # "Retry cover errors" in /admin puts them all back if a host
+                # comes good.
+                return mark(p, f"HTTP {e.code}")
             except (urllib.error.URLError, TimeoutError, OSError) as e:
-                # Could be our network (lid just opened) rather than the cover: leave it pending.
+                # No answer at all — our network, or the host being down. Worth
+                # another pass, so leave it pending.
                 return None, str(e)[:180]
+
+            # Whatever came back isn't a usable image (an HTML error page, a
+            # truncated file). That won't change on a retry either.
+            try:
+                webp, _dims = to_webp(data, args.max, quality)
             except Exception as e:  # noqa: BLE001
-                msg = str(e)[:180]
-                try:
-                    sess.call(f"/api/admin/abb/catalog/covers/{p['id']}/error", "POST", {"error": msg})
-                except Exception:  # noqa: BLE001
-                    pass
-                return False, msg
+                return mark(p, "not an image: " + str(e)[:60])
+
+            try:
+                sess.call(f"/api/admin/abb/catalog/covers/{p['id']}{node_qs(args)}", "PUT", webp, "image/webp")
+            except urllib.error.HTTPError as e:
+                return mark(p, f"shim rejected it: HTTP {e.code}")
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                return None, str(e)[:180]   # shim unreachable — try again later
+            return True, len(webp)
 
         skipped = 0
+        # Reasons, counted: a silent skip pile is what hid the 403 loop.
+        skips = {}
+        fails = {}
         batch_done = 0
         done_at_start = done   # st['cached'] already counts earlier batches of this run
         batch_t0 = time.time()
@@ -244,9 +278,10 @@ def one_pass(sess, args, quality, limit):
                     done += 1
                 elif ok is None:
                     skipped += 1
+                    skips[info.split(':')[0][:40]] = skips.get(info.split(':')[0][:40], 0) + 1
                 else:
                     failed += 1
-                    log(f"  {p['id']} failed: {info}")
+                    fails[str(info)[:40]] = fails.get(str(info)[:40], 0) + 1
                 # One line, rewritten in place every ~3s: batch progress, overall progress, rate, ETA.
                 now = time.time()
                 if now - last_print >= 3 or batch_done == len(pending):
@@ -257,7 +292,11 @@ def one_pass(sess, args, quality, limit):
                     sys.stdout.write(f"\r  {batch_done}/{len(pending)} this batch · {st['cached'] + (done - done_at_start)}/{st['withCover']} overall · {rate:.1f}/s · ~{eta} left   ")
                     sys.stdout.flush()
         sys.stdout.write("\n")
-        log(f"  batch done in {time.time() - batch_t0:.0f}s — ok {done}, failed {failed} so far this run")
+        def top(d):
+            return ', '.join(f"{k}×{v}" for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:3])
+        log(f"  batch done in {time.time() - batch_t0:.0f}s — ok {done}, failed {failed} so far this run"
+            + (f" · this batch skipped {skipped} ({top(skips)})" if skipped else "")
+            + (f" · marked {top(fails)}" if fails else ""))
         if skipped == len(pending):
             # Everything hit the network — don't spin, let the caller sleep.
             raise ConnectionError("network unavailable")

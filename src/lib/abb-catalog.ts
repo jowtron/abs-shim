@@ -58,6 +58,8 @@ export type ListingState = {
   // How a finished listing finished, when it wasn't a clean 404. Not an
   // error — /admin shows a ⚠ for `error` only.
   ended?: string;
+  // Consecutive empty-but-200 pages at the cursor. See backfillPass.
+  emptyStreak?: number;
   finishedAt: number | null;
 };
 
@@ -464,14 +466,30 @@ async function backfillPass(env: Env, t: Tick, pages: number): Promise<boolean> 
       break; // leave the cursor; next tick retries this page
     }
     const first = r?.posts[0]?.url ?? null;
-    if (!r || !r.posts.length || (first && first === st.lastFirstUrl)) {
+    if (!r || (first && first === st.lastFirstUrl)) {
       // 404 = past the end; a repeat of the previous page's first post is
       // ABB's 500-page wall (pages beyond it echo the last real page).
       st.done = true;
       st.finishedAt = Date.now();
-      if (r && !r.posts.length) st.ended = 'last page was empty';
+      st.emptyStreak = 0;
       break;
     }
+    if (!r.posts.length) {
+      // An empty HTTP 200 is ABB's *other* way of saying end-of-listing — but
+      // it's also what a blank/hiccup page looks like, and treating the first
+      // one as final retired listings that plainly weren't finished (2026-09-03:
+      // "Action" stopped at page 4, "Adventure" at 11). Leave the cursor where
+      // it is and try the same page again next tick; only a second empty in a
+      // row ends the walk.
+      st.emptyStreak = (st.emptyStreak ?? 0) + 1;
+      if (st.emptyStreak >= 2) {
+        st.done = true;
+        st.finishedAt = Date.now();
+        st.ended = 'two empty pages in a row';
+      }
+      break;
+    }
+    st.emptyStreak = 0;
     st.page = page;
     st.pages++;
     st.posts += r.posts.length;
@@ -660,28 +678,45 @@ export async function catalogStatus(env: Env): Promise<{
   };
 }
 
-export type CatalogAction = 'pause' | 'resume' | 'retry-errors' | 'restart-backfill' | 'reset-report' | 'set-budget' | 'clear-backoff';
+export type CatalogAction = 'pause' | 'resume' | 'retry-errors' | 'retry-cover-errors' | 'restart-backfill' | 'reset-report' | 'set-budget' | 'clear-backoff';
 
-export async function catalogControl(env: Env, action: CatalogAction, value?: number): Promise<void> {
+// Returns a sentence for the UI. "Retry errors" used to answer with a bare
+// {ok:true} and no visible change (the queue only moves on the next tick), so
+// it read as a dead button.
+export async function catalogControl(env: Env, action: CatalogAction, value?: number): Promise<string> {
   const stats = await loadStats(env);
+  let said = '';
   switch (action) {
     case 'pause': stats.paused = true; break;
     case 'resume': stats.paused = false; break;
     case 'set-budget': stats.budget = Math.min(Math.max(Math.round(value ?? DEFAULT_BUDGET) || DEFAULT_BUDGET, 1), MAX_BUDGET); break;
     case 'clear-backoff': stats.backoffUntil = null; stats.backoffLevel = 0; break;
     case 'reset-report': stats.reportSentAt = null; stats.startedAt = Date.now(); break;
-    case 'retry-errors':
-      await env.DB.prepare('UPDATE abb_posts SET detail_fetched_at = NULL, detail_error = NULL WHERE detail_error IS NOT NULL').run();
+    case 'retry-errors': {
+      const r = await env.DB.prepare('UPDATE abb_posts SET detail_fetched_at = NULL, detail_error = NULL WHERE detail_error IS NOT NULL').run();
+      const n = r.meta.changes ?? 0;
+      said = n ? `${n.toLocaleString()} post(s) queued for another detail fetch — the crawler and the nodes pick them up within a minute.` : 'No detail errors to retry.';
       break;
+    }
+    // Covers that answered 403/404/523 are recorded so the runner stops
+    // re-fetching them every pass; this puts them back when a host recovers.
+    case 'retry-cover-errors': {
+      const r = await env.DB.prepare('UPDATE abb_posts SET cover_error = NULL WHERE cover_error IS NOT NULL').run();
+      const n = r.meta.changes ?? 0;
+      said = n ? `${n.toLocaleString()} cover(s) queued for another try.` : 'No cover errors to retry.';
+      break;
+    }
     case 'restart-backfill': {
       // Re-walk every listing from page 1 (posts already cached are just refreshed).
       const listings = await listListings(env);
       await env.DB.batch(listings.map((l) => env.DB.prepare('UPDATE abb_crawl SET value = ?, updated_at = ? WHERE key = ?')
         .bind(JSON.stringify(newListing(l.state.name)), Date.now(), 'listing:' + l.path)));
+      said = `${listings.length} listing(s) reset to page 1.`;
       break;
     }
   }
   await setState(env, 'stats', stats);
+  return said;
 }
 
 // ─── Distributed detail backfill (wharf nodes) ──────────────────────────────

@@ -262,6 +262,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
       <p id="abb-cat-explain" class="cat-note"></p>
       <table class="cat-workers"><tbody id="abb-cat-workers"></tbody></table>
       <div id="abb-catalog-status" class="muted" style="font-size:0.82rem; margin-top:0.5rem">Not loaded.</div>
+      <div id="abb-catalog-said" class="ok" style="font-size:0.82rem; margin-top:0.3rem"></div>
       <details id="abb-cat-listings-box" style="margin-top:0.4rem">
         <summary class="muted" style="font-size:0.82rem; cursor:pointer"><span id="abb-cat-listings-sum">Listings</span></summary>
         <div id="abb-catalog-listings" class="muted" style="font-size:0.8rem; margin-top:0.3rem"></div>
@@ -271,7 +272,8 @@ export const ADMIN_HTML = String.raw`<!doctype html>
         <button class="secondary" data-catalog="run">Run a tick now</button>
         <button class="secondary" data-catalog="pause">Pause</button>
         <button class="secondary" data-catalog="resume" style="display:none">Resume</button>
-        <button class="secondary" data-catalog="retry-errors">Retry errors</button>
+        <button class="secondary" data-catalog="retry-errors" title="Re-queue posts whose detail page failed (timeout, 500). Posts ABB publishes no hash for will fail again.">Retry errors</button>
+        <button class="secondary" data-catalog="retry-cover-errors" title="Re-queue covers whose image host answered 403/404/523">Retry cover errors</button>
         <button class="secondary" data-catalog="restart-backfill" data-confirm="Re-walk every listing from page 1? Cached posts are kept and refreshed.">Restart backfill</button>
         <button class="secondary" data-catalog="clear-backoff" style="display:none">Clear backoff</button>
         <button class="secondary" data-catalog="send-report" title="Sends the check-in push now, as a test">Send report now</button>
@@ -2298,8 +2300,15 @@ async function abbCatalogAction(action, btn, value) {
   if (btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
   btn.disabled = true;
   try {
-    if (action === 'run') await api('/api/admin/abb/catalog/run', { method: 'POST' });
-    else await api('/api/admin/abb/catalog/control', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(value != null ? { action, value } : { action }) });
+    const said = document.getElementById('abb-catalog-said');
+    if (action === 'run') {
+      await api('/api/admin/abb/catalog/run', { method: 'POST' });
+      said.textContent = 'Tick started — watch the counters above.';
+    } else {
+      const r = await api('/api/admin/abb/catalog/control', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(value != null ? { action, value } : { action }) });
+      said.textContent = r.message || 'Done.';
+    }
+    setTimeout(() => { said.textContent = ''; }, 15000);
     if (action === 'run') setTimeout(abbLoadCatalog, 3000);
     await abbLoadCatalog();
     if (action === 'run') abbLoadFacets();

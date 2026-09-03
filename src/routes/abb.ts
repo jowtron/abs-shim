@@ -279,8 +279,11 @@ abbRoutes.post('/catalog/run', async (c) => {
   return c.json({ ok: true });
 });
 
-// Body: { action: 'pause' | 'resume' | 'retry-errors' | 'restart-backfill' | 'reset-report' | 'send-report'
+// Body: { action: 'pause' | 'resume' | 'retry-errors' | 'retry-cover-errors'
+//                 | 'restart-backfill' | 'reset-report' | 'send-report'
 //                 | 'set-budget' (+ value) | 'clear-backoff' }
+// Answers with { message } saying what changed — these actions mostly move
+// rows the next tick will act on, so without it the button looks dead.
 abbRoutes.post('/catalog/control', async (c) => {
   if (c.get('tenantRole') !== 'owner') return c.json({ error: 'Only the tenant owner can control the crawler' }, 403);
   const body = await c.req.json().catch(() => ({})) as { action?: string; value?: number };
@@ -289,10 +292,10 @@ abbRoutes.post('/catalog/control', async (c) => {
     await sendReportNow(c.env);
     return c.json({ ok: true });
   }
-  const allowed: CatalogAction[] = ['pause', 'resume', 'retry-errors', 'restart-backfill', 'reset-report', 'set-budget', 'clear-backoff'];
+  const allowed: CatalogAction[] = ['pause', 'resume', 'retry-errors', 'retry-cover-errors', 'restart-backfill', 'reset-report', 'set-budget', 'clear-backoff'];
   if (!allowed.includes(action as CatalogAction)) return c.json({ error: 'unknown action' }, 400);
-  await catalogControl(c.env, action as CatalogAction, typeof body.value === 'number' ? body.value : undefined);
-  return c.json({ ok: true });
+  const message = await catalogControl(c.env, action as CatalogAction, typeof body.value === 'number' ? body.value : undefined);
+  return c.json({ ok: true, message });
 });
 
 // ─── Detail backfill farmed out to wharf nodes ──────────────────────────────
