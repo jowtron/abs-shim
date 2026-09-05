@@ -1329,9 +1329,19 @@ function renderLibraries(status, libraries) {
           h.className = 'section-title';
           h.style.marginTop = '0.75rem';
           h.textContent = (g.title || '(untitled)') + (g.author ? ' · ' + g.author : '');
+          const tag = document.createElement('span');
+          tag.className = 'muted';
+          tag.style.fontWeight = '400';
+          tag.style.fontSize = '0.85rem';
+          // One copy per backend is usually on purpose; two on the same one
+          // is the accident.
+          tag.textContent = g.acrossBackends
+            ? ' — one copy on each of ' + g.items.length + ' backends'
+            : ' — ' + g.items.length + ' copies on the same backend';
+          h.appendChild(tag);
           box.appendChild(h);
           const rows = document.createElement('div');
-          renderBooksList(rows, g.items.map((it) => ({ ...it, title: it.rel_path })));
+          renderBooksList(rows, g.items.map((it) => ({ ...it, title: it.backend + ' · ' + it.rel_path })));
           box.appendChild(rows);
         }
       } catch (e) {
@@ -2560,7 +2570,19 @@ async function abbResumeGroup(g, folderId, listEl, pick) {
     // the folder name scattered one book across three directories. The
     // torrent's own name comes back as originalFilename.
     // (No backticks in this file: it is one String.raw template.)
-    const groupName = san(infos[0].originalFilename || g.filename);
+    let groupName = san(infos[0].originalFilename || g.filename);
+    // This is the path Joseph hit: finishing a release from this panel because
+    // the first pass missed tracks. If we grabbed this hash before, reuse the
+    // folder it went to, so the missing tracks join the book instead of
+    // starting a second copy of it.
+    const groupHash = (infos[0].hash || g.hash || '').toLowerCase();
+    try {
+      const prior = await api('/api/admin/abb/grabs?hash=' + encodeURIComponent(groupHash));
+      if (prior && prior.previous && prior.previous.dest) {
+        groupName = prior.previous.dest;
+        row.setStatus('Topping up "' + groupName + '" — where this release went before');
+      }
+    } catch (e) { /* courtesy check only */ }
     const plan = abbPlanDest(groupName, chosen.filter((f) => byFile.has(f.id)));
     // One torrent may cover several files (old-flow first torrent); key the
     // tracking list by torrent and give it the first covered file's dest.
@@ -2569,7 +2591,7 @@ async function abbResumeGroup(g, folderId, listEl, pick) {
     const torrents = [...byTorrent].map(([id, dest]) => ({ id, dest }));
     if (!torrents.length) throw new Error('Nothing to track');
     row.setStatus(torrents.length + ' torrent(s) on Real-Debrid — waiting for download');
-    await abbTrackTorrents(torrents, folderId, listEl, row);
+    await abbTrackTorrents(torrents, folderId, listEl, row, { hash: groupHash, title: groupName });
   } catch (e) {
     row.fail(e.message || String(e));
   }
@@ -2636,7 +2658,30 @@ async function abbGrab(res, folderId, listEl) {
       chosen = await abbPickFiles(peek.name || m.title, candidates);
       if (!chosen) { row.fail('Cancelled'); return false; }
     }
-    const plan = abbPlanDest(m.folderName, chosen);
+    // Has this release been here before? A second pass to collect tracks the
+    // first one missed must go back to the SAME folder, or the library gains
+    // a second, differently-incomplete copy of the book.
+    const hash = abbHashFromMagnet(m.magnet);
+    let dest = m.folderName;
+    let prior = null;
+    try {
+      prior = await api('/api/admin/abb/grabs?hash=' + encodeURIComponent(hash || '')
+        + '&title=' + encodeURIComponent(m.title || '')
+        + '&folderName=' + encodeURIComponent(m.folderName || ''));
+    } catch (e) { /* the check is a courtesy — never block a grab on it */ }
+    if (prior && prior.previous && prior.previous.dest) {
+      dest = prior.previous.dest;
+      row.setStatus('Already grabbed before — topping up "' + dest + '"');
+    } else if (prior && prior.matches && prior.matches.length) {
+      const lines = prior.matches.map((mm) =>
+        '• ' + mm.topFolder + ' (' + mm.files + ' file(s), ' + (mm.seconds / 3600).toFixed(1) + 'h) — ' + mm.reason);
+      if (!confirm('This looks like a book you already have:\n\n' + lines.join('\n')
+        + '\n\nGrab it again anyway? It will download a second copy to pCloud.')) {
+        row.fail('Cancelled — already in the library');
+        return false;
+      }
+    }
+    const plan = abbPlanDest(dest, chosen);
     row.setStatus('Adding ' + plan.length + ' torrent(s) to Real-Debrid…');
     // One torrent per file, two at a time — RD caps active torrents, each
     // add costs ~10 API calls, and four in parallel drew a 429 (2026-09-02).
@@ -2648,7 +2693,7 @@ async function abbGrab(res, folderId, listEl) {
       const retry = () => {
         r.setStatus('Adding to Real-Debrid…');
         abbAddPaced(m.magnet, p.id, r, 'Adding')
-          .then((a) => { removeBtn(); return abbTrackTorrents([{ id: a.id, dest: p.dest }], folderId, listEl, r); })
+          .then((a) => { removeBtn(); return abbTrackTorrents([{ id: a.id, dest: p.dest }], folderId, listEl, r, { hash, title: m.title }); })
           .then(() => abbLoadRdList())
           .catch((e) => r.fail('Add failed: ' + e.message));
       };
@@ -2670,7 +2715,7 @@ async function abbGrab(res, folderId, listEl) {
     }
     if (!torrents.length) throw new Error('Nothing could be added to Real-Debrid');
     row.setStatus(torrents.length + ' torrent(s) on Real-Debrid — waiting for download');
-    return await abbTrackTorrents(torrents, folderId, listEl, row);
+    return await abbTrackTorrents(torrents, folderId, listEl, row, { hash, title: m.title });
   } catch (e) {
     row.fail(e.message || String(e));
     return false;
@@ -2681,7 +2726,7 @@ async function abbGrab(res, folderId, listEl) {
 // file to pCloud at its planned dest, delete it on RD, scan if needed.
 // Also used by the "On Real-Debrid" panel to resume a torrent nobody is
 // watching (tab closed mid-grab).
-async function abbTrackTorrents(torrents, folderId, listEl, row) {
+async function abbTrackTorrents(torrents, folderId, listEl, row, source) {
   try {
 
     // Poll every torrent on one shared timer so RD's 250 req/min limit holds
@@ -2732,7 +2777,7 @@ async function abbTrackTorrents(torrents, folderId, listEl, row) {
                 appendUploadRow(listEl, '  ↳ ' + d.filename, '').fail('Real-Debrid produced a ' + d.ext + ' — can\'t extract server-side. Download it and use the browser upload instead.');
                 continue;
               }
-              const registered = await fetchUrlToPcloud(folderId, d.download, p.dest, listEl);
+              const registered = await fetchUrlToPcloud(folderId, d.download, p.dest, listEl, source);
               if (!registered) needsScan = true;
             }
           })());
@@ -2783,6 +2828,13 @@ async function abbTrackTorrents(torrents, folderId, listEl, row) {
 //   • Two m4b/m4a siblings in one dir would be read as one broken
 //     "multi-file non-mp3" book, so each gets its own folder named after
 //     the file. mp3 siblings stay together — they're chapters of one book.
+// The 40-hex info hash out of a magnet link, which is how a release is
+// recognised on a later pass regardless of what Real-Debrid calls it.
+function abbHashFromMagnet(magnet) {
+  const m = /btih:([0-9a-fA-F]{40})/.exec(magnet || '');
+  return m ? m[1].toLowerCase() : '';
+}
+
 function abbPlanDest(folderName, files) {
   const san = (s) => s.replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim();
   const split = files.map((f) => f.path.split('/').filter(Boolean));
@@ -3107,7 +3159,7 @@ function fileNameFromUrl(url) {
 // pCloud gives no progress API for these jobs (see admin routes), so the
 // file may stay invisible until it lands in one go; the wait is bounded by
 // a generous timeout rather than by anything pCloud tells us.
-async function fetchUrlToPcloud(folderId, url, relPath, listEl) {
+async function fetchUrlToPcloud(folderId, url, relPath, listEl, source) {
   const row = appendUploadRow(listEl, relPath, 'Queueing…');
   try {
     // /start can block for a while (pCloud's stat of the target hangs 10-60s
@@ -3121,7 +3173,7 @@ async function fetchUrlToPcloud(folderId, url, relPath, listEl) {
       started = await api('/api/admin/storage/folder/' + folderId + '/fetch-url/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, relPath }),
+        body: JSON.stringify({ url, relPath, sourceHash: source && source.hash, sourceTitle: source && source.title }),
       });
     } finally {
       clearInterval(qTimer);

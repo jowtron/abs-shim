@@ -19,6 +19,7 @@ import { S3Adapter } from '../storage/s3';
 import { WebDAVAdapter, normalizeWebdavBaseUrl } from '../storage/webdav';
 import { PcloudOAuthAdapter } from '../storage/pcloud';
 import { isAudiobookFile, type RemoteEntry } from '../storage/adapter';
+import { storageLabelText } from '../lib/storage-label';
 import { findCatalogCover, purgeCoverCache } from '../lib/cover-from-catalog';
 import { redactSecrets, safeJson } from '../lib/redact';
 import { getSignupMode, setSetting, membersCanAdd, setTenantSetting, MEMBERS_CAN_ADD_KEY } from '../db/settings';
@@ -807,6 +808,20 @@ adminRoutes.post('/storage/folder/:folderId/fetch-url/start', requireCanAdd, asy
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const url = String(body['url'] ?? '').trim();
   const relPath = String(body['relPath'] ?? '').trim().replace(/^\/+/, '');
+  // Remember where this release goes, so a later top-up pass lands in the
+  // same folder instead of inventing a new one (migration 0013).
+  const sourceHash = String(body['sourceHash'] ?? '').trim().toLowerCase();
+  const sourceTitle = String(body['sourceTitle'] ?? '').trim();
+  if (/^[0-9a-f]{40}$/.test(sourceHash) && relPath.includes('/')) {
+    const top = relPath.split('/')[0]!;
+    const now = Date.now();
+    await c.env.DB.prepare(
+      `INSERT INTO abb_grabs (tenant_id, hash, dest, title, folder_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(tenant_id, hash) DO UPDATE SET updated_at = excluded.updated_at`,
+    ).bind(c.get('tenantId'), sourceHash, top, sourceTitle || null, c.req.param('folderId'), now, now)
+      .run().catch(() => undefined);   // never block a fetch on bookkeeping
+  }
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -1022,6 +1037,8 @@ adminRoutes.get('/libraries/:libId/items', async (c) => {
 // which is what a person means by "the same book"; the paths and lengths in
 // each group are what you need to decide which copy to keep.
 adminRoutes.get('/libraries/:libId/duplicates', async (c) => {
+  const folders = await listFolders(c.env, c.req.param('libId'), c.get('tenantId'));
+  const backendOf = new Map(folders.map((f) => [f.id, storageLabelText(f)]));
   const rows = await c.env.DB.prepare(
     `SELECT li.id, li.rel_path, li.folder_id, bm.title, bm.author_name,
             (SELECT COUNT(*) FROM chapters ch WHERE ch.library_item_id = li.id) AS chapter_count,
@@ -1046,7 +1063,15 @@ adminRoutes.get('/libraries/:libId/duplicates', async (c) => {
   return c.json({
     groups: [...groups.values()]
       .filter((g) => g.length > 1)
-      .map((g) => ({ title: g[0]!.title, author: g[0]!.author_name, items: g })),
+      .map((g) => ({
+        title: g[0]!.title,
+        author: g[0]!.author_name,
+        // The same book on two backends is a deliberate arrangement (one
+        // copy on the NAS, one on pCloud); the same book twice on ONE
+        // backend is the accident worth cleaning up. Say which this is.
+        acrossBackends: new Set(g.map((i) => i.folder_id)).size > 1,
+        items: g.map((i) => ({ ...i, backend: backendOf.get(i.folder_id) ?? i.folder_id })),
+      })),
   });
 });
 

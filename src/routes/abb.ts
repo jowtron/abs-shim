@@ -397,6 +397,79 @@ abbRoutes.get('/details', async (c) => {
 // Body: { url } or { magnet } → { title, folderName, infoHash, magnet }
 // A pasted magnet skips AudioBookBay entirely; the title comes from its
 // dn= parameter (or the hash when absent).
+// Asked before a grab starts, so nothing lands on pCloud twice.
+//
+// Answers two questions: have we put this exact release somewhere before
+// (by info hash, migration 0013), and does the library already hold a book
+// that looks like this one (by folder name, or by title/author words). The
+// first is the important one — a re-run to collect tracks a previous pass
+// missed must go back to the same folder, or the library gains a second,
+// differently-incomplete copy.
+abbRoutes.get('/grabs', requireCanAdd, async (c) => {
+  const tenantId = c.get('tenantId');
+  const hash = (c.req.query('hash') ?? '').trim().toLowerCase();
+  const title = (c.req.query('title') ?? '').trim();
+  const folderName = (c.req.query('folderName') ?? '').trim();
+
+  const previous = /^[0-9a-f]{40}$/.test(hash)
+    ? await c.env.DB.prepare(
+      'SELECT dest, title, folder_id, created_at FROM abb_grabs WHERE tenant_id = ? AND hash = ?',
+    ).bind(tenantId, hash).first<{ dest: string; title: string | null; folder_id: string | null; created_at: number }>()
+    : null;
+
+  // Candidate books, small enough to match in JS (a personal library is
+  // hundreds of rows, and the comparison is fuzzier than SQL does well).
+  const rows = await c.env.DB.prepare(
+    `SELECT li.id, li.rel_path, bm.title, bm.author_name,
+            (SELECT COUNT(*) FROM audio_files af WHERE af.library_item_id = li.id) AS files,
+            (SELECT COALESCE(SUM(af.duration_seconds), 0) FROM audio_files af WHERE af.library_item_id = li.id) AS seconds
+       FROM library_items li
+       LEFT JOIN book_metadata bm ON bm.library_item_id = li.id
+      WHERE li.tenant_id = ? AND li.is_missing = 0`,
+  ).bind(tenantId).all<{ id: string; rel_path: string; title: string | null; author_name: string | null; files: number; seconds: number }>();
+
+  const matches = rows.results
+    .map((r) => {
+      const topFolder = r.rel_path.split('/')[0] ?? '';
+      let reason: string | null = null;
+      if (previous && topFolder === previous.dest) reason = 'same folder as your earlier grab';
+      else if (folderName && topFolder.toLowerCase() === folderName.toLowerCase()) reason = 'same folder name';
+      else if (title && looksLikeSameBook(title, r.title, r.author_name)) reason = 'same title';
+      return reason ? { ...r, topFolder, reason } : null;
+    })
+    .filter((m): m is NonNullable<typeof m> => m !== null);
+
+  return c.json({ previous, matches });
+});
+
+// Word-overlap match between an AudioBookBay listing title (which usually
+// carries the author and the format: "Philippa Gregory - Dawnlands - mp3")
+// and a library book's title + author. Deliberately generous: a false
+// positive only produces a confirmation prompt.
+const NOISE = new Set([
+  'the', 'a', 'an', 'and', 'of', 'novel', 'book', 'series', 'unabridged', 'abridged',
+  'audiobook', 'audio', 'mp3', 'm4b', 'm4a', 'aac', 'part', 'vol', 'volume', 'complete',
+]);
+function words(s: string | null | undefined): string[] {
+  return (s ?? '')
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, ' ')
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((w) => w.length > 2 && !NOISE.has(w) && !/^\d+$/.test(w));
+}
+function looksLikeSameBook(listingTitle: string, bookTitle: string | null, bookAuthor: string | null): boolean {
+  const listing = new Set(words(listingTitle));
+  const author = new Set(words(bookAuthor));
+  // The book's own title words, with the author's removed: an ABB listing
+  // usually reads "Author - Title - format", so counting author words as
+  // matches made every book by that author look like the same book (the
+  // first cut flagged all five Dennis E. Taylor titles for a Flybot grab).
+  const title = words(bookTitle).filter((w) => !author.has(w));
+  if (!title.length) return false;
+  const shared = title.filter((w) => listing.has(w)).length;
+  return shared >= Math.max(1, Math.ceil(title.length * 0.5));
+}
+
 abbRoutes.post('/resolve', requireCanAdd, async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const url = String(body['url'] ?? '').trim();
