@@ -26,6 +26,13 @@ npx wrangler tail --format pretty   # live prod request logs (use for debugging 
 
 **Routes**: `/login`, `/api/authorize`, `/api/me`, `/api/items/*`, `/api/libraries/*`, `/api/admin/*`, `/api/session/*`, `/public/proxy/*`, `/admin` (UI), plus a Socket.io stub via `ListeningSessionDO`. Other DOs: `SignupRateLimitDO` (per-IP signup throttle), `ArchiveExtractDO` (zip extraction jobs). Auth middleware (`src/auth/middleware.ts`) accepts Bearer header, `?token=` query, or `accessToken` cookie. Cookie is refreshed on every `/login` AND `/api/authorize`.
 
+**WebDAV, three ways it broke on one afternoon (2026-09-05).** All fixed, all worth knowing:
+1. **Never probe through the proxy URL.** `resolveProbeUrl` used to return the signed `/public/proxy/...` URL, so the prober made the Worker fetch *its own hostname* — the edge answers that with **522**, while the identical Range request from a laptop returned 206 in 380 ms. It now returns the backend URL plus a `headers` field on `ResolvedUrl` (Basic auth), threaded through `probeM4b`/`probeMp3`/`probeOgg` and every internal range read. Miss one internal call and you get a **401 on a big file only**, because the first read succeeds and the follow-up read of a tail-placed moov is the one without the header. Client streaming still must use the proxy: a URL handed to a player can't carry a credential.
+2. **A server URL with no scheme.** `dav.example.com/` was accepted by the attach form and made every `new URL(path, base)` throw `Invalid URL string`, reported as a scan error naming nothing. `normalizeWebdavBaseUrl` now prepends `https://` and validates, both at attach time and in the adapter constructor, so rows already stored that way are repaired on read.
+3. **Depth: infinity refused** — see below.
+
+**Folder picker** (`POST /api/admin/storage/browse`, owner-only): lists one level of an S3, WebDAV or pCloud backend from credentials passed in the body, before anything is saved, so attaching asks you to pick a folder instead of typing a path. S3 needs `S3Adapter.listDirectory` (a delimiter listing) because `listFolder` is prefix-recursive and file-only, which shows a bucket root as a flat object dump and no folders at all.
+
 **WebDAV depth** (`src/storage/webdav.ts`): `walkAudiobookFiles` tries one `Depth: infinity` PROPFIND and falls back to a bounded breadth-first walk of `Depth: 1` requests when the server refuses it. RFC 4918 lets a server decline (403 + `propfind-finite-depth`), and Joseph's NAS answers `400 Invalid depth: only 0 and 1 are allowed`, which failed the entire scan before 2026-09-05. Keep the infinity attempt: it is one request instead of one per folder. The fallback stops at 400 folders / 8 levels so a folder pointed at a whole NAS share can't burn the Worker's subrequest budget.
 
 **Storage adapters** (`src/storage/`): `adapter.ts` defines the interface — `resolveUrl`, `resolveProbeUrl`, `listFolder`, optional `walkAudiobookFiles`. `factory.ts` builds an adapter from a `library_folders` row. The adapter for streaming is invoked from `src/storage/resolve.ts` — it falls back to `audio_files.filedn_url` when `rel_path` is null (preserves backward compatibility with the original seed).
@@ -94,6 +101,10 @@ ShelfPlayer uses strict Swift Codable — one field type mismatch fails the enti
 - CORS `allowHeaders` must keep `X-Playback-Session-Id` (plus `If-Range`, `Accept`): Pholia's service worker re-issues iOS media requests as CORS fetches when it serves a partially cached book, and iOS adds that header to every media request. Without it the preflight fails and playback dies at the cache edge. iOS also requires every response in one media load to have the same CORS status, so the shim's file route must behave identically for CORS and no-cors requests (it does — don't add Origin-dependent branches).
 
 When adding a new client integration: open `wrangler tail --format pretty` and use `gh api repos/<owner>/<repo>/contents/<path> --jq '.content' | base64 -d` to read Swift Codable structs. Diff the strict types against `src/lib/abs-shapes.ts` output.
+
+## Scan reports say which backend (2026-09-05)
+
+`ScanReport.folders` carries one `ScanFolderReport` per storage backend — provider, a human label built from its config, added/skipped/error counts and up to 50 added paths — and every error row carries `folderId` + `backend`. A library can have several folders, so "added 3, 1 error" said nothing about which NAS or bucket was involved. `/admin`'s scan output and the folder rows both print it; `storage/status` also returns per-folder book counts.
 
 ## D1 cost: index what you filter on (2026-09-05)
 

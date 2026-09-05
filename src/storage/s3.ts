@@ -94,6 +94,40 @@ export class S3Adapter implements StorageAdapter {
     return out;
   }
 
+  // One level of the bucket, folders included — what a human browsing for
+  // "the folder my audiobooks are in" needs. listFolder above is the
+  // scanner's view: prefix-recursive and files only, which shows a bucket
+  // root as a flat list of every object and no folders at all.
+  async listDirectory(relPath: string): Promise<RemoteEntry[]> {
+    const prefix = this.absoluteKey(relPath);
+    const withSlash = prefix && !prefix.endsWith('/') ? prefix + '/' : prefix;
+    const url = new URL(`${this.config.endpoint}/${this.config.bucket}`);
+    url.searchParams.set('list-type', '2');
+    url.searchParams.set('delimiter', '/');
+    url.searchParams.set('max-keys', '1000');
+    if (withSlash) url.searchParams.set('prefix', withSlash);
+
+    const headers = await signRequestHeaders({ method: 'GET', url, creds: this.creds });
+    const res = await fetch(url.toString(), { headers });
+    if (!res.ok) throw new Error(`S3 ListObjects HTTP ${res.status}: ${await res.text().catch(() => '')}`);
+    const xml = await res.text();
+
+    const out: RemoteEntry[] = [];
+    // CommonPrefixes are the folders at this level.
+    const prefixRe = /<CommonPrefixes>[\s\S]*?<Prefix>([\s\S]*?)<\/Prefix>[\s\S]*?<\/CommonPrefixes>/g;
+    let m: RegExpExecArray | null;
+    while ((m = prefixRe.exec(xml)) !== null) {
+      const full = unxml(m[1]).replace(/\/+$/, '');
+      const name = full.slice(withSlash.length).replace(/^\/+/, '');
+      if (name) out.push({ relPath: name, isDir: true });
+    }
+    for (const e of parseListObjectsXml(xml, withSlash).entries) {
+      if (e.relPath.includes('/')) continue;   // deeper keys belong to a folder
+      out.push(e);
+    }
+    return out;
+  }
+
   // Combine bucket-level prefix from config with the per-call rel path.
   private absoluteKey(relPath: string): string {
     const cfgPrefix = this.config.prefix.replace(/^\/+|\/+$/g, '');

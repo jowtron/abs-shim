@@ -15,6 +15,10 @@ import { probeM4b } from '../prober/m4b';
 import { probeMp3 } from '../prober/mp3';
 import { resolveProbeUrl } from '../storage/resolve';
 import type { OAuthProfileRow } from '../storage/factory';
+import { S3Adapter } from '../storage/s3';
+import { WebDAVAdapter, normalizeWebdavBaseUrl } from '../storage/webdav';
+import { PcloudOAuthAdapter } from '../storage/pcloud';
+import { isAudiobookFile, type RemoteEntry } from '../storage/adapter';
 import { redactSecrets, safeJson } from '../lib/redact';
 import { getSignupMode, setSetting, membersCanAdd, setTenantSetting, MEMBERS_CAN_ADD_KEY } from '../db/settings';
 import { createInvite, listOpenInvites, deleteInvite } from '../db/invites';
@@ -81,6 +85,21 @@ adminRoutes.get('/storage/status', async (c) => {
   // over library_items, whereas duration/size sums across audio_files (a book
   // can have multiple files in principle, even though our scanner only emits
   // one today).
+  // Per-backend counts. A library can have several folders and the useful
+  // question when looking at one is "how much of this library lives here".
+  const perFolder = await c.env.DB.prepare(
+    `SELECT folder_id,
+            SUM(CASE WHEN is_missing = 0 THEN 1 ELSE 0 END) AS book_count,
+            SUM(CASE WHEN is_missing = 1 THEN 1 ELSE 0 END) AS missing_count
+       FROM library_items
+      WHERE tenant_id = ?
+      GROUP BY folder_id`,
+  ).bind(tenantId).all<{ folder_id: string; book_count: number; missing_count: number }>();
+  const folderStats: Record<string, { bookCount: number; missingCount: number }> = {};
+  for (const r of perFolder.results) {
+    folderStats[r.folder_id] = { bookCount: r.book_count ?? 0, missingCount: r.missing_count ?? 0 };
+  }
+
   const counts = await c.env.DB.prepare(
     `SELECT library_id,
             SUM(CASE WHEN is_missing = 0 THEN 1 ELSE 0 END) AS book_count,
@@ -128,6 +147,7 @@ adminRoutes.get('/storage/status', async (c) => {
       // every admin session.
       config: redactSecrets(safeJson(f.config_json)),
       legacyBaseUrl: f.filedn_base_url,
+      stats: folderStats[f.id] ?? { bookCount: 0, missingCount: 0 },
     })),
     profiles: profiles.results,
     stats,
@@ -157,6 +177,55 @@ adminRoutes.post('/tenant/settings', requireTenantOwner, async (c) => {
     await setTenantSetting(c.env, c.get('tenantId'), MEMBERS_CAN_ADD_KEY, body['membersCanAdd'] ? '1' : '0');
   }
   return c.json({ ok: true, membersCanAdd: await membersCanAdd(c.env, c.get('tenantId')) });
+});
+
+// Browse a storage backend before attaching it, so "which folder?" is a list
+// to pick from rather than a path to type blind. Takes the same credentials
+// the attach routes take — nothing is stored — and answers with one level of
+// the tree. Owner-only, like attaching itself.
+//
+// S3 needs its own one-level call (listFolder is prefix-recursive and hides
+// folders); WebDAV and pCloud already list a single directory.
+adminRoutes.post('/storage/browse', requireTenantOwner, async (c) => {
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  const provider = String(body['provider'] ?? '');
+  const path = String(body['path'] ?? '').replace(/^\/+|\/+$/g, '');
+  const cfg = (body['config'] ?? {}) as Record<string, string>;
+
+  let entries: RemoteEntry[];
+  try {
+    if (provider === 's3') {
+      const adapter = new S3Adapter(
+        { endpoint: String(cfg['endpoint'] ?? ''), bucket: String(cfg['bucket'] ?? ''), region: String(cfg['region'] ?? 'auto'), prefix: '' },
+        { accessKeyId: String(cfg['accessKeyId'] ?? ''), secretAccessKey: String(cfg['secretAccessKey'] ?? ''), region: String(cfg['region'] ?? 'auto') },
+      );
+      entries = await adapter.listDirectory(path);
+    } else if (provider === 'webdav') {
+      const adapter = new WebDAVAdapter(c.env, 'browse', new URL(c.req.url).origin, {
+        baseUrl: String(cfg['baseUrl'] ?? ''), username: String(cfg['username'] ?? ''),
+        password: String(cfg['password'] ?? ''), rootPath: '',
+      });
+      entries = await adapter.listFolder(path);
+    } else if (provider === 'pcloud_oauth') {
+      const profileRow = await c.env.DB.prepare(
+        'SELECT * FROM oauth_profiles WHERE id = ? AND tenant_id = ?',
+      ).bind(String(body['profileId'] ?? ''), c.get('tenantId')).first<OAuthProfileRow>();
+      if (!profileRow) return c.json({ error: 'Unknown pCloud connection' }, 400);
+      const adapter = new PcloudOAuthAdapter(
+        { accessToken: profileRow.access_token, apiHost: profileRow.api_host ?? 'api.pcloud.com' },
+        { rootPath: '/' },
+      );
+      entries = await adapter.listFolder(path);
+    } else {
+      return c.json({ error: `Can't browse provider ${provider}` }, 400);
+    }
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 502);
+  }
+
+  const dirs = entries.filter((e) => e.isDir).map((e) => e.relPath.split('/').pop() ?? e.relPath).sort((a, b) => a.localeCompare(b));
+  const audioFiles = entries.filter((e) => !e.isDir && isAudiobookFile(e.relPath)).length;
+  return c.json({ path, dirs, audioFiles, files: entries.filter((e) => !e.isDir).length });
 });
 
 // ─── Tenant members & invites (the "household / family" sharing model) ────────
@@ -369,13 +438,17 @@ adminRoutes.post('/storage/folder/s3', requireTenantOwner, async (c) => {
 adminRoutes.post('/storage/folder/webdav', requireTenantOwner, async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const libraryId = String(body['libraryId'] ?? '');
-  const baseUrl = String(body['baseUrl'] ?? '').replace(/\/+$/, '') + '/';
   const username = String(body['username'] ?? '');
   const password = String(body['password'] ?? '');
   const rootPath = String(body['rootPath'] ?? '');
-  if (!libraryId || !baseUrl || !username) {
+  if (!libraryId || !body['baseUrl'] || !username) {
     return c.json({ error: 'libraryId, baseUrl, username required' }, 400);
   }
+  // Store it already normalised, so a URL typed without https:// can't be
+  // saved as one that no request can be built from.
+  let baseUrl: string;
+  try { baseUrl = normalizeWebdavBaseUrl(String(body['baseUrl'])); }
+  catch (e) { return c.json({ error: (e as Error).message }, 400); }
   const tenantId = c.get('tenantId');
   if (!await getLibrary(c.env, libraryId, tenantId)) return c.json({ error: 'Library not found' }, 404);
   const config = JSON.stringify({ baseUrl, username, password, rootPath });
@@ -1040,8 +1113,8 @@ adminRoutes.post('/covers/warm', async (c) => {
         || audio.mime_type === 'audio/mpeg'
         || /\.mp3$/i.test(audio.rel_path ?? audio.filedn_url);
       const cover = isMp3
-        ? (await probeMp3(probeUrl.url, audio.size_bytes || undefined)).cover
-        : (await probeM4b(probeUrl.url)).cover;
+        ? (await probeMp3(probeUrl.url, audio.size_bytes || undefined, probeUrl.headers)).cover
+        : (await probeM4b(probeUrl.url, probeUrl.headers)).cover;
       if (!cover) { failed++; errors.push({ id, reason: 'no embedded cover' }); continue; }
 
       await c.env.COVERS.put(r2Key, cover.bytes, {

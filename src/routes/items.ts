@@ -97,12 +97,12 @@ itemRoutes.get('/:id/cover', async (c) => {
       || audio.mime_type === 'audio/mpeg'
       || /\.mp3$/i.test(audio.rel_path ?? audio.filedn_url);
     if (isMp3) {
-      const probe = await probeMp3(probeUrl.url, audio.size_bytes || undefined);
+      const probe = await probeMp3(probeUrl.url, audio.size_bytes || undefined, probeUrl.headers);
       cover = probe.cover;
     } else if (audio.format === 'ogg' || /\.(opus|ogg)$/i.test(audio.rel_path ?? audio.filedn_url)) {
-      cover = (await probeOgg(probeUrl.url)).cover;
+      cover = (await probeOgg(probeUrl.url, probeUrl.headers)).cover;
     } else {
-      const probe = await probeM4b(probeUrl.url);
+      const probe = await probeM4b(probeUrl.url, probeUrl.headers);
       cover = probe.cover;
     }
   } catch (e) {

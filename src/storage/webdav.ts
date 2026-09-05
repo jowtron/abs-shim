@@ -23,15 +23,38 @@ export type WebDAVConfig = {
   rootPath: string;
 };
 
+// A base URL typed without a scheme ("dav.example.com/") makes every
+// `new URL(path, base)` throw "Invalid URL string", which surfaced as a
+// scan error with no hint about the cause (2026-09-05). Normalising here
+// rather than only at attach time also repairs folders already stored that
+// way. Anything that still won't parse fails loudly, naming the value.
+export function normalizeWebdavBaseUrl(raw: string): string {
+  const trimmed = String(raw ?? '').trim();
+  if (!trimmed) throw new Error('WebDAV folder has no server URL');
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : 'https://' + trimmed.replace(/^\/+/, '');
+  const withSlash = withScheme.endsWith('/') ? withScheme : withScheme + '/';
+  try { new URL(withSlash); } catch {
+    throw new Error(`WebDAV server URL is not a URL: ${trimmed}`);
+  }
+  return withSlash;
+}
+
 export class WebDAVAdapter implements StorageAdapter {
   readonly provider = 'webdav';
+  private config: WebDAVConfig;
 
   constructor(
     private env: Env,
     private folderId: string,
     private origin: string,
-    private config: WebDAVConfig,
-  ) {}
+    config: WebDAVConfig,
+  ) {
+    this.config = {
+      ...config,
+      baseUrl: normalizeWebdavBaseUrl(config.baseUrl),
+      rootPath: config.rootPath ?? '',
+    };
+  }
 
   async resolveUrl(relPath: string): Promise<ResolvedUrl> {
     return signProxyUrl({
@@ -43,14 +66,17 @@ export class WebDAVAdapter implements StorageAdapter {
     });
   }
 
-  resolveProbeUrl(relPath: string): Promise<ResolvedUrl> {
-    return signProxyUrl({
-      env: this.env,
-      origin: this.origin,
-      folderId: this.folderId,
-      relPath,
-      kind: 'probe',
-    });
+  // Probing goes straight at the NAS with the credentials, NOT through the
+  // signed proxy. The proxy URL points at this Worker's own hostname, and a
+  // Worker fetching itself goes back out through the edge, which answers
+  // 522: every WebDAV scan died with "Range fetch failed: 522" while the
+  // same Range request from a laptop returned 206 in 380 ms (2026-09-05).
+  // Client streaming still has to use the proxy — see resolveUrl.
+  async resolveProbeUrl(relPath: string): Promise<ResolvedUrl> {
+    return {
+      url: this.absoluteUrl(relPath),
+      headers: { Authorization: 'Basic ' + btoa(`${this.config.username}:${this.config.password}`) },
+    };
   }
 
   // Used by the proxy route to actually fetch bytes from the NAS. Range

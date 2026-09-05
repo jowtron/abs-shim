@@ -19,11 +19,15 @@ export async function resolveStreamUrl(
   return adapter.resolveUrl(audio.rel_path, audio.provider_file_id);
 }
 
+// `headers` comes back set for backends we must authenticate to ourselves
+// (WebDAV). Probing must NOT go through the client-facing proxy URL: that
+// points at this Worker, and a Worker fetching its own hostname is answered
+// with 522 by the edge.
 export async function resolveProbeUrl(
   env: Env,
   folder: LibraryFolderRow,
   audio: AudioFileRow,
-): Promise<{ url: string; expiresAt?: number }> {
+): Promise<{ url: string; expiresAt?: number; headers?: Record<string, string> }> {
   if (!audio.rel_path) {
     return { url: audio.filedn_url };
   }

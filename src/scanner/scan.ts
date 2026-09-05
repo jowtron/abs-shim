@@ -27,13 +27,45 @@ import { invalidateIdMap } from '../lib/ids';
 //   - Detect deletions: items present in D1 but missing remotely → mark
 //     is_missing = 1 instead of dropping rows (don't lose user progress).
 
+// Per-backend attribution (2026-09-05). A library can have several folders,
+// so "added 3, 1 error" doesn't say which NAS or bucket they came from, and
+// the errors were the same story. Totals stay at the top level for callers
+// that only want the numbers.
+export type ScanFolderReport = {
+  folderId: string;
+  provider: string;
+  label: string;              // human-readable "where": bucket, root path, host
+  added: number;
+  skipped: number;
+  errors: number;
+  addedPaths: string[];       // capped — a first scan can add hundreds
+};
+
 export type ScanReport = {
   libraryId: string;
   added: number;
   skipped: number;
-  errors: Array<{ relPath: string; reason: string }>;
+  errors: Array<{ relPath: string; reason: string; folderId?: string; backend?: string }>;
+  folders: ScanFolderReport[];
   durationMs: number;
 };
+
+const ADDED_PATHS_CAP = 50;
+
+// Where a folder points, in a few words. Mirrors describeFolder() in the
+// admin UI; kept server-side so a scan report reads on its own.
+function folderLabel(folder: FolderRow): string {
+  let config: Record<string, unknown> = {};
+  try { config = JSON.parse(folder.config_json || '{}') as Record<string, unknown>; } catch { /* unparseable — fall through */ }
+  const str = (k: string) => String(config[k] ?? '');
+  switch (folder.provider) {
+    case 'pcloud_oauth': return 'pCloud ' + (str('rootPath') || '/');
+    case 's3': return [str('bucket'), str('prefix')].filter(Boolean).join('/') || str('endpoint');
+    case 'webdav': return [str('baseUrl'), str('rootPath')].filter(Boolean).join(' ');
+    case 'public_url': return str('baseUrl') || folder.filedn_base_url || '';
+    default: return folder.provider;
+  }
+}
 
 export async function runScan(env: Env, libraryId: string, tenantId: string): Promise<ScanReport> {
   const started = Date.now();
@@ -46,15 +78,31 @@ export async function runScan(env: Env, libraryId: string, tenantId: string): Pr
     added: 0,
     skipped: 0,
     errors: [],
+    folders: [],
     durationMs: 0,
   };
 
   for (const folder of folders.results) {
+    const fr: ScanFolderReport = {
+      folderId: folder.id, provider: folder.provider, label: folderLabel(folder),
+      added: 0, skipped: 0, errors: 0, addedPaths: [],
+    };
+    report.folders.push(fr);
+    // Every error inside this folder's pass is attributed to it.
+    const fail = (relPath: string, reason: string) => {
+      fr.errors++;
+      report.errors.push({ relPath, reason, folderId: folder.id, backend: fr.label });
+    };
+    const noteAdded = (relPath: string) => {
+      fr.added++;
+      if (fr.addedPaths.length < ADDED_PATHS_CAP) fr.addedPaths.push(relPath);
+    };
+
     let adapter;
     try {
       adapter = await getAdapter(env, folder);
     } catch (e) {
-      report.errors.push({ relPath: '', reason: `adapter: ${(e as Error).message}` });
+      fail('', `adapter: ${(e as Error).message}`);
       continue;
     }
 
@@ -63,13 +111,10 @@ export async function runScan(env: Env, libraryId: string, tenantId: string): Pr
       entries = await collectAudioFiles(adapter, '');
     } catch (e) {
       if (e instanceof ListingNotSupportedError) {
-        report.errors.push({
-          relPath: '',
-          reason: `listing not supported for provider ${folder.provider} — manifest scan not yet implemented`,
-        });
+        fail('', `listing not supported for provider ${folder.provider} — manifest scan not yet implemented`);
         continue;
       }
-      report.errors.push({ relPath: '', reason: `walk: ${(e as Error).message}` });
+      fail('', `walk: ${(e as Error).message}`);
       continue;
     }
 
@@ -95,6 +140,7 @@ export async function runScan(env: Env, libraryId: string, tenantId: string): Pr
     for (const [itemRel, files] of groups) {
       if (known.has(itemRel)) {
         report.skipped += files.length;
+        fr.skipped += files.length;
         continue;
       }
       // Lex sort — "01 - chapter.mp3" naming is the de facto standard for
@@ -106,23 +152,21 @@ export async function runScan(env: Env, libraryId: string, tenantId: string): Pr
         if (allMp3) {
           await probeMp3Book({ env, adapter, folder, itemRel, files });
           report.added++;
+          noteAdded(itemRel);
           known.add(itemRel);
         } else if (files.length === 1) {
           const f = files[0]!;
           const out = await probeBook({ env, adapter, folder, file: f, itemRel });
-          if (out === 'added') { report.added++; known.add(itemRel); }
-          else report.skipped++;
+          if (out === 'added') { report.added++; noteAdded(itemRel); known.add(itemRel); }
+          else { report.skipped++; fr.skipped++; }
         } else {
           // Multi-file non-mp3 layouts (e.g. m4b split into chapter files)
           // aren't yet supported by the prober. Flag and continue.
-          report.errors.push({
-            relPath: itemRel,
-            reason: `multi-file non-mp3 folder layout not supported (${files.length} files)`,
-          });
+          fail(itemRel, `multi-file non-mp3 folder layout not supported (${files.length} files)`);
         }
       } catch (e) {
-        if (isUniqueViolation(e)) { report.skipped += files.length; known.add(itemRel); continue; }
-        report.errors.push({ relPath: itemRel, reason: (e as Error).message });
+        if (isUniqueViolation(e)) { report.skipped += files.length; fr.skipped += files.length; known.add(itemRel); continue; }
+        fail(itemRel, (e as Error).message);
       }
     }
   }
@@ -184,7 +228,7 @@ export const isOgg = (path: string): boolean => /\.(opus|ogg)$/i.test(path);
 async function probeOggBook(args: SingleFileArgs): Promise<'added' | 'skipped'> {
   const { env, adapter, folder, file, itemRel } = args;
   const probeUrl = await adapter.resolveProbeUrl(file.relPath, file.providerId ?? null);
-  const probe = await probeOgg(probeUrl.url);
+  const probe = await probeOgg(probeUrl.url, probeUrl.headers);
 
   const filename = file.relPath.split('/').pop() ?? file.relPath;
   const title = probe.tags['TITLE'] ?? probe.tags['ALBUM'] ?? filename.replace(/\.(opus|ogg)$/i, '');
@@ -260,7 +304,7 @@ async function probeM4bBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
   // Get a probe URL — for OAuth providers this is short-lived, but the prober
   // makes its requests immediately so it's fine.
   const probeUrl = await adapter.resolveProbeUrl(file.relPath, file.providerId ?? null);
-  const probe = await probeM4b(probeUrl.url);
+  const probe = await probeM4b(probeUrl.url, probeUrl.headers);
 
   // Title: prefer the iTunes ©nam tag, fall back to filename without extension.
   const filename = file.relPath.split('/').pop() ?? file.relPath;
@@ -399,7 +443,7 @@ async function probeMp3Book(args: {
   const probes: Mp3Probe[] = [];
   for (const f of files) {
     const probeUrl = await adapter.resolveProbeUrl(f.relPath, f.providerId ?? null);
-    probes.push(await probeMp3(probeUrl.url, f.sizeBytes));
+    probes.push(await probeMp3(probeUrl.url, f.sizeBytes, probeUrl.headers));
   }
   const first = probes[0]!;
 
@@ -542,7 +586,7 @@ export async function reprobeItem(env: Env, itemId: string, tenantId: string): P
   const probeUrl = audio.rel_path
     ? await adapter.resolveProbeUrl(audio.rel_path, audio.provider_file_id)
     : { url: audio.filedn_url };
-  const probe = await probeM4b(probeUrl.url);
+  const probe = await probeM4b(probeUrl.url, probeUrl.headers);
 
   const totalDuration = probe.durationSeconds ?? audio.duration_seconds ?? 0;
   const stmts: D1PreparedStatement[] = [
@@ -675,7 +719,7 @@ async function reprobeOggItem(
   const probeUrl = audio.rel_path
     ? await adapter.resolveProbeUrl(audio.rel_path, audio.provider_file_id)
     : { url: audio.filedn_url };
-  const probe = await probeOgg(probeUrl.url);
+  const probe = await probeOgg(probeUrl.url, probeUrl.headers);
   const totalDuration = probe.durationSeconds ?? audio.duration_seconds ?? 0;
   const stmts: D1PreparedStatement[] = [env.DB.prepare('DELETE FROM chapters WHERE library_item_id = ?').bind(itemId)];
   const meta = await env.DB.prepare(
@@ -726,7 +770,7 @@ async function reprobeMp3Item(
     const probeUrl = f.rel_path
       ? await adapter.resolveProbeUrl(f.rel_path, f.provider_file_id)
       : { url: f.filedn_url };
-    probes.push(await probeMp3(probeUrl.url, f.size_bytes || undefined));
+    probes.push(await probeMp3(probeUrl.url, f.size_bytes || undefined, probeUrl.headers));
   }
   const relPaths = files.results.map((f) => f.rel_path ?? f.filedn_url);
   const stmts: D1PreparedStatement[] = [

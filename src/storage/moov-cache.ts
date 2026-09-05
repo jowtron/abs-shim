@@ -21,7 +21,7 @@ import { probeM4b } from '../prober/m4b';
 // values. Used only when an older row hasn't been backfilled yet.
 async function backfillMoovLocation(env: Env, folder: LibraryFolderRow, audio: AudioFileRow): Promise<void> {
   const probeUrl = await resolveProbeUrl(env, folder, audio);
-  const probe = await probeM4b(probeUrl.url);
+  const probe = await probeM4b(probeUrl.url, probeUrl.headers);
   audio.moov_offset = probe.moovOffset;
   audio.moov_size = probe.moovSize;
   await env.DB.prepare(

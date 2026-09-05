@@ -31,8 +31,8 @@ const TAIL_BYTES = 64 * 1024;
 
 const OGGS = 0x5367674f; // "OggS" little-endian u32
 
-async function rangeGet(url: string, start: number, end?: number): Promise<{ bytes: Uint8Array; total: number | null; status: number }> {
-  const res = await fetch(url, { headers: { Range: end == null ? `bytes=${start}` : `bytes=${start}-${end}` } });
+async function rangeGet(url: string, start: number, end?: number, headers?: Record<string, string>): Promise<{ bytes: Uint8Array; total: number | null; status: number }> {
+  const res = await fetch(url, { headers: { ...headers, Range: end == null ? `bytes=${start}` : `bytes=${start}-${end}` } });
   if (res.status !== 206 && res.status !== 200) throw new Error(`Range fetch failed: HTTP ${res.status}`);
   const cr = res.headers.get('Content-Range');
   const total = cr ? Number(/\/(\d+)$/.exec(cr)?.[1]) : Number(res.headers.get('Content-Length'));
@@ -144,15 +144,15 @@ function parsePictureBlock(b: Uint8Array): { bytes: Uint8Array; mimeType: string
   return { bytes: b.slice(off, off + dataLen), mimeType: mime || 'image/jpeg' };
 }
 
-export async function probeOgg(url: string): Promise<OggProbe> {
+export async function probeOgg(url: string, headers?: Record<string, string>): Promise<OggProbe> {
   // Head: grow until the comment packet is complete (a big embedded cover
   // can push OpusTags well past the first 256 KB).
   let headLen = HEAD_BYTES;
-  let head = await rangeGet(url, 0, headLen - 1);
+  let head = await rangeGet(url, 0, headLen - 1, headers);
   let first = firstPackets(head.bytes);
   while (!first && headLen < HEAD_MAX_BYTES && (head.total == null || headLen < head.total)) {
     headLen *= 4;
-    head = await rangeGet(url, 0, headLen - 1);
+    head = await rangeGet(url, 0, headLen - 1, headers);
     first = firstPackets(head.bytes);
   }
   if (!first) throw new Error('Not an Ogg stream (no codec header / comment packets found)');
@@ -208,7 +208,7 @@ export async function probeOgg(url: string): Promise<OggProbe> {
   const total = head.total;
   if (total && total > 0) {
     const start = Math.max(0, total - TAIL_BYTES);
-    const tail = await rangeGet(url, start, total - 1);
+    const tail = await rangeGet(url, start, total - 1, headers);
     const tb = tail.bytes;
     const dv = new DataView(tb.buffer, tb.byteOffset, tb.byteLength);
     // Scan backward for the last page header of our stream with a real granule.

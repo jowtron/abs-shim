@@ -63,8 +63,8 @@ function readBox(view: DataView, viewStart: number, offset: number): Box | null 
 // Issue a single Range request, return the bytes plus the response (so callers
 // can read Content-Length, etc.) — important: Cloudflare's fetch from inside
 // a Worker honours `Range` and CDNs return 206 normally.
-async function rangeFetch(url: string, start: number, endInclusive: number): Promise<{ bytes: Uint8Array; totalSize: number | null }> {
-  const res = await fetch(url, { headers: { Range: `bytes=${start}-${endInclusive}` } });
+async function rangeFetch(url: string, start: number, endInclusive: number, headers?: Record<string, string>): Promise<{ bytes: Uint8Array; totalSize: number | null }> {
+  const res = await fetch(url, { headers: { ...headers, Range: `bytes=${start}-${endInclusive}` } });
   if (res.status !== 206 && res.status !== 200) {
     throw new Error(`Range fetch failed: ${res.status} ${res.statusText}`);
   }
@@ -115,9 +115,10 @@ async function rangeFetch(url: string, start: number, endInclusive: number): Pro
 // can be served without a pCloud round-trip.
 export async function fetchMoov(
   url: string,
+  headers?: Record<string, string>,
 ): Promise<{ moov: Uint8Array; headerType: string; moovOffset: number; moovSize: number }> {
   // Step 1: read prefix.
-  const { bytes: prefix, totalSize } = await rangeFetch(url, 0, PREFIX_BYTES - 1);
+  const { bytes: prefix, totalSize } = await rangeFetch(url, 0, PREFIX_BYTES - 1, headers);
   let view = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
   let viewStart = 0;
   let cursor = 0;
@@ -128,7 +129,7 @@ export async function fetchMoov(
     if (!box) break;
     if (box.type === 'moov') {
       return {
-        moov: await readBoxFully(url, prefix, box),
+        moov: await readBoxFully(url, prefix, box, 0, headers),
         headerType: 'moov',
         moovOffset: box.start,
         moovSize: box.size,
@@ -143,12 +144,12 @@ export async function fetchMoov(
       if (box.size > 0 && totalSize !== null && box.start + box.size + 8 <= totalSize) {
         // Read just the next box header at box.start + box.size.
         const nextStart = box.start + box.size;
-        const { bytes: hdr } = await rangeFetch(url, nextStart, nextStart + 31);
+        const { bytes: hdr } = await rangeFetch(url, nextStart, nextStart + 31, headers);
         const hview = new DataView(hdr.buffer, hdr.byteOffset, hdr.byteLength);
         const next = readBox(hview, nextStart, nextStart);
         if (next?.type === 'moov') {
           return {
-            moov: await readBoxFully(url, hdr, next, nextStart),
+            moov: await readBoxFully(url, hdr, next, nextStart, headers),
             headerType: 'moov',
             moovOffset: next.start,
             moovSize: next.size,
@@ -165,7 +166,7 @@ export async function fetchMoov(
   if (totalSize === null) throw new Error('moov not in prefix and unknown file size');
   const tailLen = Math.min(MOOV_MAX_BYTES, totalSize);
   const tailStart = totalSize - tailLen;
-  const { bytes: tail } = await rangeFetch(url, tailStart, totalSize - 1);
+  const { bytes: tail } = await rangeFetch(url, tailStart, totalSize - 1, headers);
   view = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
   viewStart = tailStart;
 
@@ -194,7 +195,7 @@ export async function fetchMoov(
         };
       }
       return {
-        moov: await readBoxFully(url, tail, probe, viewStart),
+        moov: await readBoxFully(url, tail, probe, viewStart, headers),
         headerType: 'moov',
         moovOffset,
         moovSize: probe.size,
@@ -206,7 +207,7 @@ export async function fetchMoov(
 
 // Read the full payload bytes of `box`. `prefix` may already contain part of
 // it; if so, splice with a tail fetch.
-async function readBoxFully(url: string, prefix: Uint8Array, box: Box, prefixStart = 0): Promise<Uint8Array> {
+async function readBoxFully(url: string, prefix: Uint8Array, box: Box, prefixStart = 0, headers?: Record<string, string>): Promise<Uint8Array> {
   const payloadStart = box.payloadOffset;
   const payloadEnd = box.payloadOffset + (box.payloadSize >= 0 ? box.payloadSize : 0);
   const haveStart = prefixStart;
@@ -217,7 +218,7 @@ async function readBoxFully(url: string, prefix: Uint8Array, box: Box, prefixSta
   }
   // Otherwise, fetch the rest.
   const fetchStart = Math.max(payloadStart, haveEnd);
-  const { bytes: rest } = await rangeFetch(url, fetchStart, payloadEnd - 1);
+  const { bytes: rest } = await rangeFetch(url, fetchStart, payloadEnd - 1, headers);
   if (payloadStart >= haveStart && payloadStart < haveEnd) {
     const front = prefix.slice(payloadStart - haveStart, prefix.length);
     const out = new Uint8Array(front.length + rest.length);
@@ -315,7 +316,7 @@ function parseChpl(udta: Uint8Array): Array<{ start: number; title: string }> {
 // chapter samples can be spread across hundreds of MB. We compute each
 // sample's offset+size from stbl, then batch nearby samples into a small
 // number of Range requests rather than issuing one fetch per chapter.
-async function parseQtChapters(moov: Uint8Array, url: string): Promise<Array<{ start: number; title: string }>> {
+async function parseQtChapters(moov: Uint8Array, url: string, headers?: Record<string, string>): Promise<Array<{ start: number; title: string }>> {
   type Trak = { trackId: number; handlerType: string; body: Uint8Array };
   const traks: Trak[] = [];
   for (const c of walkChildren(moov)) {
@@ -452,7 +453,7 @@ async function parseQtChapters(moov: Uint8Array, url: string): Promise<Array<{ s
   // Fetch each group concurrently.
   const sampleBytes = new Array<Uint8Array | null>(sampleCount).fill(null);
   await Promise.all(groups.map(async (g) => {
-    const { bytes } = await rangeFetch(url, g.start, g.end - 1);
+    const { bytes } = await rangeFetch(url, g.start, g.end - 1, headers);
     for (const i of g.samples) {
       const local = sampleOffsets[i]! - g.start;
       sampleBytes[i] = bytes.slice(local, local + sampleSizes[i]!);
@@ -492,8 +493,8 @@ export type ProbeResult = {
   moovSize: number;
 };
 
-export async function probeM4b(url: string): Promise<ProbeResult> {
-  const { moov, moovOffset, moovSize } = await fetchMoov(url);
+export async function probeM4b(url: string, headers?: Record<string, string>): Promise<ProbeResult> {
+  const { moov, moovOffset, moovSize } = await fetchMoov(url, headers);
 
   // mvhd → duration / timescale
   const mvhd = findChild(moov, 'mvhd');
@@ -574,7 +575,7 @@ export async function probeM4b(url: string): Promise<ProbeResult> {
   let chapters = udta ? parseChpl(udta) : [];
   if (!chapters.length) {
     try {
-      chapters = await parseQtChapters(moov, url);
+      chapters = await parseQtChapters(moov, url, headers);
     } catch {
       // Non-fatal: just leave chapters empty.
     }

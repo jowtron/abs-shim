@@ -52,8 +52,8 @@ export type Mp3Probe = {
   chapters: Array<{ start: number; end: number; title: string }>;
 };
 
-export async function probeMp3(url: string, fileSize?: number): Promise<Mp3Probe> {
-  let { bytes, totalSize } = await rangeFetch(url, 0, PREFIX_BYTES - 1);
+export async function probeMp3(url: string, fileSize?: number, headers?: Record<string, string>): Promise<Mp3Probe> {
+  let { bytes, totalSize } = await rangeFetch(url, 0, PREFIX_BYTES - 1, headers);
   const realFileSize = fileSize ?? totalSize ?? bytes.length;
 
   // If the ID3v2 tag is bigger than our prefix, extend the fetch so the parser
@@ -63,7 +63,7 @@ export async function probeMp3(url: string, fileSize?: number): Promise<Mp3Probe
     if (id3End > MAX_ID3V2_BYTES) throw new Error('ID3v2 tag implausibly large');
     const needed = id3End + 4096;
     if (needed > bytes.length && bytes.length < realFileSize) {
-      const more = await rangeFetch(url, bytes.length, Math.min(needed, realFileSize) - 1);
+      const more = await rangeFetch(url, bytes.length, Math.min(needed, realFileSize) - 1, headers);
       const merged = new Uint8Array(bytes.length + more.bytes.length);
       merged.set(bytes, 0);
       merged.set(more.bytes, bytes.length);
@@ -442,9 +442,9 @@ function parseVbri(bytes: Uint8Array, frameOff: number, hdr: MpegHeader): number
 // ─── Range fetch ──────────────────────────────────────────────────────────────
 
 async function rangeFetch(
-  url: string, start: number, endInclusive: number,
+  url: string, start: number, endInclusive: number, headers?: Record<string, string>,
 ): Promise<{ bytes: Uint8Array; totalSize: number | null }> {
-  const res = await fetch(url, { headers: { Range: `bytes=${start}-${endInclusive}` } });
+  const res = await fetch(url, { headers: { ...headers, Range: `bytes=${start}-${endInclusive}` } });
   if (res.status !== 206 && res.status !== 200) {
     throw new Error(`Range fetch failed: ${res.status} ${res.statusText}`);
   }

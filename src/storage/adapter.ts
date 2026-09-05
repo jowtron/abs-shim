@@ -11,6 +11,10 @@ export type ResolvedUrl = {
   // Wall-clock ms when the URL stops working. Undefined means "stable".
   // The Worker can use this to set Cache-Control on 302 responses.
   expiresAt?: number;
+  // Headers OUR OWN fetches must send — WebDAV's Basic auth. Only ever set on
+  // probe URLs: a URL handed to a client can't carry a credential, which is
+  // exactly why client streaming goes through the signed proxy instead.
+  headers?: Record<string, string>;
 };
 
 export type RemoteEntry = {

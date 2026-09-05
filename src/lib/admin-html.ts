@@ -148,6 +148,11 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     .abb-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 1rem; }
     .abb-modal-box { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; width: min(640px, 100%); max-height: 90vh; display: flex; flex-direction: column; }
     .abb-modal-box h3 { margin: 0 0 0.25rem 0; font-size: 1rem; overflow-wrap: anywhere; }
+    .browse-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.25rem; border-bottom: 1px solid var(--border); cursor: pointer; }
+    .browse-row:last-child { border-bottom: none; }
+    .browse-row:hover { background: var(--bg); }
+    .browse-row .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+    .browse-here { font-size: 0.85rem; color: var(--muted); margin: 0.25rem 0 0.5rem; overflow-wrap: anywhere; }
     .abb-pick-list { overflow-y: auto; flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: 6px; padding: 0.25rem 0.5rem; font-size: 0.85rem; }
     .abb-pick-group { margin: 0.35rem 0; }
     .abb-pick-dir { display: block; font-weight: 600; padding: 0.2rem 0; overflow-wrap: anywhere; }
@@ -713,6 +718,18 @@ function formatScanReport(report) {
   lines.push('Added: ' + report.added);
   lines.push('Skipped: ' + report.skipped);
   lines.push('Duration: ' + report.durationMs + ' ms');
+  // Which backend each book came from. A library can have several, and the
+  // totals above don't say whether the new books landed on the NAS or in
+  // the bucket.
+  for (const f of report.folders || []) {
+    lines.push('');
+    lines.push(f.provider + ' · ' + (f.label || '(no path)'));
+    lines.push('  added ' + f.added + ', skipped ' + f.skipped + (f.errors ? ', ' + f.errors + ' error' + (f.errors === 1 ? '' : 's') : ''));
+    for (const p of f.addedPaths || []) lines.push('    + ' + p);
+    if (f.added > (f.addedPaths || []).length) {
+      lines.push('    … and ' + (f.added - f.addedPaths.length) + ' more');
+    }
+  }
   if (report.errors && report.errors.length) {
     lines.push('');
     lines.push('Errors:');
@@ -727,7 +744,7 @@ function formatScanReport(report) {
         lines.push('    "Add book by path" button next to "Scan now" (scroll up');
         lines.push('    to the library card if it just hid behind this output).');
       } else {
-        lines.push('  ✗ ' + (err.relPath || '(folder)') + ': ' + err.reason);
+        lines.push('  ✗ ' + (err.backend ? '[' + err.backend + '] ' : '') + (err.relPath || '(folder)') + ': ' + err.reason);
       }
     }
   }
@@ -1097,7 +1114,11 @@ function renderLibraries(status, libraries) {
         // min-width:0 lets flex children shrink below their content width;
         // word-break makes long URLs wrap inside the card on mobile rather
         // than spilling out the side.
-        html += '<span class="muted" style="flex:1; min-width:0; font-size: 0.85rem; word-break: break-all;">' + describeFolder(f) + '</span>';
+        const fst = f.stats || { bookCount: 0, missingCount: 0 };
+        let count = fst.bookCount + ' book' + (fst.bookCount === 1 ? '' : 's');
+        if (fst.missingCount) count += ', ' + fst.missingCount + ' missing';
+        html += '<span class="muted" style="flex:1; min-width:0; font-size: 0.85rem; word-break: break-all;">' + describeFolder(f)
+          + '<br><span style="font-size:0.8rem">' + count + '</span></span>';
         if (isOwner) html += '<button class="danger" data-remove-folder="' + escapeHtml(f.id) + '" style="font-size:0.8rem; padding:0.2rem 0.6rem; flex-shrink:0">Remove</button>';
         html += '</div>';
       }
@@ -1233,11 +1254,14 @@ function renderLibraries(status, libraries) {
       if (!bucket) return;
       const region = prompt('Region (R2 = "auto", AWS = "us-east-1" etc.):', 'auto');
       if (region == null) return;
-      const prefix = prompt('Path prefix inside the bucket (optional, e.g. "audiobooks/"):', '') || '';
       const accessKeyId = prompt('Access Key ID:');
       if (!accessKeyId) return;
       const secretAccessKey = prompt('Secret Access Key:');
       if (!secretAccessKey) return;
+      // Credentials first, then browse the bucket — picking the folder from
+      // a list beats typing a prefix and finding out at scan time.
+      const prefix = await pickRemoteFolder('s3', { endpoint, bucket, region, accessKeyId, secretAccessKey });
+      if (prefix == null) return;
       try {
         await api('/api/admin/storage/folder/s3', {
           method: 'POST',
@@ -1260,7 +1284,8 @@ function renderLibraries(status, libraries) {
       if (!username) return;
       const password = prompt('Password (or app-specific token):');
       if (!password) return;
-      const rootPath = prompt('Subfolder inside the WebDAV root (optional, e.g. "Audiobooks/"):', '') || '';
+      const rootPath = await pickRemoteFolder('webdav', { baseUrl, username, password });
+      if (rootPath == null) return;
       try {
         await api('/api/admin/storage/folder/webdav', {
           method: 'POST',
@@ -1390,8 +1415,9 @@ function renderLibraries(status, libraries) {
         || (profiles.length === 1 ? profiles[0].id
             : prompt('pCloud profile id:', profiles[0].id));
       if (!profileId) return;
-      const rootPath = prompt('Root path inside pCloud (e.g. /Audiobooks):', '/Audiobooks');
-      if (!rootPath) return;
+      const picked = await pickRemoteFolder('pcloud_oauth', {}, { profileId });
+      if (picked == null) return;
+      const rootPath = '/' + picked;
       try {
         await api('/api/admin/storage/folder/pcloud', {
           method: 'POST',
@@ -2727,6 +2753,89 @@ function abbPlanDest(folderName, files) {
       ? [...r.slice(0, -1), name.replace(/\.[^.]+$/, ''), name].join('/')
       : r.join('/');
     return { id: f.id, dest, bytes: f.bytes };
+  });
+}
+
+// Folder picker for a storage backend being attached. The credentials are
+// already in hand but nothing is saved yet, so the browse route takes them
+// in the body and lists one level at a time. Resolves with the chosen path
+// (relative to the backend root, '' meaning the root itself) or null.
+//
+// Beats asking for a path in a prompt(): nobody remembers whether their NAS
+// share is "Audiobooks", "audiobooks" or "media/Audiobooks", and a wrong
+// guess only shows up later as an empty scan.
+function pickRemoteFolder(provider, config, opts) {
+  opts = opts || {};
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'abb-modal';
+    overlay.innerHTML =
+      '<div class="abb-modal-box">' +
+        '<h3>Choose a folder</h3>' +
+        '<div class="browse-here"></div>' +
+        '<div class="abb-pick-list"></div>' +
+        '<div class="upload-row" style="justify-content:flex-end; margin:0.75rem 0 0">' +
+          '<span class="muted browse-status" style="margin-right:auto"></span>' +
+          '<button class="secondary" data-cancel>Cancel</button>' +
+          '<button data-ok>Use this folder</button>' +
+        '</div>' +
+      '</div>';
+    const list = overlay.querySelector('.abb-pick-list');
+    const here = overlay.querySelector('.browse-here');
+    const status = overlay.querySelector('.browse-status');
+    let path = (opts.startPath || '').replace(/^\/+|\/+$/g, '');
+
+    const close = (value) => { overlay.remove(); resolve(value); };
+
+    async function load() {
+      list.innerHTML = '';
+      status.textContent = 'Loading…';
+      here.textContent = path ? '/' + path : '(root)';
+      let r;
+      try {
+        r = await api('/api/admin/storage/browse', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider, config, path, profileId: opts.profileId }),
+        });
+        if (r.error) throw new Error(r.error);
+      } catch (e) {
+        status.textContent = '';
+        list.innerHTML = '<p class="warn" style="margin:0.5rem"></p>';
+        list.querySelector('p').textContent = 'Could not list this folder: ' + e.message;
+        return;
+      }
+      status.textContent = r.audioFiles
+        ? r.audioFiles + ' audiobook file' + (r.audioFiles === 1 ? '' : 's') + ' here'
+        : (r.files ? r.files + ' file(s), none audiobooks' : 'No files here');
+      if (path) {
+        const up = document.createElement('div');
+        up.className = 'browse-row';
+        up.innerHTML = '<span class="name">↰ ..</span>';
+        up.addEventListener('click', () => { path = path.split('/').slice(0, -1).join('/'); load(); });
+        list.appendChild(up);
+      }
+      for (const d of r.dirs) {
+        const row = document.createElement('div');
+        row.className = 'browse-row';
+        row.innerHTML = '<span class="name"></span><span class="muted">›</span>';
+        row.querySelector('.name').textContent = '📁 ' + d;
+        row.addEventListener('click', () => { path = path ? path + '/' + d : d; load(); });
+        list.appendChild(row);
+      }
+      if (!r.dirs.length) {
+        const none = document.createElement('div');
+        none.className = 'muted';
+        none.style.padding = '0.5rem';
+        none.textContent = 'No sub-folders here.';
+        list.appendChild(none);
+      }
+    }
+
+    overlay.querySelector('[data-cancel]').addEventListener('click', () => close(null));
+    overlay.querySelector('[data-ok]').addEventListener('click', () => close(path));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(null); });
+    document.body.appendChild(overlay);
+    load();
   });
 }
 
