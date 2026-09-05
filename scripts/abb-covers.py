@@ -39,6 +39,7 @@ import getpass
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -135,12 +136,34 @@ class Session:
 
 # ─── images ─────────────────────────────────────────────────────────────────
 
-def fetch_image(url):
+def is_dns_failure(e):
+    """A name that didn't resolve, as opposed to a host that didn't answer."""
+    reason = getattr(e, "reason", e)
+    return isinstance(reason, socket.gaierror) or isinstance(e, socket.gaierror)
+
+
+def fetch_image(url, attempts=3):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://audiobookbay.lu/"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        if r.status != 200:
-            raise RuntimeError(f"HTTP {r.status}")
-        data = r.read(8 * 1024 * 1024)
+    for i in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}")
+                data = r.read(8 * 1024 * 1024)
+            break
+        except urllib.error.HTTPError:
+            raise                      # the host answered; caller records it
+        except urllib.error.URLError as e:
+            # On the wharf nodes DNS goes through Tailscale's MagicDNS
+            # resolver (nameserver 100.100.100.100), and its upstream returns
+            # SERVFAIL in bursts under the lookup rate a cover pass generates
+            # — 2026-09-05 01:48, tailscaled logging "forward: sendUDP:
+            # response code indicating server failure: 2" at the exact second
+            # a batch skipped 60 of 60. Seconds later everything resolves
+            # again, so ride it out instead of parking 60 good covers.
+            if i + 1 >= attempts or not is_dns_failure(e):
+                raise
+            time.sleep(1 + 2 * i)
     if len(data) < 100:
         raise RuntimeError("empty response")
     return data
@@ -203,6 +226,7 @@ def sample(sess, args, qualities):
 def one_pass(sess, args, quality, limit):
     """Process pending covers until none are left (or `limit`). Returns (done, failed)."""
     done = failed = 0
+    all_skipped_once = False
     t0 = time.time()
     while done + failed < limit:
         st = sess.call(f"/api/admin/abb/catalog/covers/pending?limit={min(args.batch, limit - done - failed)}{shard_qs(args)}")
@@ -298,8 +322,17 @@ def one_pass(sess, args, quality, limit):
             + (f" · this batch skipped {skipped} ({top(skips)})" if skipped else "")
             + (f" · marked {top(fails)}" if fails else ""))
         if skipped == len(pending):
-            # Everything hit the network — don't spin, let the caller sleep.
-            raise ConnectionError("network unavailable")
+            # Everything hit the network. One more go after a pause — a
+            # MagicDNS SERVFAIL burst clears in seconds, and aborting the pass
+            # here costs 15 minutes of backlog for a blip. Two in a row is a
+            # real outage: let the caller sleep.
+            if all_skipped_once:
+                raise ConnectionError("network unavailable")
+            all_skipped_once = True
+            log("  whole batch hit the network — pausing 20s and retrying it")
+            time.sleep(20)
+        else:
+            all_skipped_once = False
     return done, failed
 
 
