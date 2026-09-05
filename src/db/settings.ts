@@ -42,6 +42,17 @@ export async function setTenantSetting(env: Env, tenantId: string, key: string, 
   ).bind(tenantId, key, value, Date.now()).run();
 }
 
+// "Members can add books" — the one per-tenant permission switch (2026-09-05).
+// Off: only the owner can upload, fetch, grab from AudioBookBay or link an
+// Audible account. On: members can too, each seeing only their own torrents
+// and Audible accounts. Deleting books and changing storage stay owner-only
+// regardless — see requireTenantOwner / requireCanAdd in auth/middleware.ts.
+export const MEMBERS_CAN_ADD_KEY = 'members_can_add';
+
+export async function membersCanAdd(env: Env, tenantId: string): Promise<boolean> {
+  return (await getTenantSetting(env, tenantId, MEMBERS_CAN_ADD_KEY)) === '1';
+}
+
 export async function deleteTenantSetting(env: Env, tenantId: string, key: string): Promise<void> {
   await env.DB.prepare('DELETE FROM tenant_settings WHERE tenant_id = ? AND key = ?').bind(tenantId, key).run();
 }

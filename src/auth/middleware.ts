@@ -3,6 +3,7 @@ import type { Env } from '../types';
 import { verifyAccessToken, type AccessClaims } from './tokens';
 import { findUserById, type UserRow } from '../db/users';
 import { getActiveMembership, type TenantRole } from '../db/tenants';
+import { membersCanAdd } from '../db/settings';
 
 export type AuthVars = {
   userId: string;
@@ -47,6 +48,37 @@ export const requireAuth = createMiddleware<{ Bindings: Env; Variables: AuthVars
     c.set('tenantId', membership.tenantId);
     c.set('tenantRole', membership.role);
     await next();
+  },
+);
+
+// Owner-only gate for anything that changes the shape of the tenant's
+// library or spends the owner's accounts irreversibly: connecting or
+// removing storage, deleting books (and their files), inviting members,
+// crawler control. A member with all of that was the state of things until
+// 2026-09-05 — every admin route was open to any active member.
+export const requireTenantOwner = createMiddleware<{ Bindings: Env; Variables: AuthVars }>(
+  async (c, next) => {
+    if (c.get('tenantRole') !== 'owner') {
+      return c.json({ error: 'Only the library owner can do this' }, 403);
+    }
+    return next();
+  },
+);
+
+// "May add books": the owner always, members only when the tenant's
+// members_can_add switch is on. Covers uploads, fetch-from-URL, zip extract,
+// add-by-path, AudioBookBay grabs (resolve + Real-Debrid) and Audible.
+export async function canAddBooks(c: { env: Env; get: (k: 'tenantRole' | 'tenantId') => string }): Promise<boolean> {
+  if (c.get('tenantRole') === 'owner') return true;
+  return membersCanAdd(c.env, c.get('tenantId'));
+}
+
+export const requireCanAdd = createMiddleware<{ Bindings: Env; Variables: AuthVars }>(
+  async (c, next) => {
+    if (!(await canAddBooks(c))) {
+      return c.json({ error: 'The library owner has not enabled adding books for members' }, 403);
+    }
+    return next();
   },
 );
 

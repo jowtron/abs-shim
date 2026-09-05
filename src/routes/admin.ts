@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { createMiddleware } from 'hono/factory';
 import type { Env } from '../types';
-import { requireAuth, type AuthVars } from '../auth/middleware';
+import { requireAuth, requireTenantOwner, requireCanAdd, type AuthVars } from '../auth/middleware';
 import {
   exchangePcloudCode, pcloudAuthorizeUrl, pcloudUserinfo,
   apiHostFromLocationId, type PcloudProfile,
@@ -16,19 +16,24 @@ import { probeMp3 } from '../prober/mp3';
 import { resolveProbeUrl } from '../storage/resolve';
 import type { OAuthProfileRow } from '../storage/factory';
 import { redactSecrets, safeJson } from '../lib/redact';
-import { getSignupMode, setSetting } from '../db/settings';
+import { getSignupMode, setSetting, membersCanAdd, setTenantSetting, MEMBERS_CAN_ADD_KEY } from '../db/settings';
 import { createInvite, listOpenInvites, deleteInvite } from '../db/invites';
 import { listTenantMembers, removeMember } from '../db/tenants';
 
 // Mounted at /api/admin from index.ts. The admin UI itself lives at /admin and
 // is served as an inline HTML page (src/lib/admin-html.ts).
 //
-// Auth model (Phase 3): the storage/library management endpoints are open to
-// ANY authenticated, active member — they're all tenant-scoped (every query
-// filters by c.get('tenantId')), so a member only ever sees and mutates their
-// own tenant's data. A small set of *instance-wide* operations (approving
-// signups, the signup-mode switch) stay restricted to the instance owner via
-// requireInstanceOwner. Cross-tenant visibility lives at /ops, not here.
+// Auth model. Every query is tenant-scoped (filters by c.get('tenantId')), so
+// a member only ever sees their own tenant's data. Within the tenant there
+// are three tiers (2026-09-05 — before that every route here was open to any
+// active member, so a member could disconnect pCloud or delete the library):
+//   - anyone:            read status, scan, re-probe, warm covers, see members
+//   - requireCanAdd:     upload / fetch / extract / add-by-path — owner, or a
+//                        member when the tenant's members_can_add switch is on
+//   - requireTenantOwner: connect/attach/remove storage, delete books, invites
+// A small set of *instance-wide* operations (approving signups, the signup-
+// mode switch) stay restricted to the instance owner via requireInstanceOwner.
+// Cross-tenant visibility lives at /ops, not here.
 
 export const adminRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
@@ -42,17 +47,6 @@ const requireInstanceOwner = createMiddleware<{ Bindings: Env; Variables: AuthVa
     const u = c.get('user');
     if (u.type !== 'root' && u.type !== 'admin') {
       return c.json({ error: 'Forbidden' }, 403);
-    }
-    return next();
-  },
-);
-
-// Gate for managing one's own tenant (invite/remove members). The per-tenant
-// 'owner' role — distinct from the instance owner above.
-const requireTenantOwner = createMiddleware<{ Bindings: Env; Variables: AuthVars }>(
-  async (c, next) => {
-    if (c.get('tenantRole') !== 'owner') {
-      return c.json({ error: 'Only the tenant owner can do this' }, 403);
     }
     return next();
   },
@@ -72,12 +66,16 @@ adminRoutes.get('/storage/status', async (c) => {
        ORDER BY lf.added_at ASC`,
   ).bind(tenantId).all<FolderWithLibName>();
 
-  const profiles = await c.env.DB.prepare(
+  const isOwner = c.get('tenantRole') === 'owner';
+  // Connected accounts are the owner's business; a member gets the folder
+  // list (needed to pick an upload target) but not whose pCloud it is.
+  const profiles = isOwner ? await c.env.DB.prepare(
     `SELECT id, provider, account_label, api_host, created_at, last_verified_at
        FROM oauth_profiles
       WHERE tenant_id = ?
        ORDER BY created_at ASC`,
-  ).bind(tenantId).all<ProfileSummary>();
+  ).bind(tenantId).all<ProfileSummary>() : { results: [] as ProfileSummary[] };
+  const membersMayAdd = await membersCanAdd(c.env, tenantId);
 
   // Per-library stats. Two queries because counting books requires DISTINCT
   // over library_items, whereas duration/size sums across audio_files (a book
@@ -146,7 +144,19 @@ adminRoutes.get('/storage/status', async (c) => {
     isInstanceOwner,
     userId: u.id,
     signupMode: isInstanceOwner ? await getSignupMode(c.env) : null,
+    // The permission switch (owner sets it) and what it means for the caller.
+    membersCanAdd: membersMayAdd,
+    canAdd: isOwner || membersMayAdd,
   });
+});
+
+// Owner-only: the one per-tenant permission switch. Body {membersCanAdd: bool}.
+adminRoutes.post('/tenant/settings', requireTenantOwner, async (c) => {
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  if (typeof body['membersCanAdd'] === 'boolean') {
+    await setTenantSetting(c.env, c.get('tenantId'), MEMBERS_CAN_ADD_KEY, body['membersCanAdd'] ? '1' : '0');
+  }
+  return c.json({ ok: true, membersCanAdd: await membersCanAdd(c.env, c.get('tenantId')) });
 });
 
 // ─── Tenant members & invites (the "household / family" sharing model) ────────
@@ -202,7 +212,7 @@ adminRoutes.delete('/members/:userId', requireTenantOwner, async (c) => {
 
 // Step 1: redirect the browser to pCloud's authorize page. Persists a CSRF
 // state token tied to this admin session.
-adminRoutes.get('/storage/pcloud/start', async (c) => {
+adminRoutes.get('/storage/pcloud/start', requireTenantOwner, async (c) => {
   const clientId = c.env.PCLOUD_CLIENT_ID;
   if (!clientId) {
     return c.json({ error: 'PCLOUD_CLIENT_ID not configured' }, 500);
@@ -222,7 +232,7 @@ adminRoutes.get('/storage/pcloud/start', async (c) => {
 // Step 2: pCloud redirects the browser back here with `code` + `state` (and
 // for EU users, `hostname` and `locationid`). Validate state, exchange code,
 // persist tokens, redirect to the admin UI success page.
-adminRoutes.get('/storage/pcloud/callback', async (c) => {
+adminRoutes.get('/storage/pcloud/callback', requireTenantOwner, async (c) => {
   const code = c.req.query('code');
   const state = c.req.query('state');
   if (!code || !state) {
@@ -276,7 +286,7 @@ adminRoutes.get('/storage/pcloud/callback', async (c) => {
 // Folder rows are kept (so you can re-link to a fresh connection); their
 // provider stays 'pcloud_oauth' but profile_id becomes null and the folder
 // will fail at first use.
-adminRoutes.post('/storage/pcloud/disconnect/:profileId', async (c) => {
+adminRoutes.post('/storage/pcloud/disconnect/:profileId', requireTenantOwner, async (c) => {
   const profileId = c.req.param('profileId');
   const tenantId = c.get('tenantId');
   await c.env.DB.batch([
@@ -292,7 +302,7 @@ adminRoutes.post('/storage/pcloud/disconnect/:profileId', async (c) => {
 // path. Used by the admin UI after a successful connect.
 //
 // Body: { libraryId, profileId, rootPath }
-adminRoutes.post('/storage/folder/pcloud', async (c) => {
+adminRoutes.post('/storage/folder/pcloud', requireTenantOwner, async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const libraryId = String(body['libraryId'] ?? '');
   const profileId = String(body['profileId'] ?? '');
@@ -336,7 +346,7 @@ adminRoutes.post('/storage/folder/pcloud', async (c) => {
 
 // Configure a library_folders row to point at an S3-compatible bucket.
 // Body: { libraryId, endpoint, bucket, region, prefix?, accessKeyId, secretAccessKey }
-adminRoutes.post('/storage/folder/s3', async (c) => {
+adminRoutes.post('/storage/folder/s3', requireTenantOwner, async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const libraryId = String(body['libraryId'] ?? '');
   const endpoint = String(body['endpoint'] ?? '').replace(/\/+$/, '');
@@ -356,7 +366,7 @@ adminRoutes.post('/storage/folder/s3', async (c) => {
 
 // Configure a library_folders row to point at a WebDAV server.
 // Body: { libraryId, baseUrl, username, password, rootPath? }
-adminRoutes.post('/storage/folder/webdav', async (c) => {
+adminRoutes.post('/storage/folder/webdav', requireTenantOwner, async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const libraryId = String(body['libraryId'] ?? '');
   const baseUrl = String(body['baseUrl'] ?? '').replace(/\/+$/, '') + '/';
@@ -392,7 +402,7 @@ async function upsertFolderProvider(env: Env, libraryId: string, tenantId: strin
 // Remove a folder. Refuses if any library_items still reference it — caller
 // has to explicitly clear those items first (we don't cascade-delete here
 // because losing user progress on a misclick is worse than the inconvenience).
-adminRoutes.delete('/storage/folder/:id', async (c) => {
+adminRoutes.delete('/storage/folder/:id', requireTenantOwner, async (c) => {
   const folderId = c.req.param('id');
   const tenantId = c.get('tenantId');
   // Confirm the folder belongs to this tenant before touching it.
@@ -441,7 +451,7 @@ adminRoutes.post('/libraries/:id/scan', async (c) => {
 //
 // Body: { libraryId: string, relPath: string }
 //   relPath is the path inside the folder, e.g. "The Singularity Trap/The Singularity Trap (Unabridged).m4b"
-adminRoutes.post('/books/add-by-path', async (c) => {
+adminRoutes.post('/books/add-by-path', requireCanAdd, async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const libraryId = String(body['libraryId'] ?? '');
   const relPath = String(body['relPath'] ?? '').trim();
@@ -515,7 +525,7 @@ function joinPcloudPath(rootPath: string, relPath: string): string {
 // Chunk size = 25 MB. Larger amortises per-request handshake overhead; the
 // Worker streams the body through (see /chunk below) so we don't hold this
 // in memory.
-adminRoutes.post('/storage/folder/:folderId/upload/init', async (c) => {
+adminRoutes.post('/storage/folder/:folderId/upload/init', requireCanAdd, async (c) => {
   const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
   if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
   const uploadId = await pcloudUploadCreate(loaded.profile);
@@ -533,7 +543,7 @@ adminRoutes.post('/storage/folder/:folderId/upload/init', async (c) => {
 // transfers overlap in time instead of running sequentially, ~halving wall
 // clock for each chunk on slow uplinks, and Worker memory stays low so we
 // can use large chunks without trouble.
-adminRoutes.post('/storage/folder/:folderId/upload/chunk', async (c) => {
+adminRoutes.post('/storage/folder/:folderId/upload/chunk', requireCanAdd, async (c) => {
   const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
   if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
   const uploadId = Number(c.req.query('uploadId') ?? '');
@@ -557,7 +567,7 @@ adminRoutes.post('/storage/folder/:folderId/upload/chunk', async (c) => {
 // without a separate scan step.
 //
 // Body: { uploadId: number, relPath: string, registerAsBook?: boolean }
-adminRoutes.post('/storage/folder/:folderId/upload/save', async (c) => {
+adminRoutes.post('/storage/folder/:folderId/upload/save', requireCanAdd, async (c) => {
   const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
   if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
@@ -678,7 +688,7 @@ async function probeSourceUrl(url: string): Promise<{ size?: number; contentType
 
 // Body: { url: string, relPath: string }
 // Returns: { relPath, absPath, expectedSize? }
-adminRoutes.post('/storage/folder/:folderId/fetch-url/start', async (c) => {
+adminRoutes.post('/storage/folder/:folderId/fetch-url/start', requireCanAdd, async (c) => {
   const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
   if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
@@ -737,7 +747,7 @@ adminRoutes.post('/storage/folder/:folderId/fetch-url/start', async (c) => {
 
 // Query: ?relPath=…&expectedSize=N&lastSize=N
 // Returns: { finished: boolean, status: 'pending'|'downloading'|'ready', size?, downloaded? }
-adminRoutes.get('/storage/folder/:folderId/fetch-url/progress', async (c) => {
+adminRoutes.get('/storage/folder/:folderId/fetch-url/progress', requireCanAdd, async (c) => {
   const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
   if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
   const relPath = (c.req.query('relPath') ?? '').trim().replace(/^\/+/, '');
@@ -767,7 +777,7 @@ adminRoutes.get('/storage/folder/:folderId/fetch-url/progress', async (c) => {
 
 // Body: { relPath: string, registerAsBook?: boolean }
 // Mirrors the tail of /upload/save so both paths register books identically.
-adminRoutes.post('/storage/folder/:folderId/fetch-url/finish', async (c) => {
+adminRoutes.post('/storage/folder/:folderId/fetch-url/finish', requireCanAdd, async (c) => {
   const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
   if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
@@ -818,7 +828,7 @@ function extractJobStub(env: Env, tenantId: string, folderId: string, relPath: s
 }
 
 // Body: { relPath: string, deleteArchive?: boolean }
-adminRoutes.post('/storage/folder/:folderId/extract/start', async (c) => {
+adminRoutes.post('/storage/folder/:folderId/extract/start', requireCanAdd, async (c) => {
   const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
   if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
@@ -848,7 +858,7 @@ adminRoutes.post('/storage/folder/:folderId/extract/start', async (c) => {
 });
 
 // Query: ?relPath=
-adminRoutes.get('/storage/folder/:folderId/extract/status', async (c) => {
+adminRoutes.get('/storage/folder/:folderId/extract/status', requireCanAdd, async (c) => {
   const loaded = await loadPcloudFolder(c.env, c.req.param('folderId'), c.get('tenantId'));
   if (!loaded.ok) return c.json({ error: loaded.error }, loaded.status as 400 | 404);
   const relPath = (c.req.query('relPath') ?? '').trim().replace(/^\/+/, '');
@@ -950,7 +960,7 @@ adminRoutes.post('/libraries/:libId/reprobe', async (c) => {
 // only runs afterwards, so a pCloud failure mid-way leaves a consistent
 // "item still listed, some files gone" state the next scan marks missing,
 // rather than an orphaned file nobody can see.
-adminRoutes.delete('/items/:itemId', async (c) => {
+adminRoutes.delete('/items/:itemId', requireTenantOwner, async (c) => {
   const itemId = c.req.param('itemId');
   const tenantId = c.get('tenantId');
   const deleteFiles = c.req.query('deleteFiles') === '1';

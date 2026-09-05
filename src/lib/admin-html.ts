@@ -397,6 +397,9 @@ npx wrangler secret put PCLOUD_CLIENT_SECRET</pre>
     <h2>Library members</h2>
     <p class="muted">Everyone here shares the same libraries but keeps their own progress, bookmarks, and finished books.</p>
     <div id="members-body" class="muted">Loading…</div>
+    <label id="members-can-add-row" class="muted" style="display:none; margin-top:0.75rem; font-size:0.9rem; cursor:pointer">
+      <input type="checkbox" id="members-can-add"> Members can add books (upload, fetch, AudioBookBay, Audible). Deleting books and changing storage stay yours.
+    </label>
     <div id="invite-actions" class="row" style="margin-top:1rem; display:none">
       <button id="create-invite" class="secondary">Invite someone…</button>
       <span id="invite-status" class="muted"></span>
@@ -744,6 +747,12 @@ async function refresh() {
     return;
   }
   hideLoginForm();
+  // Role gates for the render functions below. Every owner-only control is
+  // also enforced server-side (requireTenantOwner / requireCanAdd) — hiding
+  // them here just spares members buttons that would 403.
+  window.__role = status.role;
+  window.__canAdd = !!status.canAdd;
+  document.getElementById('connections-card').style.display = status.role === 'owner' ? '' : 'none';
   renderConnections(status);
   renderConnectActions(status);
   renderLibraries(status, libs.libraries || []);
@@ -830,10 +839,23 @@ function renderHousehold(status) {
     });
   }).catch((e) => { if (!(e instanceof UnauthorizedError)) document.getElementById('members-body').innerHTML = '<p class="warn">' + escapeHtml(e.message) + '</p>'; });
 
-  // Owner-only: invite controls + open invites.
+  // Owner-only: the members-can-add switch, invite controls + open invites.
   document.getElementById('invite-actions').style.display = isOwner ? '' : 'none';
+  document.getElementById('members-can-add-row').style.display = isOwner ? 'block' : 'none';
   document.getElementById('invites-body').innerHTML = '';
   if (!isOwner) return;
+
+  const canAddBox = document.getElementById('members-can-add');
+  canAddBox.checked = !!status.membersCanAdd;
+  if (!canAddBox.dataset.wired) {
+    canAddBox.dataset.wired = '1';
+    canAddBox.addEventListener('change', async () => {
+      canAddBox.disabled = true;
+      try { await api('/api/admin/tenant/settings', { method: 'POST', body: JSON.stringify({ membersCanAdd: canAddBox.checked }) }); }
+      catch (err) { canAddBox.checked = !canAddBox.checked; showError('Could not save: ' + err.message); }
+      finally { canAddBox.disabled = false; }
+    });
+  }
 
   const createBtn = document.getElementById('create-invite');
   if (!createBtn.dataset.wired) {
@@ -1044,6 +1066,8 @@ function renderLibraries(status, libraries) {
   }
 
   const stats = status.stats || {};
+  const isOwner = status.role === 'owner';
+  const canAdd = !!status.canAdd;
   let html = '';
   for (const lib of libraries) {
     const folders = foldersByLib[lib.id] || [];
@@ -1074,7 +1098,7 @@ function renderLibraries(status, libraries) {
         // word-break makes long URLs wrap inside the card on mobile rather
         // than spilling out the side.
         html += '<span class="muted" style="flex:1; min-width:0; font-size: 0.85rem; word-break: break-all;">' + describeFolder(f) + '</span>';
-        html += '<button class="danger" data-remove-folder="' + escapeHtml(f.id) + '" style="font-size:0.8rem; padding:0.2rem 0.6rem; flex-shrink:0">Remove</button>';
+        if (isOwner) html += '<button class="danger" data-remove-folder="' + escapeHtml(f.id) + '" style="font-size:0.8rem; padding:0.2rem 0.6rem; flex-shrink:0">Remove</button>';
         html += '</div>';
       }
       html += '</div>';
@@ -1085,8 +1109,8 @@ function renderLibraries(status, libraries) {
     // Primary actions row.
     html += '<div class="row" style="flex-wrap: wrap; gap: 0.5rem;">';
     html += '<button data-scan="' + escapeHtml(lib.id) + '">Scan now</button>';
-    html += '<button class="secondary" data-add-path="' + escapeHtml(lib.id) + '">Add book by path</button>';
-    if (pcloudFolder) {
+    if (canAdd) html += '<button class="secondary" data-add-path="' + escapeHtml(lib.id) + '">Add book by path</button>';
+    if (pcloudFolder && canAdd) {
       html += '<button class="secondary" data-upload-toggle="' + escapeHtml(lib.id) + '">Upload audiobook…</button>';
     }
     html += '<button class="secondary" data-show-books="' + escapeHtml(lib.id) + '">Show books (' + s.bookCount + ')</button>';
@@ -1102,7 +1126,7 @@ function renderLibraries(status, libraries) {
     // Inline upload widget — placed directly under the row that contains the
     // toggle button so it visually belongs to "Upload audiobook…", not to the
     // attach-backend row below.
-    if (pcloudFolder) {
+    if (pcloudFolder && canAdd) {
       html += '<div class="upload-area" id="upload-area-' + escapeHtml(lib.id) + '" data-folder="' + escapeHtml(pcloudFolder.id) + '">';
       html += '<div class="upload-row">';
       html += '<input type="file" multiple accept=".m4b,.m4a,.aac,.zip,.rar" data-upload-files="' + escapeHtml(lib.id) + '" />';
@@ -1118,15 +1142,17 @@ function renderLibraries(status, libraries) {
       html += '</div>';
     }
 
-    // Secondary actions: attach another backend.
-    html += '<div class="row" style="flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem;">';
-    html += '<span class="muted" style="width:100%">Add another storage backend:</span>';
-    html += '<button class="secondary" data-attach-s3="' + escapeHtml(lib.id) + '">S3-compat (R2 / B2 / S3 / Wasabi)</button>';
-    html += '<button class="secondary" data-attach-webdav="' + escapeHtml(lib.id) + '">WebDAV (NAS)</button>';
-    if (status.profiles.some((p) => p.provider === 'pcloud')) {
-      html += '<button class="secondary" data-attach-pcloud="' + escapeHtml(lib.id) + '">pCloud (OAuth)</button>';
+    // Secondary actions: attach another backend (owner only).
+    if (isOwner) {
+      html += '<div class="row" style="flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem;">';
+      html += '<span class="muted" style="width:100%">Add another storage backend:</span>';
+      html += '<button class="secondary" data-attach-s3="' + escapeHtml(lib.id) + '">S3-compat (R2 / B2 / S3 / Wasabi)</button>';
+      html += '<button class="secondary" data-attach-webdav="' + escapeHtml(lib.id) + '">WebDAV (NAS)</button>';
+      if (status.profiles.some((p) => p.provider === 'pcloud')) {
+        html += '<button class="secondary" data-attach-pcloud="' + escapeHtml(lib.id) + '">pCloud (OAuth)</button>';
+      }
+      html += '</div>';
     }
-    html += '</div>';
 
     html += '</div>';
   }
@@ -1402,7 +1428,11 @@ function renderAbb(status, libraries) {
     target.appendChild(opt);
   }
   if (prev) target.value = prev;
-  card.style.display = target.options.length ? 'block' : 'none';
+  // A member without the members-can-add switch can't grab, so the whole
+  // card goes (search alone would only tease). The catalogue crawler box is
+  // the owner's dashboard.
+  card.style.display = target.options.length && status.canAdd ? 'block' : 'none';
+  document.getElementById('abb-catalog').style.display = status.role === 'owner' ? '' : 'none';
   audibleRender(status, libraries);
   if (abbWired) return;
   abbWired = true;
@@ -3123,8 +3153,10 @@ function renderBooksList(container, items) {
     html += '<span class="meta">' + formatDuration(it.duration_seconds) + '</span>';
     html += '<span class="meta">' + formatBytes(it.size_bytes) + '</span>';
     html += '<button class="secondary" data-reprobe-item="' + escapeHtml(it.id) + '">Re-probe</button>';
-    html += '<button class="danger" data-remove-item="' + escapeHtml(it.id) + '">Remove</button>';
-    html += '<button class="danger" data-delete-item-files="' + escapeHtml(it.id) + '" title="Remove from the library AND delete the audio files from pCloud">Delete + files</button>';
+    if (window.__role === 'owner') {
+      html += '<button class="danger" data-remove-item="' + escapeHtml(it.id) + '">Remove</button>';
+      html += '<button class="danger" data-delete-item-files="' + escapeHtml(it.id) + '" title="Remove from the library AND delete the audio files from pCloud">Delete + files</button>';
+    }
     html += '</div>';
   }
   container.innerHTML = html;

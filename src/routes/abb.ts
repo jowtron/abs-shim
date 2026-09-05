@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { Env } from '../types';
-import { requireAuth, type AuthVars } from '../auth/middleware';
-import { getTenantSetting, setTenantSetting, deleteTenantSetting } from '../db/settings';
+import { requireAuth, requireCanAdd, type AuthVars } from '../auth/middleware';
+import { getTenantSetting, setTenantSetting, deleteTenantSetting, membersCanAdd } from '../db/settings';
 import { abbLogin, abbSearch, abbMagnet, abbDetails, magnetFromHash, type AbbCookie, type AbbResult } from '../lib/abb';
 import {
   catalogSearch, catalogBrowse, catalogFacets, catalogGet, rowToDetails, catalogRecordHash, catalogRecordDetails,
@@ -95,16 +95,53 @@ const originOf = (url: string) => new URL(url).origin;
 
 // ─── Settings ───────────────────────────────────────────────────────────────
 
+// Also the capability probe both UIs make (Pholia hides its Add screen and
+// its delete-from-pCloud on these): canGrab follows the members_can_add
+// switch, canDelete is owner-only.
 abbRoutes.get('/settings', async (c) => {
   const creds = await loadCreds(c.env, c.get('tenantId'));
+  const isOwner = c.get('tenantRole') === 'owner';
+  const membersMayAdd = await membersCanAdd(c.env, c.get('tenantId'));
   return c.json({
     abbUsername: creds.abbUsername ?? '',
     abbPasswordSet: !!creds.abbPassword,
     rdTokenSet: !!creds.rdToken,
-    canEdit: c.get('tenantRole') === 'owner',
+    canEdit: isOwner,
+    canGrab: isOwner || membersMayAdd,
+    canDelete: isOwner,
+    membersCanAdd: membersMayAdd,
     encryptionConfigured: secretsConfigured(c.env),
   });
 });
+
+// ─── Real-Debrid torrent ownership (migration 0011) ─────────────────────────
+//
+// One RD account per tenant, so the list on RD mixes everyone's grabs. A
+// member sees only the torrents they added; the owner sees all. Rows are
+// pruned against RD's own list because RD expires torrents itself.
+
+async function recordTorrent(env: Env, tenantId: string, torrentId: string, userId: string): Promise<void> {
+  await env.DB.prepare(
+    'INSERT OR REPLACE INTO rd_torrents (tenant_id, torrent_id, user_id, created_at) VALUES (?, ?, ?, ?)',
+  ).bind(tenantId, torrentId, userId, Date.now()).run();
+}
+
+async function forgetTorrent(env: Env, tenantId: string, torrentId: string): Promise<void> {
+  await env.DB.prepare('DELETE FROM rd_torrents WHERE tenant_id = ? AND torrent_id = ?').bind(tenantId, torrentId).run();
+}
+
+async function ownedTorrentIds(env: Env, tenantId: string, userId: string): Promise<Set<string>> {
+  const rows = await env.DB.prepare('SELECT torrent_id FROM rd_torrents WHERE tenant_id = ? AND user_id = ?')
+    .bind(tenantId, userId).all<{ torrent_id: string }>();
+  return new Set(rows.results.map((r) => r.torrent_id));
+}
+
+// A member may touch a torrent only if they added it. Answers 404 rather than
+// 403 so the list of other people's torrent ids isn't confirmable.
+async function torrentVisible(c: { env: Env; get: (k: 'tenantRole' | 'tenantId' | 'userId') => string }, torrentId: string): Promise<boolean> {
+  if (c.get('tenantRole') === 'owner') return true;
+  return (await ownedTorrentIds(c.env, c.get('tenantId'), c.get('userId'))).has(torrentId);
+}
 
 // Body: { abbUsername?, abbPassword?, rdToken? } — blank fields are left
 // alone; pass clear: ['abb'|'rd'] to remove.
@@ -360,7 +397,7 @@ abbRoutes.get('/details', async (c) => {
 // Body: { url } or { magnet } → { title, folderName, infoHash, magnet }
 // A pasted magnet skips AudioBookBay entirely; the title comes from its
 // dn= parameter (or the hash when absent).
-abbRoutes.post('/resolve', async (c) => {
+abbRoutes.post('/resolve', requireCanAdd, async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const url = String(body['url'] ?? '').trim();
   const magnet = String(body['magnet'] ?? '').trim();
@@ -405,7 +442,7 @@ abbRoutes.post('/resolve', async (c) => {
 //   exactly one audio → it                    mode: 'single'
 //   several audio     → the first; the rest  mode: 'multi' (client adds them)
 //   no audio          → nothing; torrent deleted, error returned
-abbRoutes.post('/torrents', async (c) => {
+abbRoutes.post('/torrents', requireCanAdd, async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const magnet = String(body['magnet'] ?? '').trim();
   const fileId = body['fileId'] != null ? Number(body['fileId']) : null;
@@ -419,13 +456,19 @@ abbRoutes.post('/torrents', async (c) => {
   }
   try {
     const added = await rdAddMagnet(token, magnet);
+    // Recorded before anything that can throw below: an add that then fails
+    // still leaves the torrent on RD (see the no-auto-delete rule), and its
+    // adder must be able to see it to retry or delete it.
+    await recordTorrent(c.env, c.get('tenantId'), added.id, c.get('userId'));
     const info = await rdWaitForFiles(token, added.id);
     if (RD_FAILED[info.status]) {
       await rdDelete(token, added.id).catch(() => undefined);
+      await forgetTorrent(c.env, c.get('tenantId'), added.id);
       return c.json({ error: RD_FAILED[info.status] }, 502);
     }
     if (inspect) {
       await rdDelete(token, added.id).catch(() => undefined);
+      await forgetTorrent(c.env, c.get('tenantId'), added.id);
       const all = (info.files ?? []).map((f) => {
         const ext = extOf(f.path);
         return { id: f.id, path: f.path, bytes: f.bytes, ext, isAudio: AUDIO_EXT.has(ext), isArchive: ARCHIVE_EXT.has(ext) };
@@ -439,6 +482,7 @@ abbRoutes.post('/torrents', async (c) => {
     if (fileId != null) {
       if (!(info.files ?? []).some((f) => f.id === fileId)) {
         await rdDelete(token, added.id).catch(() => undefined);
+      await forgetTorrent(c.env, c.get('tenantId'), added.id);
         return c.json({ error: `File id ${fileId} not in torrent` }, 400);
       }
       selected = fileId;
@@ -450,6 +494,7 @@ abbRoutes.post('/torrents', async (c) => {
       mode = 'multi';
     } else {
       await rdDelete(token, added.id).catch(() => undefined);
+      await forgetTorrent(c.env, c.get('tenantId'), added.id);
       return c.json({ error: 'Torrent contains no audio files' }, 400);
     }
     await rdSelectFiles(token, added.id, String(selected));
@@ -463,7 +508,7 @@ abbRoutes.post('/torrents', async (c) => {
 // Everything on the Real-Debrid account. The grab flow is browser-driven,
 // so a tab closed mid-grab leaves torrents here with nobody watching; the
 // UIs list these with Finish / Watch / Delete.
-abbRoutes.get('/torrents', async (c) => {
+abbRoutes.get('/torrents', requireCanAdd, async (c) => {
   let token: string;
   try {
     token = await requireRd(c.env, c.get('tenantId'));
@@ -471,7 +516,17 @@ abbRoutes.get('/torrents', async (c) => {
     return c.json({ error: (e as Error).message }, 400);
   }
   try {
-    const list = await rdList(token);
+    const tenantId = c.get('tenantId');
+    let list = await rdList(token);
+    // Prune ownership rows for torrents RD no longer has (it expires them).
+    const live = new Set(list.map((t) => t.id));
+    const known = await c.env.DB.prepare('SELECT torrent_id FROM rd_torrents WHERE tenant_id = ?').bind(tenantId).all<{ torrent_id: string }>();
+    const gone = known.results.map((r) => r.torrent_id).filter((id) => !live.has(id));
+    if (gone.length) c.executionCtx.waitUntil(Promise.all(gone.map((id) => forgetTorrent(c.env, tenantId, id))).then(() => undefined));
+    if (c.get('tenantRole') !== 'owner') {
+      const mine = await ownedTorrentIds(c.env, tenantId, c.get('userId'));
+      list = list.filter((t) => mine.has(t.id));
+    }
     return c.json({
       torrents: list.map((t) => ({
         id: t.id, hash: (t.hash ?? '').toLowerCase(), filename: t.filename, status: t.status, progress: t.progress, bytes: t.bytes,
@@ -483,13 +538,14 @@ abbRoutes.get('/torrents', async (c) => {
   }
 });
 
-abbRoutes.get('/torrents/:id', async (c) => {
+abbRoutes.get('/torrents/:id', requireCanAdd, async (c) => {
   let token: string;
   try {
     token = await requireRd(c.env, c.get('tenantId'));
   } catch (e) {
     return c.json({ error: (e as Error).message }, 400);
   }
+  if (!(await torrentVisible(c, c.req.param('id')))) return c.json({ error: 'Not found' }, 404);
   try {
     const info = await rdInfo(token, c.req.param('id'));
     const out: {
@@ -530,15 +586,17 @@ abbRoutes.get('/torrents/:id', async (c) => {
   }
 });
 
-abbRoutes.delete('/torrents/:id', async (c) => {
+abbRoutes.delete('/torrents/:id', requireCanAdd, async (c) => {
   let token: string;
   try {
     token = await requireRd(c.env, c.get('tenantId'));
   } catch (e) {
     return c.json({ error: (e as Error).message }, 400);
   }
+  if (!(await torrentVisible(c, c.req.param('id')))) return c.json({ error: 'Not found' }, 404);
   try {
     await rdDelete(token, c.req.param('id'));
+    await forgetTorrent(c.env, c.get('tenantId'), c.req.param('id'));
     return c.body(null, 204);
   } catch (e) {
     return c.json({ error: (e as Error).message }, 502);
