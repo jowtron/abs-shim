@@ -102,6 +102,10 @@ ShelfPlayer uses strict Swift Codable — one field type mismatch fails the enti
 
 When adding a new client integration: open `wrangler tail --format pretty` and use `gh api repos/<owner>/<repo>/contents/<path> --jq '.content' | base64 -d` to read Swift Codable structs. Diff the strict types against `src/lib/abs-shapes.ts` output.
 
+## Which backend is a book on? (2026-09-05)
+
+`src/lib/storage-label.ts` is the single answer: `storageLabel(folder)` → `{provider, name, detail}` ('pCloud' + rootPath, a bucket + prefix, a WebDAV hostname). It feeds the scan report, /admin's folder rows, and a **non-ABS `storage` field on every entry in `media.audioFiles`** (strict clients ignore unknown keys), which is what Pholia shows beside the codec on the book page and in the flip-side file info panel. Nothing in either UI could answer the question before, and the same title can legitimately exist on two backends as two separate `library_items` rows with separate progress — scanning finds each independently and neither knows about the other. There is no de-duplication; removing one is a manual delete.
+
 ## Scan reports say which backend (2026-09-05)
 
 `ScanReport.folders` carries one `ScanFolderReport` per storage backend — provider, a human label built from its config, added/skipped/error counts and up to 50 added paths — and every error row carries `folderId` + `backend`. A library can have several folders, so "added 3, 1 error" said nothing about which NAS or bucket was involved. `/admin`'s scan output and the folder rows both print it; `storage/status` also returns per-folder book counts.

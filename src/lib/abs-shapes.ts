@@ -7,6 +7,7 @@ import type {
   LibraryItemRow, LibraryRow,
 } from '../db/library';
 import { derivedId } from './ids';
+import { storageLabel } from './storage-label';
 
 // ─── Library detail ──────────────────────────────────────────────────────────
 
@@ -222,6 +223,11 @@ function buildAudioFile(a: AudioFileRow, folder: LibraryFolderRow, item: Library
     manuallyVerified: false,
     exclude: false,
     error: null,
+    // Not an ABS field. Strict clients ignore unknown keys, and Pholia shows
+    // it on the book page and the flip-side info panel: with more than one
+    // backend attached, "which of my storages is this book on" had no answer
+    // anywhere in the UI.
+    storage: storageLabel(folder),
     format: a.format ?? 'mp4',
     duration: a.duration_seconds,
     // The m4b prober doesn't record a bitrate (20 of 23 rows were NULL on

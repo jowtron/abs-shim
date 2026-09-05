@@ -1,5 +1,6 @@
 import type { Env } from '../types';
 import { getAdapter, type FolderRow } from '../storage/factory';
+import { storageLabelText } from '../lib/storage-label';
 import { ListingNotSupportedError, type RemoteEntry } from '../storage/adapter';
 import { probeM4b } from '../prober/m4b';
 import { probeOgg } from '../prober/ogg';
@@ -52,21 +53,6 @@ export type ScanReport = {
 
 const ADDED_PATHS_CAP = 50;
 
-// Where a folder points, in a few words. Mirrors describeFolder() in the
-// admin UI; kept server-side so a scan report reads on its own.
-function folderLabel(folder: FolderRow): string {
-  let config: Record<string, unknown> = {};
-  try { config = JSON.parse(folder.config_json || '{}') as Record<string, unknown>; } catch { /* unparseable — fall through */ }
-  const str = (k: string) => String(config[k] ?? '');
-  switch (folder.provider) {
-    case 'pcloud_oauth': return 'pCloud ' + (str('rootPath') || '/');
-    case 's3': return [str('bucket'), str('prefix')].filter(Boolean).join('/') || str('endpoint');
-    case 'webdav': return [str('baseUrl'), str('rootPath')].filter(Boolean).join(' ');
-    case 'public_url': return str('baseUrl') || folder.filedn_base_url || '';
-    default: return folder.provider;
-  }
-}
-
 export async function runScan(env: Env, libraryId: string, tenantId: string): Promise<ScanReport> {
   const started = Date.now();
   const folders = await env.DB.prepare(
@@ -84,7 +70,7 @@ export async function runScan(env: Env, libraryId: string, tenantId: string): Pr
 
   for (const folder of folders.results) {
     const fr: ScanFolderReport = {
-      folderId: folder.id, provider: folder.provider, label: folderLabel(folder),
+      folderId: folder.id, provider: folder.provider, label: storageLabelText(folder),
       added: 0, skipped: 0, errors: 0, addedPaths: [],
     };
     report.folders.push(fr);

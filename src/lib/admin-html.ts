@@ -1119,7 +1119,7 @@ function renderLibraries(status, libraries) {
         if (fst.missingCount) count += ', ' + fst.missingCount + ' missing';
         html += '<span class="muted" style="flex:1; min-width:0; font-size: 0.85rem; word-break: break-all;">' + describeFolder(f)
           + '<br><span style="font-size:0.8rem">' + count + '</span></span>';
-        if (isOwner) html += '<button class="danger" data-remove-folder="' + escapeHtml(f.id) + '" style="font-size:0.8rem; padding:0.2rem 0.6rem; flex-shrink:0">Remove</button>';
+        if (isOwner) html += '<button class="danger" data-remove-folder="' + escapeHtml(f.id) + '" data-folder-books="' + fst.bookCount + '" style="font-size:0.8rem; padding:0.2rem 0.6rem; flex-shrink:0">Remove</button>';
         html += '</div>';
       }
       html += '</div>';
@@ -1181,12 +1181,24 @@ function renderLibraries(status, libraries) {
 
   body.querySelectorAll('[data-remove-folder]').forEach((btn) => {
     btn.addEventListener('click', async () => {
-      if (!confirm('Remove this storage backend? Books that live on it must be deleted or migrated first — the request fails if any items still reference it.')) return;
+      // Detaching a backend that still has books would leave library entries
+      // pointing at storage the shim can no longer reach — the server refuses
+      // it (409). Say so up front with the actual number instead of the old
+      // wording, which mentioned migrating, something the shim can't do.
+      const books = Number(btn.dataset.folderBooks || '0');
+      const msg = books
+        ? 'This backend still holds ' + books + ' book' + (books === 1 ? '' : 's') + ' in the library.\n\n'
+          + 'Remove them first with "Show books" → Remove (library entry only) or "Delete + files" (also deletes from storage), then detach the backend.\n\n'
+          + 'Try anyway?'
+        : 'Detach this storage backend? The library keeps working; this backend is no longer read. Nothing is deleted from the storage itself.';
+      if (!confirm(msg)) return;
       try {
         await api('/api/admin/storage/folder/' + btn.dataset.removeFolder, { method: 'DELETE' });
         refresh();
       } catch (e) {
-        showError('Remove failed: ' + e.message);
+        showError(/409|still has items/.test(e.message)
+          ? 'Still holds ' + books + ' book(s) — remove those from the library first, then detach.'
+          : 'Remove failed: ' + e.message);
       }
     });
   });
