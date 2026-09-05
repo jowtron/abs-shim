@@ -529,7 +529,9 @@ abbRoutes.get('/torrents', requireCanAdd, async (c) => {
     }
     return c.json({
       torrents: list.map((t) => ({
-        id: t.id, hash: (t.hash ?? '').toLowerCase(), filename: t.filename, status: t.status, progress: t.progress, bytes: t.bytes,
+        id: t.id, hash: (t.hash ?? '').toLowerCase(), filename: t.filename,
+        originalFilename: t.original_filename ?? null,
+        status: t.status, progress: t.progress, bytes: t.bytes,
         seeders: t.seeders ?? null, speed: t.speed ?? null, error: RD_FAILED[t.status] ?? null,
       })),
     });
@@ -550,12 +552,14 @@ abbRoutes.get('/torrents/:id', requireCanAdd, async (c) => {
     const info = await rdInfo(token, c.req.param('id'));
     const out: {
       id: string; status: string; progress: number; seeders?: number; speed?: number; filename: string;
+      originalFilename: string | null;
       error: string | null; hash: string;
       selectedFiles: Array<{ id: number; path: string; bytes: number }>;
       files: Array<{ id: number; path: string; bytes: number; selected: boolean; isAudio: boolean; isArchive: boolean }>;
       downloads?: Array<{ filename: string; filesize: number; ext: string; isAudio: boolean; isArchive: boolean; download: string }>;
     } = {
       id: info.id, status: info.status, progress: info.progress, filename: info.filename,
+      originalFilename: info.original_filename ?? null,
       error: RD_FAILED[info.status] ?? null,
       hash: (info.hash ?? '').toLowerCase(),
       // Lets a UI that didn't start this grab (tab closed, other device)

@@ -2524,7 +2524,12 @@ async function abbResumeGroup(g, folderId, listEl, pick) {
       }
     }
     const san = (s) => s.replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120) || 'audiobook';
-    const plan = abbPlanDest(san(g.filename), chosen.filter((f) => byFile.has(f.id)));
+    // Real-Debrid renames a torrent to its selected file, so `filename` on a
+    // resumed one-file-per-torrent grab is "Book-Part04.mp3" — using it as
+    // the folder name scattered one book across three directories. The
+    // torrent's own name is `originalFilename`.
+    const groupName = san(infos[0].originalFilename || g.filename);
+    const plan = abbPlanDest(groupName, chosen.filter((f) => byFile.has(f.id)));
     // One torrent may cover several files (old-flow first torrent); key the
     // tracking list by torrent and give it the first covered file's dest.
     const byTorrent = new Map();

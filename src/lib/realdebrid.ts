@@ -18,7 +18,14 @@ export const RD_FAILED: Record<string, string> = {
 
 export type RdFile = { id: number; path: string; bytes: number; selected: number };
 export type RdTorrentInfo = {
-  id: string; filename: string; hash: string; bytes: number; status: string; progress: number;
+  // `filename` becomes the SELECTED FILE's name once files are selected, so a
+  // one-file-per-torrent grab reports "Book-Part04.mp3" as the torrent name.
+  // `original_filename` keeps the torrent's own name — use that for anything
+  // that becomes a folder, or a resumed grab lands its files in a directory
+  // named after one mp3 part (2026-09-06: three copies of one book, in
+  // "Dawnlands - Philippa Gregory", "Dawnlands-Part04.mp3" and
+  // "Dawnlands-Part17.mp3").
+  id: string; filename: string; original_filename?: string; hash: string; bytes: number; status: string; progress: number;
   seeders?: number; speed?: number; files?: RdFile[]; links?: string[];
 };
 export type RdUnrestricted = { download: string; filename: string; filesize: number; mimeType?: string };
