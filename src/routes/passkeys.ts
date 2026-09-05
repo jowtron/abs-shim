@@ -3,6 +3,7 @@ import type { Env } from '../types';
 import { requireAuth, type AuthVars } from '../auth/middleware';
 import { issueAccessToken, issueRefreshToken } from '../auth/tokens';
 import { insertRefreshToken } from '../db/refresh';
+import { sessionCookie } from '../auth/cookie';
 import { findUserById, touchLastSeen } from '../db/users';
 import {
   CHALLENGE_EXPIRY_MS, bytesToBase64Url, base64UrlToBytes, rpIdFor, isOriginTrusted,
@@ -155,7 +156,7 @@ passkeyRoutes.post('/authenticate', async (c) => {
     deviceInfo: { userAgent: c.req.header('user-agent') ?? '', passkey: body.id },
   });
   await touchLastSeen(c.env, row.id);
-  c.header('Set-Cookie', `accessToken=${access.token}; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax`, { append: true });
+  c.header('Set-Cookie', sessionCookie(access.token, c.req.url), { append: true });
   return c.json({ user: { id: row.id, username: row.username, token: access.token, accessToken: access.token, refreshToken: refresh.raw } });
 });
 

@@ -8,7 +8,7 @@ import type { Env } from '../types';
 // access tokens. Refresh tokens are opaque random bytes; only their SHA-256
 // is stored in D1.
 
-const ACCESS_TTL_SECONDS = 60 * 60 * 24 * 30;  // 30 days
+export const ACCESS_TTL_SECONDS = 60 * 60 * 24 * 30;  // 30 days
 const REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 
 export type AccessClaims = {

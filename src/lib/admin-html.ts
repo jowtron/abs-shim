@@ -1181,24 +1181,22 @@ function renderLibraries(status, libraries) {
 
   body.querySelectorAll('[data-remove-folder]').forEach((btn) => {
     btn.addEventListener('click', async () => {
-      // Detaching a backend that still has books would leave library entries
-      // pointing at storage the shim can no longer reach — the server refuses
-      // it (409). Say so up front with the actual number instead of the old
-      // wording, which mentioned migrating, something the shim can't do.
+      // Detaching takes the backend's books out of the library with it —
+      // a shelf listing books it can no longer read is worse than an empty
+      // one. The files on the storage are never touched, so re-attaching and
+      // scanning brings them back (listening progress doesn't come back).
       const books = Number(btn.dataset.folderBooks || '0');
       const msg = books
-        ? 'This backend still holds ' + books + ' book' + (books === 1 ? '' : 's') + ' in the library.\n\n'
-          + 'Remove them first with "Show books" → Remove (library entry only) or "Delete + files" (also deletes from storage), then detach the backend.\n\n'
-          + 'Try anyway?'
-        : 'Detach this storage backend? The library keeps working; this backend is no longer read. Nothing is deleted from the storage itself.';
+        ? 'Detach this backend and remove its ' + books + ' book' + (books === 1 ? '' : 's') + ' from the library?\n\n'
+          + 'The files themselves are NOT deleted — they stay where they are, and re-attaching then scanning brings them back. '
+          + 'Listening progress for those books is lost.'
+        : 'Detach this storage backend? It holds no books. Nothing is deleted from the storage itself.';
       if (!confirm(msg)) return;
       try {
-        await api('/api/admin/storage/folder/' + btn.dataset.removeFolder, { method: 'DELETE' });
+        await api('/api/admin/storage/folder/' + btn.dataset.removeFolder + (books ? '?removeItems=1' : ''), { method: 'DELETE' });
         refresh();
       } catch (e) {
-        showError(/409|still has items/.test(e.message)
-          ? 'Still holds ' + books + ' book(s) — remove those from the library first, then detach.'
-          : 'Remove failed: ' + e.message);
+        showError('Remove failed: ' + e.message);
       }
     });
   });

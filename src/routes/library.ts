@@ -120,16 +120,111 @@ libraryRoutes.post('/:id/scan', async (c) => c.text('OK'));
 // it's expected to return books/authors/series/narrators arrays. Returning
 // empty arrays of each kind is enough to keep the client happy until we wire
 // real search.
+// Library search. This returned an empty result set for every query until
+// 2026-09-06 — a stub that had never been filled in, so Pholia's search box
+// looked broken rather than unimplemented.
+//
+// ABS's shape: `book` entries are {libraryItem, matchKey, matchText} and the
+// author/series/narrator lists are derived from the same matches. Matching is
+// a case-insensitive substring over title, subtitle, author, narrator and
+// series — no FTS table here (the catalogue's FTS5 is for AudioBookBay), and
+// a personal library is small enough that a LIKE scan over book_metadata is
+// nothing next to the per-item bundle building below.
 libraryRoutes.get('/:id/search', async (c) => {
+  const tenantId = c.get('tenantId');
+  const id = c.req.param('id');
+  const row = await getLibrary(c.env, id, tenantId);
+  if (!row) return c.json({ error: 'Library not found' }, 404);
+
+  const q = (c.req.query('q') ?? '').trim();
+  const limit = Math.min(Math.max(Number(c.req.query('limit') ?? '12') || 12, 1), 50);
+  const empty = {
+    book: [] as unknown[], podcast: [] as unknown[], authors: [] as unknown[],
+    series: [] as unknown[], narrators: [] as unknown[], tags: [] as unknown[],
+  };
+  if (!q) return c.json(empty);
+
+  // LIKE with an escaped pattern: a title containing % or _ would otherwise
+  // turn into a wildcard.
+  // LIKE with an escaped pattern: a title containing % or _ would otherwise
+  // turn into a wildcard. D1's bind() is positional only — numbered ?1
+  // placeholders are rejected with "Wrong number of parameter bindings", so
+  // the pattern is simply bound once per placeholder.
+  const pattern = '%' + q.replace(/[\\%_]/g, (ch) => '\\' + ch).toLowerCase() + '%';
+  const rows = await c.env.DB.prepare(
+    `SELECT li.id AS item_id, bm.title, bm.subtitle, bm.author_name, bm.narrator_name, bm.series_name
+       FROM library_items li
+       JOIN book_metadata bm ON bm.library_item_id = li.id
+      WHERE li.library_id = ? AND li.tenant_id = ? AND li.is_missing = 0
+        AND (lower(COALESCE(bm.title, '')) LIKE ? ESCAPE '\\'
+          OR lower(COALESCE(bm.subtitle, '')) LIKE ? ESCAPE '\\'
+          OR lower(COALESCE(bm.author_name, '')) LIKE ? ESCAPE '\\'
+          OR lower(COALESCE(bm.narrator_name, '')) LIKE ? ESCAPE '\\'
+          OR lower(COALESCE(bm.series_name, '')) LIKE ? ESCAPE '\\')
+      ORDER BY
+        CASE WHEN lower(COALESCE(bm.title, '')) LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END,
+        bm.title COLLATE NOCASE
+      LIMIT ?`,
+  ).bind(id, tenantId, pattern, pattern, pattern, pattern, pattern, pattern, limit).all<{
+    item_id: string; title: string | null; subtitle: string | null;
+    author_name: string | null; narrator_name: string | null; series_name: string | null;
+  }>();
+
+  const has = (v: string | null) => !!v && v.toLowerCase().includes(q.toLowerCase());
+  const book = [];
+  const authors = new Map<string, string>();   // name → id
+  const seriesNames = new Set<string>();
+  const narrators = new Set<string>();
+
+  for (const r of rows.results) {
+    const item = await getItem(c.env, r.item_id, tenantId);
+    if (!item) continue;
+    const folder = await getFolderById(c.env, item.folder_id, tenantId);
+    if (!folder) continue;
+    const [metadata, audioFiles, chapters] = await Promise.all([
+      getBookMetadata(c.env, item.id, tenantId),
+      getAudioFiles(c.env, item.id, tenantId),
+      getChapters(c.env, item.id),
+    ]);
+    // Which field matched, so a client can say why a result is there.
+    const matchKey = has(r.title) ? 'title'
+      : has(r.subtitle) ? 'subtitle'
+      : has(r.author_name) ? 'authors'
+      : has(r.narrator_name) ? 'narrators'
+      : 'series';
+    const matchText = (matchKey === 'title' ? r.title
+      : matchKey === 'subtitle' ? r.subtitle
+      : matchKey === 'authors' ? r.author_name
+      : matchKey === 'narrators' ? r.narrator_name
+      : r.series_name) ?? '';
+    book.push({
+      libraryItem: await buildItemMinified({ item, folder, metadata, audioFiles, chapters }),
+      matchKey,
+      matchText,
+    });
+    for (const name of splitList(r.author_name)) {
+      if (has(name) && !authors.has(name)) authors.set(name, await derivedId(item.id, 'author', name));
+    }
+    for (const name of splitList(r.narrator_name)) if (has(name)) narrators.add(name);
+    if (has(r.series_name) && r.series_name) seriesNames.add(r.series_name);
+  }
+
   return c.json({
-    book: [] as unknown[],
-    podcast: [] as unknown[],
-    authors: [] as unknown[],
-    series: [] as unknown[],
-    narrators: [] as unknown[],
-    tags: [] as unknown[],
+    ...empty,
+    book,
+    authors: [...authors].map(([name, aid]) => ({ id: aid, name, numBooks: 0 })),
+    narrators: [...narrators].map((name) => ({ name, numBooks: 0 })),
+    series: await Promise.all([...seriesNames].map(async (name) => ({
+      series: { id: await derivedId(id, 'series', name), name },
+      books: [] as unknown[],
+    }))),
   });
 });
+
+// Author and narrator columns hold "A, B & C" style lists.
+function splitList(v: string | null): string[] {
+  return (v ?? '').split(/,|;|&| and /i).map((s) => s.trim()).filter(Boolean);
+}
 
 // Authors aggregated across the library's books. Sorted by name.
 libraryRoutes.get('/:id/authors', async (c) => {

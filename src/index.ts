@@ -10,6 +10,7 @@ import {
   ROOT_PERMISSIONS,
 } from './db/users';
 import { insertRefreshToken } from './db/refresh';
+import { sessionCookie, clearSessionCookie } from './auth/cookie';
 import { serverSettings, SERVER_VERSION } from './lib/server-settings';
 import { libraryRoutes } from './routes/library';
 import { itemRoutes } from './routes/items';
@@ -218,7 +219,7 @@ app.post('/login', async (c) => {
 
   // Set the access token as a cookie too, so the bundled web UI can issue
   // requests that don't set the Authorization header (e.g. <img>, <audio>).
-  c.header('Set-Cookie', `accessToken=${access.token}; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax`, { append: true });
+  c.header('Set-Cookie', sessionCookie(access.token, c.req.url), { append: true });
 
   const progressRows = await listProgressByUser(c.env, row.id);
   const mediaProgress = await Promise.all(progressRows.map((p) => progressToAbs(c.env, p)));
@@ -244,7 +245,7 @@ app.post('/login', async (c) => {
 // silently did nothing. Expire the cookie and hand back the JSON shape the
 // client expects (`redirect_url` null → it does its own /login redirect).
 app.post('/logout', (c) => {
-  c.header('Set-Cookie', 'accessToken=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax', { append: true });
+  c.header('Set-Cookie', clearSessionCookie(c.req.url), { append: true });
   return c.json({ redirect_url: null });
 });
 
@@ -255,7 +256,7 @@ app.post('/logout', (c) => {
 app.post('/api/authorize', requireAuth, async (c) => {
   const row = c.get('user');
   const access = await issueAccessToken(c.env, { id: row.id, username: row.username });
-  c.header('Set-Cookie', `accessToken=${access.token}; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax`, { append: true });
+  c.header('Set-Cookie', sessionCookie(access.token, c.req.url), { append: true });
   const progressRows = await listProgressByUser(c.env, row.id);
   const mediaProgress = await Promise.all(progressRows.map((p) => progressToAbs(c.env, p)));
   return c.json({

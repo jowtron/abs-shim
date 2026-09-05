@@ -475,25 +475,64 @@ async function upsertFolderProvider(env: Env, libraryId: string, tenantId: strin
 // Remove a folder. Refuses if any library_items still reference it — caller
 // has to explicitly clear those items first (we don't cascade-delete here
 // because losing user progress on a misclick is worse than the inconvenience).
+// Detach a storage backend. `?removeItems=1` also drops the library entries
+// that lived on it — which is what "remove this backend" means to a person:
+// the shelf shouldn't keep listing books it can no longer read. **Nothing is
+// deleted from the storage itself**; the files stay on the NAS or in the
+// bucket and re-attaching plus a scan brings them back (progress doesn't
+// come back — the item ids are regenerated).
+//
+// Without the flag a folder with items is still refused, so an accidental
+// call can't quietly wipe a shelf.
 adminRoutes.delete('/storage/folder/:id', requireTenantOwner, async (c) => {
   const folderId = c.req.param('id');
   const tenantId = c.get('tenantId');
+  const removeItems = c.req.query('removeItems') === '1';
   // Confirm the folder belongs to this tenant before touching it.
   const owned = await c.env.DB.prepare(
     `SELECT id FROM library_folders WHERE id = ? AND tenant_id = ?`,
   ).bind(folderId, tenantId).first<{ id: string }>();
   if (!owned) return c.json({ error: 'Folder not found' }, 404);
-  const refs = await c.env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM library_items WHERE folder_id = ? AND tenant_id = ?`,
-  ).bind(folderId, tenantId).first<{ n: number }>();
-  if ((refs?.n ?? 0) > 0) {
+
+  // Count by folder alone: the folder's own tenant is already verified, and
+  // filtering items by tenant_id too would let a row with drifted tenancy
+  // slip past the guard below — which matters because
+  // `library_items.folder_id` is ON DELETE CASCADE, so deleting the folder
+  // row takes its books (and everything hanging off them) with it whether we
+  // ask or not. The guard is the only thing standing between a mis-click and
+  // a wiped shelf; the explicit deletes below are belt-and-braces.
+  const items = await c.env.DB.prepare(
+    `SELECT id FROM library_items WHERE folder_id = ?`,
+  ).bind(folderId).all<{ id: string }>();
+
+  if (items.results.length && !removeItems) {
     return c.json({
       error: 'Folder still has items',
-      detail: `${refs!.n} library_item(s) reference this folder. Delete or migrate them first.`,
+      detail: `${items.results.length} book(s) still live on this backend. Detach with ?removeItems=1 to drop them from the library (the files themselves are not touched).`,
+      items: items.results.length,
     }, 409);
   }
+
+  if (items.results.length) {
+    // Same tables as deleting one item, keyed on the folder in one pass.
+    const ownedIds = 'SELECT id FROM library_items WHERE folder_id = ?';
+    await c.env.DB.batch([
+      c.env.DB.prepare(`DELETE FROM chapters WHERE library_item_id IN (${ownedIds})`).bind(folderId),
+      c.env.DB.prepare(`DELETE FROM audio_files WHERE library_item_id IN (${ownedIds})`).bind(folderId),
+      c.env.DB.prepare(`DELETE FROM book_metadata WHERE library_item_id IN (${ownedIds})`).bind(folderId),
+      c.env.DB.prepare(`DELETE FROM media_progress WHERE library_item_id IN (${ownedIds})`).bind(folderId),
+      c.env.DB.prepare(`DELETE FROM bookmarks WHERE library_item_id IN (${ownedIds})`).bind(folderId),
+      c.env.DB.prepare(`DELETE FROM listening_sessions WHERE library_item_id IN (${ownedIds})`).bind(folderId),
+      c.env.DB.prepare('DELETE FROM library_items WHERE folder_id = ?').bind(folderId),
+    ]);
+    // Cached covers are per item; failure here only wastes R2 space.
+    for (const it of items.results) {
+      try { await c.env.COVERS.delete(`covers/${it.id}`); } catch { /* non-fatal */ }
+    }
+  }
+
   await c.env.DB.prepare('DELETE FROM library_folders WHERE id = ? AND tenant_id = ?').bind(folderId, tenantId).run();
-  return c.body(null, 204);
+  return c.json({ detached: true, itemsRemoved: items.results.length });
 });
 
 // ─── Scan ────────────────────────────────────────────────────────────────────
