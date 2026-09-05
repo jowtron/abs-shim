@@ -7,6 +7,8 @@ import { probeM4b } from '../prober/m4b';
 import { probeOgg } from '../prober/ogg';
 import { probeMp3 } from '../prober/mp3';
 import { resolveItemIdFromUuid } from '../lib/ids';
+import { findCatalogCover } from '../lib/cover-from-catalog';
+import { getBookMetadata } from '../db/library';
 import { insertListeningSession } from '../db/sessions';
 import { getProgress, progressToAbs } from '../db/progress';
 import { audioContentType, resolveProbeUrl, resolveStreamUrl, streamAudio } from '../storage/resolve';
@@ -108,7 +110,18 @@ itemRoutes.get('/:id/cover', async (c) => {
   } catch (e) {
     return c.json({ error: 'Probe failed', detail: (e as Error).message }, 502);
   }
-  if (!cover) return c.json({ error: 'No embedded cover' }, 404);
+  // Nothing embedded. Rather than 404 and leave a blank card forever, borrow
+  // the artwork from the matching AudioBookBay listing — for an mp3 rip with
+  // no APIC frame that is the only cover the book has ever had. Cached in
+  // both tiers below exactly like an embedded one, so this costs a catalogue
+  // lookup once per book, not per view. ("Warm cover cache" in /admin does
+  // the same thing for the whole library up front.)
+  if (!cover) {
+    const meta = await getBookMetadata(c.env, id, c.get('tenantId'));
+    const fromCatalog = await findCatalogCover(c.env, { title: meta?.title ?? null, author: meta?.author_name ?? null });
+    if (!fromCatalog) return c.json({ error: 'No embedded cover, and no matching AudioBookBay listing' }, 404);
+    cover = { bytes: new Uint8Array(fromCatalog.bytes), mimeType: fromCatalog.contentType };
+  }
 
   const res = new Response(cover.bytes, {
     status: 200,
