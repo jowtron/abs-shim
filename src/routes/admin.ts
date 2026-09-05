@@ -1015,6 +1015,41 @@ adminRoutes.get('/libraries/:libId/items', async (c) => {
 });
 
 // Re-probe a single item. Useful when chapters or duration came in wrong.
+// The same book registered more than once. It happens when one release is
+// grabbed twice into different folders — the scanner is idempotent per
+// (folder, path), so a second path is a second book as far as it can tell,
+// and nothing else in the UI would ever tell you. Grouped by title+author,
+// which is what a person means by "the same book"; the paths and lengths in
+// each group are what you need to decide which copy to keep.
+adminRoutes.get('/libraries/:libId/duplicates', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT li.id, li.rel_path, li.folder_id, bm.title, bm.author_name,
+            (SELECT COUNT(*) FROM chapters ch WHERE ch.library_item_id = li.id) AS chapter_count,
+            (SELECT COUNT(*) FROM audio_files af WHERE af.library_item_id = li.id) AS file_count,
+            (SELECT COALESCE(SUM(af.duration_seconds), 0) FROM audio_files af WHERE af.library_item_id = li.id) AS duration_seconds,
+            (SELECT COALESCE(SUM(af.size_bytes), 0) FROM audio_files af WHERE af.library_item_id = li.id) AS size_bytes
+       FROM library_items li
+       LEFT JOIN book_metadata bm ON bm.library_item_id = li.id
+      WHERE li.library_id = ? AND li.tenant_id = ?
+      ORDER BY bm.title COLLATE NOCASE ASC, li.rel_path ASC`,
+  ).bind(c.req.param('libId'), c.get('tenantId')).all<{
+    id: string; rel_path: string; folder_id: string; title: string | null; author_name: string | null;
+    chapter_count: number; file_count: number; duration_seconds: number; size_bytes: number;
+  }>();
+
+  const groups = new Map<string, typeof rows.results>();
+  for (const r of rows.results) {
+    const key = ((r.title ?? r.rel_path) + '|' + (r.author_name ?? '')).toLowerCase().trim();
+    const arr = groups.get(key);
+    if (arr) arr.push(r); else groups.set(key, [r]);
+  }
+  return c.json({
+    groups: [...groups.values()]
+      .filter((g) => g.length > 1)
+      .map((g) => ({ title: g[0]!.title, author: g[0]!.author_name, items: g })),
+  });
+});
+
 adminRoutes.post('/items/:itemId/reprobe', async (c) => {
   try {
     const result = await reprobeItem(c.env, c.req.param('itemId'), c.get('tenantId'));

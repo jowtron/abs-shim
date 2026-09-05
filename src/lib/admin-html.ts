@@ -1135,6 +1135,7 @@ function renderLibraries(status, libraries) {
       html += '<button class="secondary" data-upload-toggle="' + escapeHtml(lib.id) + '">Upload audiobook…</button>';
     }
     html += '<button class="secondary" data-show-books="' + escapeHtml(lib.id) + '">Show books (' + s.bookCount + ')</button>';
+    html += '<button class="secondary" data-duplicates="' + escapeHtml(lib.id) + '" title="Titles registered more than once, usually one release grabbed twice into different folders">Find duplicates</button>';
     html += '<button class="secondary" data-reprobe-missing="' + escapeHtml(lib.id) + '">Re-probe books missing chapters</button>';
     html += '<button class="secondary" data-reprobe-all="' + escapeHtml(lib.id) + '">Re-probe all</button>';
     html += '</div>';
@@ -1305,6 +1306,36 @@ function renderLibraries(status, libraries) {
         refresh();
       } catch (e) {
         showError('Attach failed: ' + e.message);
+      }
+    });
+  });
+
+  body.querySelectorAll('[data-duplicates]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const libId = btn.dataset.duplicates;
+      const box = document.getElementById('books-list-' + libId);
+      box.style.display = 'block';
+      box.textContent = 'Checking…';
+      try {
+        const r = await api('/api/admin/libraries/' + libId + '/duplicates');
+        if (!r.groups.length) { box.textContent = 'No title appears twice in this library.'; return; }
+        box.innerHTML = '';
+        const intro = document.createElement('p');
+        intro.className = 'muted';
+        intro.textContent = r.groups.length + ' title(s) registered more than once. Each row shows where that copy lives and how much of it is there — keep the longest and remove the rest.';
+        box.appendChild(intro);
+        for (const g of r.groups) {
+          const h = document.createElement('div');
+          h.className = 'section-title';
+          h.style.marginTop = '0.75rem';
+          h.textContent = (g.title || '(untitled)') + (g.author ? ' · ' + g.author : '');
+          box.appendChild(h);
+          const rows = document.createElement('div');
+          renderBooksList(rows, g.items.map((it) => ({ ...it, title: it.rel_path })));
+          box.appendChild(rows);
+        }
+      } catch (e) {
+        box.textContent = 'Could not check: ' + e.message;
       }
     });
   });
