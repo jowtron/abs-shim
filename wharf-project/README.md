@@ -46,14 +46,23 @@ The shim routes they use: `POST /api/admin/abb/catalog/details/{claim,submit}`
 
 ## Nodes
 
-Deployed 2026-09-03: **stereo-nz** (`core@100.111.229.12`) runs `abbcrawl`
-only; **wharf-syd-1** (`root@100.65.13.50`) runs both.
+As of 2026-09-05 **stereo-nz** (`core@100.111.229.12`, FCOS — `sudo`) and
+**wharf-syd-1** (`root@100.65.13.50`) each run **both** projects; they are
+cover shards 0 and 1 of 2.
 
-**Not stereo-au.** ABB drops that AU consumer range at TCP level — a single
-curl never completes the handshake, while both other nodes answered 200 in
-~2 s. Test any new node with **one** `curl -A '<browser UA>'
-https://audiobookbay.lu/` before adding it. Never loop-probe: ABB firewalls
-an IP that bursts (≈50 pages in 3 min got the dev Mac dropped, 2026-09-02).
+**Not stereo-au** — and not for the reason it first looked. ABB does not
+geo-block Australia: wharf-syd-1 is in Sydney and fetches fine, DNS resolves
+identically everywhere, and the `audiobookbay.li` mirror on another IP
+completes TLS from home. What is blocked is the single pair
+`49.179.117.247 → 176.97.124.219` (SYNs dropped on 80 and 443) — Joseph's
+home WAN IP, which stereo-au shares with his Mac, firewalled by ABB after a
+burst on 2026-09-02 and still blocked days later. So an ABB ban is
+long-lived, and stereo-au can never crawl from that line — though it could
+resize covers, which never touch ABB.
+
+Test any new node with **one** `curl -A '<browser UA>'
+https://audiobookbay.lu/` before adding it. Never loop-probe: that burst
+(≈50 pages in 3 min) is what earned the ban.
 
 ## Not competing
 
