@@ -66,20 +66,58 @@ export class WebDAVAdapter implements StorageAdapter {
     return fetch(url, { method: inbound.method, headers });
   }
 
-  // PROPFIND with Depth: infinity to discover the whole subtree in one call.
-  // Some servers (Synology) cap depth at 1; if we get a 403/501 we should
-  // fall back to recursive depth-1 calls — TODO once we hit that in practice.
   async listFolder(relPath: string): Promise<RemoteEntry[]> {
     const url = this.absoluteUrl(relPath);
     const xml = await this.propfind(url, '1');
     return parsePropfindXml(xml, url);
   }
 
+  // One Depth: infinity PROPFIND gets the whole subtree in a single call, and
+  // most servers support it — but plenty don't. RFC 4918 explicitly allows a
+  // server to refuse it (403 with <propfind-finite-depth/>), and Joseph's NAS
+  // answers 400 "Invalid depth: only 0 and 1 are allowed" (2026-09-05), which
+  // failed the whole scan. So: try it once, and on any refusal walk the tree
+  // with Depth: 1 requests instead. Don't remove the infinity attempt — it is
+  // one request instead of one per folder.
   async *walkAudiobookFiles(relPath: string): AsyncIterable<RemoteEntry> {
     const url = this.absoluteUrl(relPath);
-    const xml = await this.propfind(url, 'infinity');
-    for (const e of parsePropfindXml(xml, url)) {
-      if (!e.isDir && isAudiobookFile(e.relPath)) yield e;
+    try {
+      const xml = await this.propfind(url, 'infinity');
+      for (const e of parsePropfindXml(xml, url)) {
+        if (!e.isDir && isAudiobookFile(e.relPath)) yield e;
+      }
+      return;
+    } catch (e) {
+      if (!(e instanceof PropfindError) || !e.depthRefused) throw e;
+    }
+    yield* this.walkDepth1(relPath);
+  }
+
+  // Breadth-first with Depth: 1. Bounded on both axes so a mount pointed at
+  // the wrong place (a whole NAS share) can't spend the Worker's subrequest
+  // budget walking someone's photo library.
+  private async *walkDepth1(root: string): AsyncIterable<RemoteEntry> {
+    const MAX_FOLDERS = 400;
+    const MAX_DEPTH = 8;
+    const queue: Array<{ rel: string; depth: number }> = [{ rel: '', depth: 0 }];
+    let listed = 0;
+    while (queue.length) {
+      const { rel, depth } = queue.shift()!;
+      if (listed++ >= MAX_FOLDERS) {
+        throw new Error(`WebDAV walk stopped after ${MAX_FOLDERS} folders — point the folder at the audiobooks directory rather than the whole share`);
+      }
+      const here = [root.replace(/\/+$/, ''), rel].filter(Boolean).join('/');
+      const url = this.absoluteUrl(here);
+      const entries = parsePropfindXml(await this.propfind(url, '1'), url);
+      for (const e of entries) {
+        // Paths come back relative to the folder we just listed.
+        const childRel = rel ? rel + '/' + e.relPath : e.relPath;
+        if (e.isDir) {
+          if (depth < MAX_DEPTH) queue.push({ rel: childRel, depth: depth + 1 });
+        } else if (isAudiobookFile(childRel)) {
+          yield { ...e, relPath: childRel };
+        }
+      }
     }
   }
 
@@ -98,7 +136,7 @@ export class WebDAVAdapter implements StorageAdapter {
 </prop></propfind>`,
     });
     if (res.status !== 207 && res.status !== 200) {
-      throw new Error(`WebDAV PROPFIND HTTP ${res.status}: ${await res.text().catch(() => '')}`);
+      throw new PropfindError(res.status, await res.text().catch(() => ''), depth);
     }
     return res.text();
   }
@@ -109,6 +147,24 @@ export class WebDAVAdapter implements StorageAdapter {
     const rel = relPath.replace(/^\/+/, '');
     const path = [root, rel].filter(Boolean).map((seg) => seg.split('/').map(encodeURIComponent).join('/')).join('/');
     return new URL(path, base).toString();
+  }
+}
+
+// A PROPFIND that the server rejected. `depthRefused` marks the specific
+// case the walk retries differently: "I won't do Depth: infinity" — either
+// RFC 4918's 403 + <propfind-finite-depth/>, a 400 complaining about the
+// depth header, or a flat 501 Not Implemented.
+class PropfindError extends Error {
+  constructor(readonly status: number, readonly body: string, readonly depth: string) {
+    super(`WebDAV PROPFIND HTTP ${status}: ${body}`);
+    this.name = 'PropfindError';
+  }
+
+  get depthRefused(): boolean {
+    if (this.depth !== 'infinity') return false;
+    if (this.status === 501) return true;
+    if (this.status !== 400 && this.status !== 403) return false;
+    return /depth|propfind-finite-depth/i.test(this.body) || this.status === 403;
   }
 }
 

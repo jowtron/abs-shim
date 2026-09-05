@@ -27,7 +27,14 @@ export type RdUnrestricted = { download: string; filename: string; filesize: num
 // adds several torrents in parallel at ~10 calls each — the 2026-09-02
 // Percy Jackson grab lost one of five files to exactly that. So a 429 (or
 // a transient 5xx) is retried with a growing pause before it surfaces.
-const RETRY_WAITS_MS = [1500, 3000, 6000];
+//
+// The ladder was [1.5s, 3s, 6s] until a 29-file grab blew through all three
+// on most of its adds (2026-09-05). RD's torrents endpoints are the strict
+// ones — roughly a request a second — so a burst needs to wait out whole
+// seconds, not milliseconds. Waiting is idle I/O, not CPU, so a long pause
+// costs the Worker nothing; the client paces its adds as well.
+const RETRY_WAITS_MS = [2000, 5000, 10_000, 20_000];
+
 
 async function rd<T>(token: string, method: string, path: string, body?: Record<string, string>): Promise<T> {
   const init: RequestInit = { method, headers: { Authorization: `Bearer ${token}` } };
@@ -43,10 +50,13 @@ async function rd<T>(token: string, method: string, path: string, body?: Record<
     const wait = RETRY_WAITS_MS[attempt];
     if (wait != null && (resp.status === 429 || resp.status === 502 || resp.status === 503)) {
       const ra = Number(resp.headers.get('Retry-After'));
-      await new Promise((res) => setTimeout(res, Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 10_000) : wait));
+      await new Promise((res) => setTimeout(res, Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 30_000) : wait));
       continue;
     }
-    throw new Error(`Real-Debrid ${resp.status}: ${data.error ?? resp.statusText}`);
+    const err = new Error(`Real-Debrid ${resp.status}: ${data.error ?? resp.statusText}`) as Error & { rdStatus?: number; retryable?: boolean };
+    err.rdStatus = resp.status;
+    if (resp.status === 429) err.retryable = true;
+    throw err;
   }
 }
 

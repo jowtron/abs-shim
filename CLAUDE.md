@@ -26,6 +26,8 @@ npx wrangler tail --format pretty   # live prod request logs (use for debugging 
 
 **Routes**: `/login`, `/api/authorize`, `/api/me`, `/api/items/*`, `/api/libraries/*`, `/api/admin/*`, `/api/session/*`, `/public/proxy/*`, `/admin` (UI), plus a Socket.io stub via `ListeningSessionDO`. Other DOs: `SignupRateLimitDO` (per-IP signup throttle), `ArchiveExtractDO` (zip extraction jobs). Auth middleware (`src/auth/middleware.ts`) accepts Bearer header, `?token=` query, or `accessToken` cookie. Cookie is refreshed on every `/login` AND `/api/authorize`.
 
+**WebDAV depth** (`src/storage/webdav.ts`): `walkAudiobookFiles` tries one `Depth: infinity` PROPFIND and falls back to a bounded breadth-first walk of `Depth: 1` requests when the server refuses it. RFC 4918 lets a server decline (403 + `propfind-finite-depth`), and Joseph's NAS answers `400 Invalid depth: only 0 and 1 are allowed`, which failed the entire scan before 2026-09-05. Keep the infinity attempt: it is one request instead of one per folder. The fallback stops at 400 folders / 8 levels so a folder pointed at a whole NAS share can't burn the Worker's subrequest budget.
+
 **Storage adapters** (`src/storage/`): `adapter.ts` defines the interface — `resolveUrl`, `resolveProbeUrl`, `listFolder`, optional `walkAudiobookFiles`. `factory.ts` builds an adapter from a `library_folders` row. The adapter for streaming is invoked from `src/storage/resolve.ts` — it falls back to `audio_files.filedn_url` when `rel_path` is null (preserves backward compatibility with the original seed).
 
 For backends that can't 302 directly (WebDAV), `proxy-url.ts` mints HMAC-signed self-Worker URLs and `index.ts` has a `/public/proxy/:folderId/*` route that validates the signature and proxies bytes. Streaming through a Worker is fine — once you `return` a `Response` with a `ReadableStream` body, CF's edge runtime pipes bytes without using your Worker's CPU budget.
@@ -92,6 +94,12 @@ ShelfPlayer uses strict Swift Codable — one field type mismatch fails the enti
 - CORS `allowHeaders` must keep `X-Playback-Session-Id` (plus `If-Range`, `Accept`): Pholia's service worker re-issues iOS media requests as CORS fetches when it serves a partially cached book, and iOS adds that header to every media request. Without it the preflight fails and playback dies at the cache edge. iOS also requires every response in one media load to have the same CORS status, so the shim's file route must behave identically for CORS and no-cors requests (it does — don't add Origin-dependent branches).
 
 When adding a new client integration: open `wrangler tail --format pretty` and use `gh api repos/<owner>/<repo>/contents/<path> --jq '.content' | base64 -d` to read Swift Codable structs. Diff the strict types against `src/lib/abs-shapes.ts` output.
+
+## D1 cost: index what you filter on (2026-09-05)
+
+D1 bills rows *read*, and a query with no usable index reads the whole table every call. `DELETE FROM abb_post_cats WHERE post_id = ?` — run once per post on every listing pass to rewrite its categories — had no index leading with `post_id` (the primary key is `(cat, post_id)`), so each of those ~59k calls scanned all ~119k rows: **3.8 billion rows read, about 99% of this database's entire read volume**, to touch two or three rows. Migration 0012 adds `abb_post_cats(post_id)`. Check `EXPLAIN QUERY PLAN` for any statement that filters a big table on something other than its leading key column; "SCAN" in the output is the alarm.
+
+The other repeat offender is a whole-table aggregate behind a polling UI: /admin's catalogue tiles poll every 10 s and each poll ran `SELECT COUNT(*), SUM(…) FROM abb_posts` twice, 23k rows a time. `catalogCounts`, `coverStats` and `catalogFacets` now go through `cachedAggregate()` in `src/lib/abb-catalog.ts`, which keeps the answer in an `abb_crawl` row (one indexed read) for 60 s — 15 min for facets — and `catalogControl` calls `bustCatalogCaches()` so a button press still shows its effect at once. Cache any new dashboard aggregate the same way.
 
 ## Schema (D1)
 

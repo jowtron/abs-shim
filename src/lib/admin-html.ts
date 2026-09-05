@@ -2358,6 +2358,10 @@ async function abbLoadRdList() {
     r = await api('/api/admin/abb/torrents');
     if (r.error) throw new Error(r.error);
   } catch (e) {
+    // A tab left open across a permission change (or a deploy) still shows
+    // controls the server now refuses. Re-render from fresh status instead
+    // of printing a 403 the user can do nothing with.
+    if (/HTTP 403/.test(e.message || '')) { box.textContent = 'Permissions changed — reloading…'; refresh(); return; }
     box.textContent = 'Couldn\'t list: ' + e.message;
     return;
   }
@@ -2476,9 +2480,11 @@ async function abbResumeGroup(g, folderId, listEl, pick) {
     if (missing.length) {
       row.setStatus('Adding ' + missing.length + ' torrent(s) to Real-Debrid…');
       const magnet = 'magnet:?xt=urn:btih:' + hash + '&dn=' + encodeURIComponent(g.filename);
-      for (const f of missing) {
-        try { const a = await abbAddTorrent(magnet, f.id); byFile.set(f.id, a.id); }
+      for (let i = 0; i < missing.length; i++) {
+        const f = missing[i];
+        try { const a = await abbAddPaced(magnet, f.id, row, 'Adding ' + (i + 1) + ' / ' + missing.length); byFile.set(f.id, a.id); }
         catch (e) { appendUploadRow(listEl, '  ↳ ' + f.path, '').fail('Add failed: ' + e.message); }
+        if (i + 1 < missing.length) await abbSleep(RD_ADD_PACE_MS);
       }
     }
     const san = (s) => s.replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120) || 'audiobook';
@@ -2568,7 +2574,7 @@ async function abbGrab(res, folderId, listEl) {
       const r = appendUploadRow(listEl, '  ↳ ' + p.dest, '');
       const retry = () => {
         r.setStatus('Adding to Real-Debrid…');
-        abbAddTorrent(m.magnet, p.id)
+        abbAddPaced(m.magnet, p.id, r, 'Adding')
           .then((a) => { removeBtn(); return abbTrackTorrents([{ id: a.id, dest: p.dest }], folderId, listEl, r); })
           .then(() => abbLoadRdList())
           .catch((e) => r.fail('Add failed: ' + e.message));
@@ -2576,14 +2582,18 @@ async function abbGrab(res, folderId, listEl) {
       let removeBtn = r.addButton('Retry', retry);
       return r;
     };
-    for (let i = 0; i < plan.length; i += 2) {
-      const batch = plan.slice(i, i + 2);
-      const added = await Promise.all(batch.map((p) => abbAddTorrent(m.magnet, p.id).then((a) => ({ ...a, dest: p.dest, plan: p })).catch((e) => ({ error: e.message, dest: p.dest, plan: p }))));
-      for (const a of added) {
-        if (a.error) retryAdd(a.plan).fail('Add failed: ' + a.error);
-        else torrents.push({ id: a.id, dest: a.dest });
+    for (let i = 0; i < plan.length; i++) {
+      const p = plan[i];
+      const label = 'Adding ' + (i + 1) + ' / ' + plan.length;
+      row.setStatus(label + '…');
+      try {
+        const a = await abbAddPaced(m.magnet, p.id, row, label);
+        torrents.push({ id: a.id, dest: p.dest });
+      } catch (e) {
+        retryAdd(p).fail('Add failed: ' + e.message);
       }
       row.setStatus('Added ' + torrents.length + ' / ' + plan.length + ' torrent(s)…');
+      if (i + 1 < plan.length) await abbSleep(RD_ADD_PACE_MS);
     }
     if (!torrents.length) throw new Error('Nothing could be added to Real-Debrid');
     row.setStatus(torrents.length + ' torrent(s) on Real-Debrid — waiting for download');
@@ -2796,6 +2806,35 @@ async function abbAddTorrent(magnet, fileId) {
   });
   if (r.error) throw new Error(r.error);
   return r;
+}
+
+const abbSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Real-Debrid's torrents endpoints allow roughly one request a second per
+// API key, and one add spends several of them (addMagnet, a few info polls,
+// selectFiles). A 29-file release added two at a time lost most of its files
+// to "Real-Debrid 429: too_many_requests" (2026-09-05) and left a wall of
+// rows each needing a manual Retry. So adds are one at a time with a gap,
+// and a 429 waits and retries itself — the user shouldn't be the retry
+// mechanism. The server already retries a 429 four times over ~37 s; this
+// ladder is what happens when even that isn't enough, so it waits in
+// minutes, not seconds.
+const RD_ADD_PACE_MS = 1200;
+const RD_RETRY_WAITS_MS = [15000, 30000, 60000, 60000, 120000];
+const abbRateLimited = (msg) => /429|too_many/i.test(msg || '');
+
+async function abbAddPaced(magnet, fileId, row, label) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await abbAddTorrent(magnet, fileId); }
+    catch (e) {
+      const wait = abbRateLimited(e.message) ? RD_RETRY_WAITS_MS[attempt] : null;
+      if (wait == null) throw e;
+      for (let left = Math.round(wait / 1000); left > 0; left--) {
+        row.setStatus(label + ' — Real-Debrid is rate-limiting, retrying in ' + left + 's');
+        await abbSleep(1000);
+      }
+    }
+  }
 }
 
 // ─── Upload pipeline ────────────────────────────────────────────────────────

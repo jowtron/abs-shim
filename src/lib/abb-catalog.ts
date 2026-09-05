@@ -108,6 +108,27 @@ async function setState(env: Env, key: string, value: unknown): Promise<void> {
   ).bind(key, JSON.stringify(value), Date.now()).run();
 }
 
+// Cheap cache for the whole-table aggregates behind the /admin dashboard.
+// Each scans abb_posts (~23k rows) or abb_post_cats, and the panel polls
+// every 10 s while it's open: on 2026-09-05 the counts + covers tiles alone
+// had read 118M rows. Cached in abb_crawl (one indexed row to read) and
+// recomputed past the TTL; every control action busts the keys so a button
+// press still shows its effect immediately.
+async function cachedAggregate<T>(env: Env, key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
+  const row = await env.DB.prepare('SELECT value, updated_at FROM abb_crawl WHERE key = ?').bind(key)
+    .first<{ value: string; updated_at: number }>();
+  if (row && Date.now() - row.updated_at < ttlMs) {
+    try { return JSON.parse(row.value) as T; } catch { /* fall through and recompute */ }
+  }
+  const value = await compute();
+  await setState(env, key, value);
+  return value;
+}
+
+export async function bustCatalogCaches(env: Env): Promise<void> {
+  await env.DB.prepare(`DELETE FROM abb_crawl WHERE key IN ('cache:counts','cache:covers','cache:facets')`).run();
+}
+
 async function loadStats(env: Env): Promise<CrawlStats> {
   return { ...emptyStats(), ...((await getState<Partial<CrawlStats>>(env, 'stats')) ?? {}) };
 }
@@ -258,10 +279,12 @@ export async function coverFailed(env: Env, id: number, error: string): Promise<
 }
 
 export async function coverStats(env: Env): Promise<{ withCover: number; cached: number; failed: number }> {
-  const r = await env.DB.prepare(
-    'SELECT SUM(cover IS NOT NULL) AS withCover, SUM(cover_r2 IS NOT NULL) AS cached, SUM(cover_error IS NOT NULL) AS failed FROM abb_posts',
-  ).first<{ withCover: number; cached: number; failed: number }>();
-  return { withCover: r?.withCover ?? 0, cached: r?.cached ?? 0, failed: r?.failed ?? 0 };
+  return cachedAggregate(env, 'cache:covers', 60_000, async () => {
+    const r = await env.DB.prepare(
+      'SELECT SUM(cover IS NOT NULL) AS withCover, SUM(cover_r2 IS NOT NULL) AS cached, SUM(cover_error IS NOT NULL) AS failed FROM abb_posts',
+    ).first<{ withCover: number; cached: number; failed: number }>();
+    return { withCover: r?.withCover ?? 0, cached: r?.cached ?? 0, failed: r?.failed ?? 0 };
+  });
 }
 
 // FTS5 query from free text: each word becomes a prefix term, all required.
@@ -318,13 +341,17 @@ export async function catalogFacets(env: Env): Promise<{
   formats: Array<{ name: string; count: number }>;
   total: number;
 }> {
-  const [cats, langs, fmts, total] = await Promise.all([
-    env.DB.prepare('SELECT cat AS name, COUNT(*) AS count FROM abb_post_cats GROUP BY cat ORDER BY name').all<{ name: string; count: number }>(),
-    env.DB.prepare('SELECT language AS name, COUNT(*) AS count FROM abb_posts WHERE language IS NOT NULL GROUP BY language ORDER BY count DESC').all<{ name: string; count: number }>(),
-    env.DB.prepare('SELECT format AS name, COUNT(*) AS count FROM abb_posts WHERE format IS NOT NULL GROUP BY format ORDER BY count DESC').all<{ name: string; count: number }>(),
-    env.DB.prepare('SELECT COUNT(*) AS n FROM abb_posts').first<{ n: number }>(),
-  ]);
-  return { categories: cats.results, languages: langs.results, formats: fmts.results, total: total?.n ?? 0 };
+  // Four full scans for a picker whose contents barely move — 15 minutes is
+  // plenty fresh for "which categories exist".
+  return cachedAggregate(env, 'cache:facets', 900_000, async () => {
+    const [cats, langs, fmts, total] = await Promise.all([
+      env.DB.prepare('SELECT cat AS name, COUNT(*) AS count FROM abb_post_cats GROUP BY cat ORDER BY name').all<{ name: string; count: number }>(),
+      env.DB.prepare('SELECT language AS name, COUNT(*) AS count FROM abb_posts WHERE language IS NOT NULL GROUP BY language ORDER BY count DESC').all<{ name: string; count: number }>(),
+      env.DB.prepare('SELECT format AS name, COUNT(*) AS count FROM abb_posts WHERE format IS NOT NULL GROUP BY format ORDER BY count DESC').all<{ name: string; count: number }>(),
+      env.DB.prepare('SELECT COUNT(*) AS n FROM abb_posts').first<{ n: number }>(),
+    ]);
+    return { categories: cats.results, languages: langs.results, formats: fmts.results, total: total?.n ?? 0 };
+  });
 }
 
 export async function catalogGet(env: Env, url: string): Promise<CatalogRow | null> {
@@ -557,11 +584,13 @@ async function detailPass(env: Env, t: Tick, count: number): Promise<number> {
 export type CatalogCounts = { total: number; withHash: number; pending: number; errors: number };
 
 export async function catalogCounts(env: Env): Promise<CatalogCounts> {
-  const r = await env.DB.prepare(
-    `SELECT COUNT(*) AS total, SUM(info_hash IS NOT NULL) AS withHash,
-            SUM(detail_fetched_at IS NULL) AS pending, SUM(detail_error IS NOT NULL) AS errors FROM abb_posts`,
-  ).first<CatalogCounts>();
-  return { total: r?.total ?? 0, withHash: r?.withHash ?? 0, pending: r?.pending ?? 0, errors: r?.errors ?? 0 };
+  return cachedAggregate(env, 'cache:counts', 60_000, async () => {
+    const r = await env.DB.prepare(
+      `SELECT COUNT(*) AS total, SUM(info_hash IS NOT NULL) AS withHash,
+              SUM(detail_fetched_at IS NULL) AS pending, SUM(detail_error IS NOT NULL) AS errors FROM abb_posts`,
+    ).first<CatalogCounts>();
+    return { total: r?.total ?? 0, withHash: r?.withHash ?? 0, pending: r?.pending ?? 0, errors: r?.errors ?? 0 };
+  });
 }
 
 // The two-week check-in Joseph asked for: one Pushover push with the
@@ -715,6 +744,8 @@ export async function catalogControl(env: Env, action: CatalogAction, value?: nu
       break;
     }
   }
+  // Every action here moves a number the dashboard shows.
+  await bustCatalogCaches(env);
   await setState(env, 'stats', stats);
   return said;
 }
