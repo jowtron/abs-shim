@@ -393,7 +393,7 @@ npx wrangler secret put PCLOUD_CLIENT_SECRET</pre>
     <h2>Cover cache</h2>
     <p class="muted">Covers are probed from the m4b on first request and stored in R2 so subsequent loads (from any CF POP) are fast. Click below to pre-fetch every library item's cover now.</p>
     <div class="row">
-      <button id="warm-covers" class="secondary">Warm cover cache</button>
+      <button id="warm-covers" class="secondary" title="Extract every book's embedded artwork into the cache; books whose files have none fall back to their AudioBookBay listing">Warm cover cache</button>
       <span id="warm-status" class="muted"></span>
     </div>
   </div>
@@ -527,7 +527,7 @@ document.getElementById('warm-covers').addEventListener('click', async (e) => {
   status.textContent = 'Probing…';
   try {
     const result = await api('/api/admin/covers/warm', { method: 'POST' });
-    status.textContent = result.warmed + ' warmed, ' + result.skipped + ' already cached, ' + result.failed + ' failed (of ' + result.totalItems + ' items).';
+    status.textContent = result.warmed + ' warmed' + (result.fromCatalog ? ' (' + result.fromCatalog + ' from AudioBookBay listings)' : '') + ', ' + result.skipped + ' already cached, ' + result.failed + ' failed (of ' + result.totalItems + ' items).';
   } catch (err) {
     showError('Warm failed: ' + err.message);
     status.textContent = '';
@@ -3317,6 +3317,7 @@ function renderBooksList(container, items) {
     html += '<span class="meta">' + formatDuration(it.duration_seconds) + '</span>';
     html += '<span class="meta">' + formatBytes(it.size_bytes) + '</span>';
     html += '<button class="secondary" data-reprobe-item="' + escapeHtml(it.id) + '">Re-probe</button>';
+    html += '<button class="secondary" data-cover-item="' + escapeHtml(it.id) + '" title="Use the matching AudioBookBay listing artwork, for books whose files carry no cover">Find cover</button>';
     if (window.__role === 'owner') {
       html += '<button class="danger" data-remove-item="' + escapeHtml(it.id) + '">Remove</button>';
       html += '<button class="danger" data-delete-item-files="' + escapeHtml(it.id) + '" title="Remove from the library AND delete the audio files from pCloud">Delete + files</button>';
@@ -3339,6 +3340,32 @@ function renderBooksList(container, items) {
         showError('Re-probe failed: ' + e.message);
       } finally {
         btn.disabled = false; btn.textContent = 'Re-probe';
+      }
+    });
+  });
+
+  container.querySelectorAll('[data-cover-item]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true; btn.textContent = '…';
+      try {
+        const r = await api('/api/admin/items/' + btn.dataset.coverItem + '/cover', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        if (r && r.error) throw new Error(r.error);
+        btn.textContent = 'Cover set';
+      } catch (e) {
+        // No catalogue match — offer to paste one instead.
+        const url = prompt('No matching AudioBookBay listing (' + e.message + ').\n\nPaste an image URL to use as the cover, or cancel:');
+        if (!url) { btn.disabled = false; btn.textContent = 'Find cover'; return; }
+        try {
+          await api('/api/admin/items/' + btn.dataset.coverItem + '/cover', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: url.trim() }),
+          });
+          btn.textContent = 'Cover set';
+        } catch (err) {
+          showError('Cover failed: ' + err.message);
+          btn.disabled = false; btn.textContent = 'Find cover';
+        }
       }
     });
   });

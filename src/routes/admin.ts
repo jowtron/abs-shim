@@ -10,7 +10,7 @@ import {
   pcloudDeleteFile, pcloudDeleteEmptyFolder,
 } from '../storage/pcloud';
 import { runScan, addBookByPath, reprobeItem, type ScanReport } from '../scanner/scan';
-import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem } from '../db/library';
+import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem, getBookMetadata } from '../db/library';
 import { probeM4b } from '../prober/m4b';
 import { probeMp3 } from '../prober/mp3';
 import { resolveProbeUrl } from '../storage/resolve';
@@ -19,6 +19,7 @@ import { S3Adapter } from '../storage/s3';
 import { WebDAVAdapter, normalizeWebdavBaseUrl } from '../storage/webdav';
 import { PcloudOAuthAdapter } from '../storage/pcloud';
 import { isAudiobookFile, type RemoteEntry } from '../storage/adapter';
+import { findCatalogCover, purgeCoverCache } from '../lib/cover-from-catalog';
 import { redactSecrets, safeJson } from '../lib/redact';
 import { getSignupMode, setSetting, membersCanAdd, setTenantSetting, MEMBERS_CAN_ADD_KEY } from '../db/settings';
 import { createInvite, listOpenInvites, deleteInvite } from '../db/invites';
@@ -1131,7 +1132,7 @@ adminRoutes.post('/covers/warm', async (c) => {
   ).bind(c.get('tenantId')).all<{ id: string }>();
   const ids = (rows.results ?? []).map((r) => r.id);
 
-  let warmed = 0, skipped = 0, failed = 0;
+  let warmed = 0, skipped = 0, failed = 0, fromCatalogCount = 0;
   const errors: { id: string; reason: string }[] = [];
 
   for (const id of ids) {
@@ -1154,7 +1155,18 @@ adminRoutes.post('/covers/warm', async (c) => {
       const cover = isMp3
         ? (await probeMp3(probeUrl.url, audio.size_bytes || undefined, probeUrl.headers)).cover
         : (await probeM4b(probeUrl.url, probeUrl.headers)).cover;
-      if (!cover) { failed++; errors.push({ id, reason: 'no embedded cover' }); continue; }
+      if (!cover) {
+        // Nothing embedded — borrow the AudioBookBay listing's artwork,
+        // which is the only cover these releases ever had.
+        const meta = await getBookMetadata(c.env, id, c.get('tenantId'));
+        const fromCatalog = await findCatalogCover(c.env, { title: meta?.title ?? null, author: meta?.author_name ?? null });
+        if (!fromCatalog) { failed++; errors.push({ id, reason: 'no embedded cover, and no catalogue match' }); continue; }
+        await c.env.COVERS.put(r2Key, fromCatalog.bytes, { httpMetadata: { contentType: fromCatalog.contentType } });
+        await purgeCoverCache(id, c.req.url);
+        fromCatalogCount++;
+        warmed++;
+        continue;
+      }
 
       await c.env.COVERS.put(r2Key, cover.bytes, {
         httpMetadata: { contentType: cover.mimeType },
@@ -1165,7 +1177,44 @@ adminRoutes.post('/covers/warm', async (c) => {
       errors.push({ id, reason: (e as Error).message });
     }
   }
-  return c.json({ totalItems: ids.length, warmed, skipped, failed, errors });
+  return c.json({ totalItems: ids.length, warmed, fromCatalog: fromCatalogCount, skipped, failed, errors });
+});
+
+// Set one book's cover by hand: from the AudioBookBay catalogue, or from a
+// URL you paste. For releases whose files carry no artwork and that the
+// catalogue can't match — the fallback in "Warm cover cache" handles the
+// rest automatically.
+adminRoutes.post('/items/:itemId/cover', requireTenantOwner, async (c) => {
+  const itemId = c.req.param('itemId');
+  const tenantId = c.get('tenantId');
+  const item = await getItem(c.env, itemId, tenantId);
+  if (!item) return c.json({ error: 'Item not found' }, 404);
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  const url = String(body['url'] ?? '').trim();
+
+  let bytes: ArrayBuffer;
+  let contentType: string;
+  let source: string;
+  if (url) {
+    if (!/^https?:\/\//i.test(url)) return c.json({ error: 'Cover URL must be http(s)' }, 400);
+    const res = await fetch(url).catch(() => null);
+    if (!res || !res.ok) return c.json({ error: `Could not fetch that URL (${res ? res.status : 'no response'})` }, 502);
+    contentType = res.headers.get('content-type') ?? '';
+    if (!contentType.startsWith('image/')) return c.json({ error: `That URL returned ${contentType || 'no content type'}, not an image` }, 400);
+    bytes = await res.arrayBuffer();
+    source = url;
+  } else {
+    const meta = await getBookMetadata(c.env, itemId, tenantId);
+    const found = await findCatalogCover(c.env, { title: meta?.title ?? null, author: meta?.author_name ?? null });
+    if (!found) return c.json({ error: 'No matching AudioBookBay listing with a cover' }, 404);
+    bytes = found.bytes;
+    contentType = found.contentType;
+    source = found.postTitle;
+  }
+
+  await c.env.COVERS.put(`covers/${itemId}`, bytes, { httpMetadata: { contentType } });
+  await purgeCoverCache(itemId, c.req.url);
+  return c.json({ ok: true, source, bytes: bytes.byteLength });
 });
 
 // ─── Signups & membership (instance owner only) ──────────────────────────────
