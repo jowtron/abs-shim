@@ -24,6 +24,7 @@ import { signupRoutes } from './routes/signup';
 import { renderSignupHtml } from './lib/signup-html';
 import { listProgressByUser, getProgress, upsertProgress, progressToAbs } from './db/progress';
 import { listSessionsByUser } from './db/sessions';
+import { userListeningStats, userYearStats } from './db/stats';
 import { streamAudio } from './storage/resolve';
 import { getFolderById, getFolderByIdUnscoped } from './db/library';
 import { ADMIN_HTML } from './lib/admin-html';
@@ -390,6 +391,21 @@ app.post('/api/session/:id/close', requireAuth, async (c) => {
        WHERE id = ? AND user_id = ?`,
   ).bind(currentTime, timeListened, now, now, sid, userRow.id).run();
   return c.body(null, 200);
+});
+
+// Listening stats (Absorb's Stats tab, Pholia's stats page) and the year in
+// review. Dates are in the client's zone when it passes ?tz=<IANA name>,
+// otherwise UTC — a Worker has no "server local time" to stamp them with.
+app.get('/api/me/listening-stats', requireAuth, async (c) => {
+  const tz = c.req.query('tz') || 'UTC';
+  return c.json(await userListeningStats(c.env, c.get('userId'), tz));
+});
+
+app.get('/api/me/stats/year/:year', requireAuth, async (c) => {
+  const year = Number(c.req.param('year'));
+  if (!Number.isInteger(year) || year < 2000 || year > 2100) return c.json({ error: 'Invalid year' }, 400);
+  const tz = c.req.query('tz') || 'UTC';
+  return c.json(await userYearStats(c.env, c.get('userId'), year, tz));
 });
 
 // Per-item session history. ShelfPlayer fetches this on book detail open;

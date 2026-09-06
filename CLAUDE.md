@@ -157,3 +157,36 @@ Migrations in `migrations/`. Initial schema (0001) plus storage additions (0002)
 - Don't add `nodejs_compat` — pure-JS only on the Worker side.
 - TypeScript is strict (`exactOptionalPropertyTypes`); guard against undefined explicitly when building objects with optional fields.
 - Comments explain the *why*, not the what. Many comments in this codebase reference past bugs ("Don't change this — without it ShelfPlayer goes offline"), which are load-bearing.
+
+## Third-party clients, stats and author metadata (2026-09-06)
+
+- **`GET /api/libraries/:id/authors` has two shapes, like real ABS.** With
+  numeric `limit` AND `page` it is the paged `{results, total, limit, page,
+  sortBy, sortDesc}`; otherwise `{authors: [...]}`. ShelfPlayer always asks
+  paged and decodes `total` as required — the plain shape failed its decode
+  and its Authors tab showed "Content unavailable". `sort` (`name`,
+  `lastFirst`, `numBooks`, `addedAt`) and `desc` are honoured.
+- **`filter=issues` on `/items` is honoured** (missing or invalid items
+  only). Absorb lists that query as "missing or invalid items"; ignoring the
+  filter made every book in the library look broken. Other ABS filters
+  (`<group>.<base64>`) still fall through to the unfiltered list.
+- **Stats endpoints** (`src/db/stats.ts`): `/api/libraries/:id/stats`,
+  `/api/me/listening-stats` and `/api/me/stats/year/:year`, shaped as ABS
+  shapes them. Sessions get calendar dates in the zone passed as
+  `?tz=<IANA>` (Pholia sends the phone's), UTC otherwise — a Worker has no
+  server-local clock to stamp them with. Absorb's "0 books" was the missing
+  stats route, its "couldn't load stats" the missing listening-stats one.
+- **Author images and biographies come from Audnexus** (`src/lib/audnexus.ts`,
+  migration 0014 `author_meta`). The name search is loose, so a candidate
+  must equal the requested name once case, punctuation and accents are
+  ignored. Lookups run in the background, four per authors-listing request,
+  and synchronously when one author is opened; a miss is remembered for 30
+  days, a network failure for an hour. `/api/authors/:id/image` is
+  edge → R2 (`authors/<id>`) → fetch-from-Audnexus → placeholder, and the
+  placeholder is deliberately not edge-cached. `imagePath` is a fake
+  `/metadata/authors/<id>.jpg` when a picture exists: clients only test it
+  for null.
+- **Login is not the problem for Prologue/Audiobooth.** The `/login` body
+  matches `.local/fixtures/login.json` key for key, `userDefaultLibraryId`
+  included (real ABS sends `null` too). Whatever they choke on is a later
+  request; capture it with `wrangler tail` while logging in.

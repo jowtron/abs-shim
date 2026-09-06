@@ -11,6 +11,8 @@ import {
 } from '../lib/abs-shapes';
 import { derivedId } from '../lib/ids';
 import { listProgressByUser, progressToAbs, type MediaProgressRow } from '../db/progress';
+import { libraryStats } from '../db/stats';
+import { authorJson, ensureAuthorMeta, getAuthorMetasForLibrary, needsLookup } from '../lib/audnexus';
 
 export const libraryRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
@@ -84,9 +86,14 @@ libraryRoutes.get('/:id/items', async (c) => {
   const limit = Number(c.req.query('limit') ?? '0');
   const page = Number(c.req.query('page') ?? '0');
   const offset = limit > 0 ? page * limit : 0;
+  // ABS filters are `<group>.<base64 value>`, except `issues`, which is bare.
+  // Only that one is honoured here (see listItemsByLibrary); the others fall
+  // through to the unfiltered list as before.
+  const filter = c.req.query('filter') ?? '';
+  const issuesOnly = filter === 'issues';
 
-  const items = await listItemsByLibrary(c.env, id, tenantId, { limit, offset });
-  const total = await countItemsByLibrary(c.env, id, tenantId);
+  const items = await listItemsByLibrary(c.env, id, tenantId, { limit, offset, issuesOnly });
+  const total = await countItemsByLibrary(c.env, id, tenantId, { issuesOnly });
 
   const results = await Promise.all(items.map(async (item) => {
     const folder = await getFolderById(c.env, item.folder_id, tenantId);
@@ -105,12 +112,23 @@ libraryRoutes.get('/:id/items', async (c) => {
     limit,
     page,
     sortDesc: false,
+    ...(filter ? { filterBy: filter } : {}),
     mediaType: row.media_type,
     minified: false,
     collapseseries: false,
     include: '',
     offset,
   });
+});
+
+// GET /api/libraries/:id/stats — the numbers behind Absorb's library page
+// and the web UI's Stats tab. Absent until 2026-09-06, which read as
+// "0 books" in Absorb's library list.
+libraryRoutes.get('/:id/stats', async (c) => {
+  const tenantId = c.get('tenantId');
+  const id = c.req.param('id');
+  if (!(await getLibrary(c.env, id, tenantId))) return c.json({ error: 'Library not found' }, 404);
+  return c.json(await libraryStats(c.env, id, tenantId));
 });
 
 // Stub: trigger a (re)scan. We don't have a scanner yet, so 200 OK and noop.
@@ -227,6 +245,14 @@ function splitList(v: string | null): string[] {
 }
 
 // Authors aggregated across the library's books. Sorted by name.
+// GET /api/libraries/:id/authors. Two response shapes, like real ABS: with
+// numeric `limit` AND `page` it is a paged {results, total, ...} result,
+// otherwise the plain {authors: [...]}. ShelfPlayer always asks paged and
+// decodes `total` as required — until 2026-09-06 the shim answered the plain
+// shape regardless, the decode failed, and its Authors tab showed "Content
+// unavailable". Author descriptions and images come from author_meta
+// (Audnexus, see src/lib/audnexus.ts); authors not yet looked up are looked
+// up in the background, a few per request, so a second load has them.
 libraryRoutes.get('/:id/authors', async (c) => {
   const tenantId = c.get('tenantId');
   const id = c.req.param('id');
@@ -239,22 +265,48 @@ libraryRoutes.get('/:id/authors', async (c) => {
       counts.set(a, (counts.get(a) ?? 0) + 1);
     }
   }
-  const authors = await Promise.all(Array.from(counts.entries()).sort(([a], [b]) => a.localeCompare(b)).map(async ([name, numBooks]) => {
+  const metas = await getAuthorMetasForLibrary(c.env, id);
+  const authors = await Promise.all(Array.from(counts.entries()).map(async ([name, numBooks]) => {
     const aid = await derivedId(id, 'author', name);
-    return {
-      id: aid,
-      asin: null,
-      name,
-      description: null,
-      imagePath: null,
-      libraryId: id,
-      addedAt: 0,
-      updatedAt: 0,
-      numBooks,
-      lastFirst: nameLF(name),
-    };
+    return { ...authorJson({ id: aid, name, libraryId: id, numBooks, meta: metas.get(aid) }), lastFirst: nameLF(name) };
   }));
-  return c.json({ authors });
+
+  const pending = authors.filter((a) => needsLookup(metas.get(a.id))).slice(0, 4);
+  if (pending.length) {
+    c.executionCtx.waitUntil(Promise.all(pending.map((a) =>
+      ensureAuthorMeta(c.env, { authorId: a.id, tenantId, libraryId: id, name: a.name }).catch(() => undefined))));
+  }
+
+  const sort = c.req.query('sort') ?? 'name';
+  const desc = c.req.query('desc') === '1';
+  const byName = (x: string, y: string) => x.localeCompare(y, undefined, { sensitivity: 'base' });
+  authors.sort((a, b) => {
+    let cmp: number;
+    if (sort === 'numBooks') cmp = a.numBooks - b.numBooks;
+    else if (sort === 'lastFirst') cmp = byName(a.lastFirst, b.lastFirst);
+    else if (sort === 'addedAt' || sort === 'updatedAt') cmp = a.updatedAt - b.updatedAt;
+    else cmp = byName(a.name, b.name);
+    return desc ? -cmp : cmp;
+  });
+
+  const limitQ = c.req.query('limit');
+  const pageQ = c.req.query('page');
+  const paginated = !!limitQ && !isNaN(Number(limitQ)) && pageQ !== undefined && !isNaN(Number(pageQ));
+  if (!paginated) return c.json({ authors });
+  const limit = Number(limitQ);
+  const page = Number(pageQ);
+  const results = limit > 0 ? authors.slice(page * limit, page * limit + limit) : authors;
+  const include = c.req.query('include');
+  return c.json({
+    results,
+    total: authors.length,
+    limit,
+    page,
+    sortBy: sort,
+    sortDesc: desc,
+    minified: c.req.query('minified') === '1',
+    ...(include !== undefined ? { include } : {}),
+  });
 });
 
 // Series listing: group books by series_name, return one entry per series

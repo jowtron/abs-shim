@@ -138,12 +138,16 @@ export async function getFolderByIdUnscoped(env: Env, id: string): Promise<Libra
   return env.DB.prepare('SELECT * FROM library_folders WHERE id = ?').bind(id).first<LibraryFolderRow>();
 }
 
-export async function listItemsByLibrary(env: Env, libraryId: string, tenantId: string, opts: { limit?: number; offset?: number } = {}): Promise<LibraryItemRow[]> {
+// `issuesOnly` is ABS's `filter=issues` (items flagged missing or invalid).
+// Absorb lists those as "missing or invalid items"; before the filter was
+// honoured every book in the library came back and was shown as broken.
+export async function listItemsByLibrary(env: Env, libraryId: string, tenantId: string, opts: { limit?: number; offset?: number; issuesOnly?: boolean } = {}): Promise<LibraryItemRow[]> {
   const limit = opts.limit ?? 0;
   const offset = opts.offset ?? 0;
+  const where = 'library_id = ? AND tenant_id = ?' + (opts.issuesOnly ? ' AND (is_missing = 1 OR is_invalid = 1)' : '');
   const sql = limit > 0
-    ? 'SELECT * FROM library_items WHERE library_id = ? AND tenant_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?'
-    : 'SELECT * FROM library_items WHERE library_id = ? AND tenant_id = ? ORDER BY created_at ASC';
+    ? `SELECT * FROM library_items WHERE ${where} ORDER BY created_at ASC LIMIT ? OFFSET ?`
+    : `SELECT * FROM library_items WHERE ${where} ORDER BY created_at ASC`;
   const stmt = limit > 0
     ? env.DB.prepare(sql).bind(libraryId, tenantId, limit, offset)
     : env.DB.prepare(sql).bind(libraryId, tenantId);
@@ -151,10 +155,9 @@ export async function listItemsByLibrary(env: Env, libraryId: string, tenantId: 
   return r.results;
 }
 
-export async function countItemsByLibrary(env: Env, libraryId: string, tenantId: string): Promise<number> {
-  const r = await env.DB.prepare(
-    'SELECT COUNT(*) AS n FROM library_items WHERE library_id = ? AND tenant_id = ?',
-  ).bind(libraryId, tenantId).first<{ n: number }>();
+export async function countItemsByLibrary(env: Env, libraryId: string, tenantId: string, opts: { issuesOnly?: boolean } = {}): Promise<number> {
+  const where = 'library_id = ? AND tenant_id = ?' + (opts.issuesOnly ? ' AND (is_missing = 1 OR is_invalid = 1)' : '');
+  const r = await env.DB.prepare(`SELECT COUNT(*) AS n FROM library_items WHERE ${where}`).bind(libraryId, tenantId).first<{ n: number }>();
   return r?.n ?? 0;
 }
 
