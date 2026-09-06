@@ -14,7 +14,6 @@ import { sessionCookie, clearSessionCookie } from './auth/cookie';
 import { serverSettings, SERVER_VERSION } from './lib/server-settings';
 import { libraryRoutes } from './routes/library';
 import { itemRoutes } from './routes/items';
-import { bookStreamRoutes } from './routes/book-stream';
 import { authorRoutes } from './routes/authors';
 import { adminRoutes } from './routes/admin';
 import { abbRoutes } from './routes/abb';
@@ -445,8 +444,6 @@ app.get('/api/me/listening-sessions', requireAuth, async (c) => {
 // ─── Library / items ─────────────────────────────────────────────────────────
 
 app.route('/api/libraries', libraryRoutes);
-// Before itemRoutes: /:id/stream must not fall into /:id.
-app.route('/api/items', bookStreamRoutes);
 app.route('/api/items', itemRoutes);
 app.route('/api/authors', authorRoutes);
 app.route('/api/auth/passkey', passkeyRoutes);

@@ -10,7 +10,7 @@ export async function resolveStreamUrl(
   env: Env,
   folder: LibraryFolderRow,
   audio: AudioFileRow,
-): Promise<{ url: string; expiresAt?: number; headers?: Record<string, string> }> {
+): Promise<{ url: string; expiresAt?: number }> {
   // Pre-scanner rows: filedn_url is the source of truth, no rel_path.
   if (!audio.rel_path) {
     return { url: audio.filedn_url };
