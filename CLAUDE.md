@@ -101,6 +101,10 @@ Until 2026-09-05 every `/api/admin` route was open to any active member, so a me
 
 `GET /api/admin/abb/settings` is the capability probe both UIs use: `canGrab`, `canDelete`, `membersCanAdd` (Pholia treats missing flags as allowed for older shims). When adding an admin route, pick a tier explicitly — the default is "anyone in the tenant".
 
+## One continuous stream for a multi-file book (2026-09-06)
+
+`GET /api/items/:id/stream` (`src/routes/book-stream.ts`) lays a book's parts end to end and serves any byte range across them, so a 15-part mp3 book can be played as one file. **iOS will not start a new media load while an app is backgrounded**: at a track boundary the audio element takes the metadata, reports itself playing and lets the lock screen tick, but makes no sound until the app is opened. It happens whether the bytes come from a service worker or straight from the network, so the block is on starting a load, not on who serves it — a client-side fix isn't possible, only removing the boundaries is. Requires every part's `size_bytes` (a NULL makes every later offset a guess, so the route 409s). mp3 only, in practice: concatenation works because mp3 frames are self-contained.
+
 ## Strict-client compatibility (ShelfPlayer)
 
 ShelfPlayer uses strict Swift Codable — one field type mismatch fails the entire response, and array-decode failures wipe whole shelves. Lessons learned and locked into the code:
