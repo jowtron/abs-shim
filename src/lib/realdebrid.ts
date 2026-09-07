@@ -4,7 +4,7 @@
 
 const RD_BASE = 'https://api.real-debrid.com/rest/1.0';
 
-export const AUDIO_EXT = new Set(['m4b', 'm4a', 'aac', 'mp3', 'flac', 'ogg', 'opus', 'wma', 'wav']);
+export const AUDIO_EXT = new Set(['m4b', 'm4a', 'aac', 'mp3', 'flac', 'ogg', 'opus', 'webm', 'wma', 'wav']);
 export const ARCHIVE_EXT = new Set(['zip', 'rar', '7z', 'tar', 'gz']);
 export const extOf = (name: string): string => (/\.([A-Za-z0-9]+)$/.exec(name ?? '')?.[1] ?? '').toLowerCase();
 

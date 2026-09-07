@@ -5,6 +5,7 @@ import { buildItemDetail } from '../lib/abs-shapes';
 import { buildItemBundle } from './library';
 import { probeM4b } from '../prober/m4b';
 import { probeOgg } from '../prober/ogg';
+import { probeWebm } from '../prober/webm';
 import { probeMp3 } from '../prober/mp3';
 import { resolveItemIdFromUuid } from '../lib/ids';
 import { findCatalogCover } from '../lib/cover-from-catalog';
@@ -101,6 +102,8 @@ itemRoutes.get('/:id/cover', async (c) => {
     if (isMp3) {
       const probe = await probeMp3(probeUrl.url, audio.size_bytes || undefined, probeUrl.headers);
       cover = probe.cover;
+    } else if (audio.format === 'webm' || /\.webm$/i.test(audio.rel_path ?? audio.filedn_url)) {
+      cover = (await probeWebm(probeUrl.url, probeUrl.headers)).cover;
     } else if (audio.format === 'ogg' || /\.(opus|ogg)$/i.test(audio.rel_path ?? audio.filedn_url)) {
       cover = (await probeOgg(probeUrl.url, probeUrl.headers)).cover;
     } else {

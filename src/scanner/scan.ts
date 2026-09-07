@@ -4,6 +4,7 @@ import { storageLabelText } from '../lib/storage-label';
 import { ListingNotSupportedError, type RemoteEntry } from '../storage/adapter';
 import { probeM4b } from '../prober/m4b';
 import { probeOgg } from '../prober/ogg';
+import { probeWebm } from '../prober/webm';
 import { probeMp3, type Mp3Probe } from '../prober/mp3';
 import { deriveSeries } from '../lib/series';
 import { invalidateIdMap } from '../lib/ids';
@@ -177,7 +178,7 @@ async function collectAudioFiles(adapter: Awaited<ReturnType<typeof getAdapter>>
     const entries = await adapter.listFolder(cur);
     for (const e of entries) {
       if (e.isDir) queue.push(e.relPath);
-      else if (/\.(m4b|m4a|aac|mp3|opus|ogg)$/i.test(e.relPath)) out.push(e);
+      else if (/\.(m4b|m4a|aac|mp3|opus|ogg|webm)$/i.test(e.relPath)) out.push(e);
     }
   }
   return out;
@@ -201,11 +202,22 @@ async function probeBook(args: SingleFileArgs): Promise<'added' | 'skipped'> {
       itemRel: args.itemRel, files: [args.file],
     });
   }
-  if (isOgg(args.file.relPath)) return probeOggBook(args);
+  if (isOgg(args.file.relPath) || isWebm(args.file.relPath)) return probeOggBook(args);
   return probeM4bBook(args);
 }
 
 export const isOgg = (path: string): boolean => /\.(opus|ogg)$/i.test(path);
+export const isWebm = (path: string): boolean => /\.webm$/i.test(path);
+
+// The same Opus stream reaches us in two containers: .opus (Ogg) and the
+// .webm remux. Ogg has no seek index, so WebKit walks its pages forward from
+// byte 0 to find the headers — ~40 Range requests and 17 s on a 254 MB book
+// before playback starts (2026-09-07 crash log). WebM puts Info/Tracks/Tags/
+// Chapters in the first few KB, so the same file starts in one read. Both
+// probers return the same shape, so everything downstream is common.
+function probeOpusContainer(path: string, url: string, headers?: Record<string, string>) {
+  return isWebm(path) ? probeWebm(url, headers) : probeOgg(url, headers);
+}
 
 // Single-file Opus/Vorbis book (the 2026-09-02 Percy Jackson grab was five
 // of these and none showed up: the scanner only knew m4b/m4a/aac/mp3).
@@ -214,10 +226,10 @@ export const isOgg = (path: string): boolean => /\.(opus|ogg)$/i.test(path);
 async function probeOggBook(args: SingleFileArgs): Promise<'added' | 'skipped'> {
   const { env, adapter, folder, file, itemRel } = args;
   const probeUrl = await adapter.resolveProbeUrl(file.relPath, file.providerId ?? null);
-  const probe = await probeOgg(probeUrl.url, probeUrl.headers);
+  const probe = await probeOpusContainer(file.relPath, probeUrl.url, probeUrl.headers);
 
   const filename = file.relPath.split('/').pop() ?? file.relPath;
-  const title = probe.tags['TITLE'] ?? probe.tags['ALBUM'] ?? filename.replace(/\.(opus|ogg)$/i, '');
+  const title = probe.tags['TITLE'] ?? probe.tags['ALBUM'] ?? filename.replace(/\.(opus|ogg|webm)$/i, '');
   const author = probe.tags['ARTIST'] ?? probe.tags['ALBUMARTIST'] ?? probe.tags['AUTHOR'] ?? null;
   const album = probe.tags['ALBUM'] ?? null;
   // ffmpeg maps an m4b's ©wrt (narrator) to COMPOSER when it converts.
@@ -243,7 +255,11 @@ async function probeOggBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
       `INSERT INTO chapters (library_item_id, chapter_index, title, start_seconds, end_seconds) VALUES (?, ?, ?, ?, ?)`,
     ).bind(itemId, i, ch.title, ch.start, next ? next.start : totalDuration);
   });
-  const mime = probe.codec === 'opus' ? 'audio/ogg; codecs=opus' : 'audio/ogg';
+  const isWebmFile = isWebm(file.relPath);
+  const format = isWebmFile ? 'webm' : 'ogg';
+  const mime = isWebmFile
+    ? 'audio/webm'
+    : (probe.codec === 'opus' ? 'audio/ogg; codecs=opus' : 'audio/ogg');
 
   await env.DB.batch([
     env.DB.prepare(
@@ -263,10 +279,10 @@ async function probeOggBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
          (id, library_item_id, tenant_id, index_no, filedn_url, ino, duration_seconds, size_bytes,
           mime_type, format, codec, bitrate, sample_rate, channels, added_at,
           rel_path, provider_file_id, moov_offset, moov_size)
-       VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 'ogg', ?, NULL, ?, ?, ?, ?, ?, NULL, NULL)`,
+       VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, NULL)`,
     ).bind(
       audioId, itemId, folder.tenant_id, stableUrl, audioIno, totalDuration,
-      file.sizeBytes ?? probe.sizeBytes ?? 0, mime, probe.codec, probe.sampleRate, probe.channels, now,
+      file.sizeBytes ?? probe.sizeBytes ?? 0, mime, format, probe.codec, probe.sampleRate, probe.channels, now,
       file.relPath, file.providerId ?? null,
     ),
     ...chapterInserts,
@@ -566,7 +582,7 @@ export async function reprobeItem(env: Env, itemId: string, tenantId: string): P
   if (audio.format === 'mp3' || /\.mp3$/i.test(audio.rel_path ?? '')) {
     return reprobeMp3Item(env, adapter, itemId, item.rel_path);
   }
-  if (audio.format === 'ogg' || isOgg(audio.rel_path ?? '')) {
+  if (audio.format === 'ogg' || audio.format === 'webm' || isOgg(audio.rel_path ?? '') || isWebm(audio.rel_path ?? '')) {
     return reprobeOggItem(env, adapter, itemId, item.rel_path, audio);
   }
   const probeUrl = audio.rel_path
@@ -705,7 +721,7 @@ async function reprobeOggItem(
   const probeUrl = audio.rel_path
     ? await adapter.resolveProbeUrl(audio.rel_path, audio.provider_file_id)
     : { url: audio.filedn_url };
-  const probe = await probeOgg(probeUrl.url, probeUrl.headers);
+  const probe = await probeOpusContainer(audio.rel_path ?? '', probeUrl.url, probeUrl.headers);
   const totalDuration = probe.durationSeconds ?? audio.duration_seconds ?? 0;
   const stmts: D1PreparedStatement[] = [env.DB.prepare('DELETE FROM chapters WHERE library_item_id = ?').bind(itemId)];
   const meta = await env.DB.prepare(

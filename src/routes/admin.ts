@@ -706,7 +706,7 @@ adminRoutes.post('/storage/folder/:folderId/upload/save', requireCanAdd, async (
   let itemId: string | undefined;
   let registerError: string | undefined;
   let alreadyInLibrary = false;
-  if (registerAsBook && /\.(m4b|m4a|aac|opus|ogg)$/i.test(relPath)) {
+  if (registerAsBook && /\.(m4b|m4a|aac|opus|ogg|webm)$/i.test(relPath)) {
     try {
       // Pass through size from pCloud's upload_save response so audio_files
       // gets a real size_bytes on first insert (without this, single-file
@@ -924,7 +924,7 @@ adminRoutes.post('/storage/folder/:folderId/fetch-url/finish', requireCanAdd, as
   let itemId: string | undefined;
   let registerError: string | undefined;
   let alreadyInLibrary = false;
-  if (registerAsBook && /\.(m4b|m4a|aac|opus|ogg)$/i.test(relPath)) {
+  if (registerAsBook && /\.(m4b|m4a|aac|opus|ogg|webm)$/i.test(relPath)) {
     try {
       const hints: { sizeBytes?: number } = {};
       if (meta.size != null) hints.sizeBytes = meta.size;

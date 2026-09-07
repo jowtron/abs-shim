@@ -63,8 +63,9 @@ export class ListingNotSupportedError extends Error {
 // opus/ogg via src/prober/ogg.ts (2026-09-02 — this list is what the pCloud
 // walk filters on, so a prober without an entry here is never reached: the
 // first Opus books sat on pCloud invisible to Scan for exactly that reason).
-// webm/flac arrive when probers for them land.
-export const AUDIOBOOK_EXTENSIONS = ['m4b', 'm4a', 'aac', 'mp3', 'opus', 'ogg'] as const;
+// webm is Opus in a seekable container via src/prober/webm.ts (2026-09-07).
+// flac arrives when a prober for it lands.
+export const AUDIOBOOK_EXTENSIONS = ['m4b', 'm4a', 'aac', 'mp3', 'opus', 'ogg', 'webm'] as const;
 
 export function isAudiobookFile(name: string): boolean {
   const dot = name.lastIndexOf('.');

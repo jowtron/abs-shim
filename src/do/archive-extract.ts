@@ -65,8 +65,8 @@ export type ExtractJobStatus = Omit<Job, 'profile' | 'entries'> & {
   entries: Array<Omit<EntryState, 'zip'>>;
 };
 
-const AUDIO_RE = /\.(m4b|m4a|aac|mp3|opus|ogg|oga|flac)$/i;
-const KEEP_RE = /\.(m4b|m4a|aac|mp3|opus|ogg|oga|flac|jpe?g|png)$/i;
+const AUDIO_RE = /\.(m4b|m4a|aac|mp3|opus|ogg|oga|webm|flac)$/i;
+const KEEP_RE = /\.(m4b|m4a|aac|mp3|opus|ogg|oga|webm|flac|jpe?g|png)$/i;
 const REGISTER_RE = /\.(m4b|m4a|aac)$/i;
 const CHUNK = 16 * 1024 * 1024;
 // If an alarm invocation dies without returning (CPU/memory kill), this
