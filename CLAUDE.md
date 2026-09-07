@@ -93,7 +93,7 @@ A real cutover needs a genuine multi-entry Cues index (one per cluster ≈ 7,210
 
 The cover does not survive the remux (an Ogg METADATA_BLOCK_PICTURE is not carried into a Matroska attachment by `-c:a copy`), which is harmless: covers live in R2 under the item id.
 
-When flipping a container: purge the R2 byte-cache chunks for that `audio_files.id` (`audio/<tenant>/<audio id>/<n>`) **before and after** the D1 update, or `tryServeByteRange` stitches old-container bytes into the new file's ranges, and give the row a fresh random `ino` — that is the URL segment clients cache under, so changing it strands any stale offline copy instead of mixing containers on the device. `provider_file_id` can go NULL; the pCloud adapter falls back to the absolute path. Note `getStreamingTarget` falls back to the first audio file for an unknown ino, so an old URL keeps answering 200 with the *new* bytes.
+When flipping a container: purge the R2 byte-cache chunks for that `audio_files.id` (`audio/<tenant>/<audio id>/<n>`) with `scripts/purge-audio-chunks.py` **before and after** the D1 update, or `tryServeByteRange` stitches old-container bytes into the new file's ranges, and give the row a fresh random `ino` — that is the URL segment clients cache under, so changing it strands any stale offline copy instead of mixing containers on the device. `provider_file_id` can go NULL; the pCloud adapter falls back to the absolute path. Note `getStreamingTarget` falls back to the first audio file for an unknown ino, so an old URL keeps answering 200 with the *new* bytes.
 
 **WebM probing** (`src/prober/webm.ts`, kept — it is correct and verified in production): pure-JS EBML walker for duration (Info/Duration × TimecodeScale), tags, chapters (ChapterAtom, ns), cover (Attachments) and codec/channels/rate, in one 256 KB head read that grows to 8 MB. Returns the Ogg prober's shape, so `probeOpusContainer()` picks by extension. A live re-probe of the remuxed book returned all 24 chapters and the right duration. `.webm` is in `AUDIOBOOK_EXTENSIONS`, the scanner walk filter, the reprobe dispatch and the register-as-book gates.
 
@@ -193,7 +193,15 @@ Migrations in `migrations/`. Initial schema (0001) plus storage additions (0002)
 - **Author images and biographies come from Audnexus** (`src/lib/audnexus.ts`,
   migration 0014 `author_meta`). The name search is loose, so a candidate
   must equal the requested name once case, punctuation and accents are
-  ignored. Lookups run in the background, four per authors-listing request,
+  ignored. **That guard is load-bearing, not tidiness**: Audnexus never
+  answers "not found" — it returns a confident, well-formed record for a
+  different human. Verified 2026-09-07: `?name=Yakov%20Rabkin` returns only
+  `William Rabkin`, and `?name=William%20Rabkin` also returns
+  `William Carlos Williams`. Without the equality check the shim would
+  publish a sourced-looking bio and photo of the wrong person. The hole it
+  cannot close is two real people sharing one name — no name comparison can.
+  A "wrong author, clear this" button in /admin (clearing `author_meta` and
+  recording a miss) was offered to Joseph on 2026-09-07 and not yet built. Lookups run in the background, four per authors-listing request,
   and synchronously when one author is opened; a miss is remembered for 30
   days, a network failure for an hour. `/api/authors/:id/image` is
   edge → R2 (`authors/<id>`) → fetch-from-Audnexus → placeholder, and the
