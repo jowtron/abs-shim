@@ -398,6 +398,16 @@ npx wrangler secret put PCLOUD_CLIENT_SECRET</pre>
     </div>
   </div>
 
+  <div id="r2-usage-card" class="card" style="display:none">
+    <h2>R2 usage</h2>
+    <p class="muted">What the covers bucket holds (instance owner only): book + catalogue covers, author images, the moov cache and the streamed-byte cache. Counted by walking the bucket listing, so Refresh takes a moment; R2's free tier is 10 GB. The Audible staging bucket isn't counted — it's emptied after each sync.</p>
+    <div id="r2-usage-body" class="muted">Loading…</div>
+    <div class="row" style="margin-top:0.5rem">
+      <button id="r2-usage-refresh" class="secondary">Refresh</button>
+      <span id="r2-usage-status" class="muted"></span>
+    </div>
+  </div>
+
   <div id="household-card" class="card" style="display:none">
     <h2>Library members</h2>
     <p class="muted">Everyone here shares the same libraries but keeps their own progress, bookmarks, and finished books.</p>
@@ -462,6 +472,7 @@ function showLoginForm() {
   document.getElementById('connections-card').style.display = 'none';
   document.getElementById('libraries-card').style.display = 'none';
   document.getElementById('cover-cache-card').style.display = 'none';
+  document.getElementById('r2-usage-card').style.display = 'none';
   document.getElementById('members-card').style.display = 'none';
   document.getElementById('all-users-card').style.display = 'none';
   document.getElementById('household-card').style.display = 'none';
@@ -776,6 +787,7 @@ async function refresh() {
   renderAbb(status, libs.libraries || []);
   renderHousehold(status);
   renderMembers(status);
+  renderR2Usage(status);
 
   // If we landed here from a successful OAuth callback, surface the freshly
   // created profile so the user can attach it without remembering its id.
@@ -3365,6 +3377,72 @@ async function runReprobe(libId, btn, onlyMissing, label) {
     btn.disabled = false;
     btn.textContent = label;
   }
+}
+
+// ─── R2 usage (instance owner) ──────────────────────────────────────────────
+// One bucket, bucketed by top-level prefix. The route walks the bucket listing
+// in bounded slices (Free-plan subrequest cap), so while it answers
+// {scanning:true} each poll advances the walk — poll promptly, not lazily.
+
+const R2_PREFIX_LABELS = {
+  covers: 'Book covers',
+  abbcovers: 'Catalogue covers',
+  authors: 'Author images',
+  moov: 'moov cache',
+  audio: 'Streamed-byte cache',
+};
+
+function renderR2Usage(status) {
+  const card = document.getElementById('r2-usage-card');
+  if (!status.isInstanceOwner) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const btn = document.getElementById('r2-usage-refresh');
+  if (!btn.dataset.wired) {
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', () => loadR2Usage(true));
+  }
+  loadR2Usage(false);
+}
+
+async function loadR2Usage(refresh) {
+  if (window.__r2UsageLoading) return; // refresh() re-runs after OAuth callbacks; one poll loop is plenty
+  window.__r2UsageLoading = true;
+  const body = document.getElementById('r2-usage-body');
+  const note = document.getElementById('r2-usage-status');
+  const btn = document.getElementById('r2-usage-refresh');
+  btn.disabled = true;
+  try {
+    let res = await api('/api/admin/storage/r2-usage' + (refresh ? '?refresh=1' : ''));
+    while (res.scanning) {
+      note.textContent = 'Counting… ' + (res.objectsSoFar || 0).toLocaleString() + ' objects so far';
+      if (res.stale) renderR2UsageTable(body, res.stale, true);
+      await new Promise((r) => setTimeout(r, 500));
+      res = await api('/api/admin/storage/r2-usage');
+    }
+    note.textContent = '';
+    renderR2UsageTable(body, res, false);
+  } catch (err) {
+    if (err instanceof UnauthorizedError) return; // api() already switched to the login form
+    note.textContent = 'Failed: ' + err.message;
+  } finally {
+    btn.disabled = false;
+    window.__r2UsageLoading = false;
+  }
+}
+
+function renderR2UsageTable(el, u, stale) {
+  const prefixes = u.prefixes || {};
+  const names = Object.keys(prefixes).sort((a, b) => prefixes[b].bytes - prefixes[a].bytes);
+  let html = '<table><thead><tr><th>What</th><th>Objects</th><th>Size</th></tr></thead><tbody>';
+  for (const n of names) {
+    const e = prefixes[n];
+    html += '<tr><td>' + escapeHtml(R2_PREFIX_LABELS[n] || n) + '</td><td>' + e.count.toLocaleString() + '</td><td>' + formatBytes(e.bytes) + '</td></tr>';
+  }
+  html += '<tr><td><strong>Total</strong></td><td><strong>' + (u.totalCount || 0).toLocaleString() + '</strong></td><td><strong>' + formatBytes(u.totalBytes || 0) + '</strong></td></tr>';
+  html += '</tbody></table>';
+  html += '<p class="muted" style="margin-bottom:0">' + (stale ? 'Previous count, refreshing as of ' : 'Counted ') + escapeHtml(new Date(u.scannedAt).toLocaleString()) + '</p>';
+  el.classList.remove('muted');
+  el.innerHTML = html;
 }
 
 function formatBytes(n) {

@@ -22,7 +22,7 @@ import { isAudiobookFile, type RemoteEntry } from '../storage/adapter';
 import { storageLabelText } from '../lib/storage-label';
 import { findCatalogCover, purgeCoverCache } from '../lib/cover-from-catalog';
 import { redactSecrets, safeJson } from '../lib/redact';
-import { getSignupMode, setSetting, membersCanAdd, setTenantSetting, MEMBERS_CAN_ADD_KEY } from '../db/settings';
+import { getSignupMode, getSetting, setSetting, membersCanAdd, setTenantSetting, MEMBERS_CAN_ADD_KEY } from '../db/settings';
 import { createInvite, listOpenInvites, deleteInvite } from '../db/invites';
 import { listTenantMembers, removeMember } from '../db/tenants';
 
@@ -179,6 +179,69 @@ adminRoutes.post('/tenant/settings', requireTenantOwner, async (c) => {
     await setTenantSetting(c.env, c.get('tenantId'), MEMBERS_CAN_ADD_KEY, body['membersCanAdd'] ? '1' : '0');
   }
   return c.json({ ok: true, membersCanAdd: await membersCanAdd(c.env, c.get('tenantId')) });
+});
+
+// ─── R2 usage (instance owner) ──────────────────────────────────────────────
+//
+// How much the COVERS bucket holds, broken down by top-level prefix (covers/,
+// abbcovers/, moov/, audio/, authors/). R2 has no "bucket size" API from a
+// Worker binding, so this walks the listing and sums sizes — but a Free-plan
+// Worker gets 50 subrequests per request, so one call advances at most
+// R2_USAGE_PAGES_PER_CALL list pages (1000 objects each) and parks its cursor
+// in server_settings when it runs out; the UI polls until scanning is false.
+// The finished answer is cached until Refresh is pressed, so opening /admin
+// costs one D1 read, not a bucket walk.
+const R2_USAGE_PAGES_PER_CALL = 20;
+const R2_USAGE_KEY = 'r2_usage';
+const R2_USAGE_SCAN_KEY = 'r2_usage_scan';
+
+type R2UsageTotals = Record<string, { count: number; bytes: number }>;
+interface R2UsageScan { cursor?: string; prefixes: R2UsageTotals; objects: number; startedAt: number }
+
+adminRoutes.get('/storage/r2-usage', requireInstanceOwner, async (c) => {
+  const refresh = c.req.query('refresh') === '1';
+  const cachedRaw = await getSetting(c.env, R2_USAGE_KEY);
+  let scan: R2UsageScan | null = null;
+  if (!refresh) {
+    const raw = await getSetting(c.env, R2_USAGE_SCAN_KEY);
+    if (raw) scan = JSON.parse(raw) as R2UsageScan | null;
+    if (!scan && cachedRaw) return c.json({ ...JSON.parse(cachedRaw), scanning: false });
+  }
+  if (!scan) scan = { prefixes: {}, objects: 0, startedAt: Date.now() };
+
+  let cursor = scan.cursor;
+  let truncated = true;
+  for (let page = 0; truncated && page < R2_USAGE_PAGES_PER_CALL; page++) {
+    const res = await c.env.COVERS.list(cursor ? { limit: 1000, cursor } : { limit: 1000 });
+    for (const o of res.objects) {
+      const slash = o.key.indexOf('/');
+      const prefix = slash > 0 ? o.key.slice(0, slash) : '(root)';
+      const entry = scan.prefixes[prefix] ?? (scan.prefixes[prefix] = { count: 0, bytes: 0 });
+      entry.count += 1;
+      entry.bytes += o.size;
+    }
+    scan.objects += res.objects.length;
+    truncated = res.truncated;
+    cursor = res.truncated ? res.cursor : undefined;
+  }
+
+  if (truncated && cursor) {
+    scan.cursor = cursor;
+    await setSetting(c.env, R2_USAGE_SCAN_KEY, JSON.stringify(scan));
+    return c.json({
+      scanning: true,
+      objectsSoFar: scan.objects,
+      ...(cachedRaw ? { stale: JSON.parse(cachedRaw) } : {}),
+    });
+  }
+
+  let totalCount = 0;
+  let totalBytes = 0;
+  for (const e of Object.values(scan.prefixes)) { totalCount += e.count; totalBytes += e.bytes; }
+  const result = { prefixes: scan.prefixes, totalCount, totalBytes, scannedAt: Date.now() };
+  await setSetting(c.env, R2_USAGE_KEY, JSON.stringify(result));
+  await setSetting(c.env, R2_USAGE_SCAN_KEY, ''); // '' = no scan in progress (getSetting ?? and !raw both treat it as absent)
+  return c.json({ ...result, scanning: false });
 });
 
 // Browse a storage backend before attaching it, so "which folder?" is a list
