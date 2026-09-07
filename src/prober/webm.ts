@@ -9,13 +9,22 @@
 // `-c:a copy` (the Opus packets are untouched; only the wrapper changed), the
 // same fix the StoryTeller site landed on for the same reason.
 //
-// What actually wins is header LOCALITY, not the seek index: ffmpeg's matroska
-// muxer writes SeekHead, Info, Tracks, Chapters and Tags in the first few KB,
-// before the first Cluster, so one read answers everything. Do NOT expect a
-// real Cues index — for an audio-only file ffmpeg writes a single CuePoint at
-// t=0 (18 bytes for a 7,210-cluster book, verified 2026-09-07), so players
-// still seek by byte estimation exactly as they did with Ogg. That was already
-// working; startup was the broken part.
+// What wins is header LOCALITY: ffmpeg's matroska muxer writes SeekHead, Info,
+// Tracks, Chapters and Tags in the first few KB, so one read answers
+// everything and `loadedmetadata` arrives in ~1.3 s instead of 17 s.
+//
+// That was NOT enough, and the library was reverted to .opus the same day.
+// ffmpeg writes no real Cues index for an audio-only file — a single CuePoint
+// at t=0, 18 bytes for a 7,210-cluster book — and WebKit CANNOT seek a
+// Matroska stream without Cues. The resume seek was silently clamped to 0
+// (`seeking` → `seeked`, currentTime 0), after which WebKit dropped Range
+// requests entirely and streamed the whole file from byte 0 until it failed
+// with MediaError 2. Byte-estimated seeking is an *Ogg demuxer* behaviour;
+// there is no Matroska equivalent. A future cutover needs a real per-cluster
+// Cues element written ahead of the clusters (WebKit never read the tail).
+//
+// This prober is kept and is correct — verified in production against the
+// remuxed book (24 chapters, exact duration).
 
 export type WebmProbe = {
   codec: 'opus' | 'vorbis' | 'unknown';
