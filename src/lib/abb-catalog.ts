@@ -831,7 +831,10 @@ export async function detailClaim(env: Env, node: string, limit: number): Promis
          ORDER BY posted_ts ASC, id ASC LIMIT ?)
       RETURNING id, url, title`,
   ).bind(node, now + CLAIM_LEASE_MS, now, n).all<DetailClaim>();
-  if (rows.results.length) await bumpNode(env, node, { claimed: rows.results.length });
+  // Bump even on an empty claim: bumpNode stamps lastSeen, and once the
+  // backfill is done an idle-but-healthy node otherwise drifts to a red
+  // liveness dot in /admin (both nodes, 2026-09-12).
+  await bumpNode(env, node, rows.results.length ? { claimed: rows.results.length } : {});
   return rows.results;
 }
 

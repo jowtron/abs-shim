@@ -40,6 +40,7 @@ import io
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -140,6 +141,37 @@ def is_dns_failure(e):
     """A name that didn't resolve, as opposed to a host that didn't answer."""
     reason = getattr(e, "reason", e)
     return isinstance(reason, socket.gaierror) or isinstance(e, socket.gaierror)
+
+
+# gaierror codes that mean the NAME is broken, not the resolver: EAI_NONAME
+# (NXDOMAIN — the dead audiobb.unblockit.* mirrors) and EAI_NODATA (the name
+# exists but has no address). EAI_AGAIN is deliberately NOT here: that is what
+# glibc returns for SERVFAIL, i.e. the MagicDNS bursts that must stay
+# transient (see the comment in fetch_image).
+_PERMANENT_GAI = {socket.EAI_NONAME, getattr(socket, "EAI_NODATA", -5)}
+
+
+def permanent_network_reason(e):
+    """A network failure no retry will ever fix, as a message — or None.
+
+    Extends the 2026-09-03 failure-class rule ("the host answering, or the
+    bytes not decoding, is permanent") to two cases that jammed the runner on
+    2026-09-12: by then the head of the newest-first pending queue was ~60
+    covers on hosts that are structurally gone, every batch skipped 60/60,
+    and the pass concluded "network unavailable" forever.
+      - NXDOMAIN/no-address after fetch_image's own retries: the domain is
+        dead, not the resolver (SERVFAIL comes back as EAI_AGAIN, not here).
+      - TLS handshake failure: the host answered TCP; its TLS is broken for
+        urllib and will be tomorrow too (blacklibrary.com answers curl but
+        fails urllib the same way every pass).
+    "Retry cover errors" in /admin is the undo if a host comes back.
+    """
+    reason = getattr(e, "reason", e)
+    if isinstance(reason, ssl.SSLError):
+        return "SSL: " + str(getattr(reason, "reason", None) or reason)[:80]
+    if isinstance(reason, socket.gaierror) and reason.errno in _PERMANENT_GAI:
+        return "DNS: " + str(reason)[:80]
+    return None
 
 
 def fetch_image(url, attempts=3):
@@ -263,7 +295,14 @@ def one_pass(sess, args, quality, limit):
                 # "Retry cover errors" in /admin puts them all back if a host
                 # comes good.
                 return mark(p, f"HTTP {e.code}")
+            except ValueError as e:
+                # urlopen rejected the URL itself (one post's "cover" is a
+                # bare filename) — no network involved, never fetchable.
+                return mark(p, "bad url: " + str(e)[:60])
             except (urllib.error.URLError, TimeoutError, OSError) as e:
+                perm = permanent_network_reason(e)
+                if perm:
+                    return mark(p, perm)
                 # No answer at all — our network, or the host being down. Worth
                 # another pass, so leave it pending.
                 return None, str(e)[:180]
