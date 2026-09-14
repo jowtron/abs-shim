@@ -279,6 +279,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
         <button class="secondary" data-catalog="resume" style="display:none">Resume</button>
         <button class="secondary" data-catalog="retry-errors" title="Re-queue posts whose detail page failed (timeout, 500). Posts ABB publishes no hash for will fail again.">Retry errors</button>
         <button class="secondary" data-catalog="retry-cover-errors" title="Re-queue covers whose image host answered 403/404/523">Retry cover errors</button>
+        <button class="secondary" data-catalog="clear-parser-alarms" title="Reset the markup-drift tally once the alarms have been explained — it is a lifetime count, so old ones never age out on their own">Clear parser alarms</button>
         <button class="secondary" data-catalog="restart-backfill" data-confirm="Re-walk every listing from page 1? Cached posts are kept and refreshed.">Restart backfill</button>
         <button class="secondary" data-catalog="clear-backoff" style="display:none">Clear backoff</button>
         <button class="secondary" data-catalog="send-report" title="Sends the check-in push now, as a test">Send report now</button>

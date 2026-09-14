@@ -270,7 +270,7 @@ def one_pass(sess, args, quality, limit):
         def mark(p, msg):
             """Record a permanent failure so the shim stops handing it back."""
             try:
-                sess.call(f"/api/admin/abb/catalog/covers/{p['id']}/error", "POST", {"error": msg})
+                sess.call(f"/api/admin/abb/catalog/covers/{p['id']}/error{node_qs(args)}", "POST", {"error": msg})
             except Exception:  # noqa: BLE001
                 pass
             return False, msg
@@ -295,6 +295,16 @@ def one_pass(sess, args, quality, limit):
                 # "Retry cover errors" in /admin puts them all back if a host
                 # comes good.
                 return mark(p, f"HTTP {e.code}")
+            except RuntimeError as e:
+                # fetch_image raises this for a non-200 status and for a body
+                # too short to be an image. Both mean the host answered with
+                # something unusable — permanent by the same rule as an
+                # HTTPError. It is caught HERE because RuntimeError is not an
+                # OSError, so before 2026-09-14 it escaped work() entirely,
+                # propagated through fut.result() and aborted the whole pass:
+                # stereo-nz was logging "pass error: HTTP 202" and then idling
+                # 15 min to the next pass, while holding the larger shard.
+                return mark(p, str(e)[:60])
             except ValueError as e:
                 # urlopen rejected the URL itself (one post's "cover" is a
                 # bare filename) — no network involved, never fetchable.

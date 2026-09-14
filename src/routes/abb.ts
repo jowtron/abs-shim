@@ -7,7 +7,7 @@ import {
   catalogSearch, catalogBrowse, catalogFacets, catalogGet, rowToDetails, catalogRecordHash, catalogRecordDetails,
   upsertPosts, runCatalogTick, catalogStatus, catalogControl, sendReportNow, type CatalogAction,
   withCoverUrls, coversPending, coverStore, coverFailed, coverStats,
-  detailClaim, detailSubmit, noteCoverStored, type DetailSubmission,
+  detailClaim, detailSubmit, noteCoverStored, noteCoverFailed, type DetailSubmission,
 } from '../lib/abb-catalog';
 import { sealSecret, openSecret, secretsConfigured } from '../lib/secret-box';
 import {
@@ -306,6 +306,8 @@ abbRoutes.post('/catalog/covers/:id/error', async (c) => {
   const body = await c.req.json().catch(() => ({})) as { error?: string };
   if (!Number.isInteger(id)) return c.json({ error: 'bad id' }, 400);
   await coverFailed(c.env, id, String(body.error ?? 'unknown'));
+  const node = (c.req.query('node') ?? '').trim().slice(0, 40);
+  if (node) c.executionCtx.waitUntil(noteCoverFailed(c.env, node).catch(() => undefined));
   return c.json({ ok: true });
 });
 
@@ -329,7 +331,7 @@ abbRoutes.post('/catalog/control', async (c) => {
     await sendReportNow(c.env);
     return c.json({ ok: true });
   }
-  const allowed: CatalogAction[] = ['pause', 'resume', 'retry-errors', 'retry-cover-errors', 'restart-backfill', 'reset-report', 'set-budget', 'clear-backoff'];
+  const allowed: CatalogAction[] = ['pause', 'resume', 'retry-errors', 'retry-cover-errors', 'restart-backfill', 'reset-report', 'set-budget', 'clear-backoff', 'clear-parser-alarms'];
   if (!allowed.includes(action as CatalogAction)) return c.json({ error: 'unknown action' }, 400);
   const message = await catalogControl(c.env, action as CatalogAction, typeof body.value === 'number' ? body.value : undefined);
   return c.json({ ok: true, message });

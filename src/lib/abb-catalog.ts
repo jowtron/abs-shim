@@ -258,12 +258,27 @@ export const ABB_COVER_PREFIX = 'abbcovers/';
 export async function coversPending(env: Env, limit: number, shard = 0, shards = 1): Promise<Array<{ id: number; url: string; title: string }>> {
   const n = Math.min(Math.max(Math.round(shards) || 1, 1), 16);
   const i = Math.min(Math.max(Math.round(shard) || 0, 0), n - 1);
+  const cap = Math.min(Math.max(limit, 1), 1000);
   const rows = await env.DB.prepare(
     `SELECT id, cover AS url, title FROM abb_posts WHERE cover IS NOT NULL AND cover_r2 IS NULL AND cover_error IS NULL
        AND (? = 1 OR id % ? = ?)
        ORDER BY posted_ts DESC, id DESC LIMIT ?`,
-  ).bind(n, n, i, Math.min(Math.max(limit, 1), 1000)).all<{ id: number; url: string; title: string }>();
-  return rows.results;
+  ).bind(n, n, i, cap).all<{ id: number; url: string; title: string }>();
+  if (rows.results.length || n === 1) return rows.results;
+
+  // This shard is drained — help the others instead of idling. A fixed
+  // partition splits the backlog evenly by id but NOT by how fast each half
+  // fetches, so one node finishes first: on 2026-09-14 wharf-syd-1 (odd ids)
+  // was down to 27 rows, all on hosts that time out, while stereo-nz still
+  // had ~6,600. There is deliberately no lease here (a duplicate PUT only
+  // wastes a download), so a helper just takes from the same pool — but from
+  // the OLDEST end, so two runners converge on the middle instead of racing
+  // over the same head-of-queue rows.
+  const helper = await env.DB.prepare(
+    `SELECT id, cover AS url, title FROM abb_posts WHERE cover IS NOT NULL AND cover_r2 IS NULL AND cover_error IS NULL
+       ORDER BY posted_ts ASC, id ASC LIMIT ?`,
+  ).bind(cap).all<{ id: number; url: string; title: string }>();
+  return helper.results;
 }
 
 export async function coverStore(env: Env, id: number, webp: ArrayBuffer): Promise<boolean> {
@@ -707,7 +722,7 @@ export async function catalogStatus(env: Env): Promise<{
   };
 }
 
-export type CatalogAction = 'pause' | 'resume' | 'retry-errors' | 'retry-cover-errors' | 'restart-backfill' | 'reset-report' | 'set-budget' | 'clear-backoff';
+export type CatalogAction = 'pause' | 'resume' | 'retry-errors' | 'retry-cover-errors' | 'restart-backfill' | 'reset-report' | 'set-budget' | 'clear-backoff' | 'clear-parser-alarms';
 
 // Returns a sentence for the UI. "Retry errors" used to answer with a bare
 // {ok:true} and no visible change (the queue only moves on the next tick), so
@@ -720,6 +735,17 @@ export async function catalogControl(env: Env, action: CatalogAction, value?: nu
     case 'resume': stats.paused = false; break;
     case 'set-budget': stats.budget = Math.min(Math.max(Math.round(value ?? DEFAULT_BUDGET) || DEFAULT_BUDGET, 1), MAX_BUDGET); break;
     case 'clear-backoff': stats.backoffUntil = null; stats.backoffLevel = 0; break;
+    // zeroParsePages is a lifetime tally and nothing reset it, so /admin kept
+    // warning about markup drift that had already been diagnosed and fixed:
+    // the four alarms standing on 2026-09-14 were all from 2026-09-03, when a
+    // finished listing's empty HTTP 200 still counted as a parse failure. The
+    // counting rule was narrowed that day; this clears the scar it left.
+    case 'clear-parser-alarms': {
+      const n = stats.zeroParsePages;
+      stats.zeroParsePages = 0;
+      said = n ? `Cleared ${n} parser alarm(s). New ones will show if the markup really does drift.` : 'No parser alarms to clear.';
+      break;
+    }
     case 'reset-report': stats.reportSentAt = null; stats.startedAt = Date.now(); break;
     case 'retry-errors': {
       const r = await env.DB.prepare('UPDATE abb_posts SET detail_fetched_at = NULL, detail_error = NULL WHERE detail_error IS NOT NULL').run();
@@ -805,6 +831,13 @@ async function bumpNode(env: Env, node: string, d: Partial<Omit<NodeStat, 'node'
 // themselves are sharded by id, not assigned, so nothing depends on this.
 export async function noteCoverStored(env: Env, node: string): Promise<void> {
   await bumpNode(env, node, { covers: 1 });
+}
+
+// Recording a dead cover is work too, and on a nearly drained shard it is the
+// ONLY work: without this the node row goes unstamped for a whole batch and
+// /admin's liveness dot calls a busy runner stale (2026-09-14).
+export async function noteCoverFailed(env: Env, node: string): Promise<void> {
+  await bumpNode(env, node, {});
 }
 
 export async function listNodes(env: Env): Promise<NodeStat[]> {
