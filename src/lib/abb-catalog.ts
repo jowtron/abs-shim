@@ -264,21 +264,27 @@ export async function coversPending(env: Env, limit: number, shard = 0, shards =
        AND (? = 1 OR id % ? = ?)
        ORDER BY posted_ts DESC, id DESC LIMIT ?`,
   ).bind(n, n, i, cap).all<{ id: number; url: string; title: string }>();
-  if (rows.results.length || n === 1) return rows.results;
+  if (n === 1 || rows.results.length >= cap) return rows.results;
 
-  // This shard is drained — help the others instead of idling. A fixed
-  // partition splits the backlog evenly by id but NOT by how fast each half
-  // fetches, so one node finishes first: on 2026-09-14 wharf-syd-1 (odd ids)
-  // was down to 27 rows, all on hosts that time out, while stereo-nz still
-  // had ~6,600. There is deliberately no lease here (a duplicate PUT only
-  // wastes a download), so a helper just takes from the same pool — but from
-  // the OLDEST end, so two runners converge on the middle instead of racing
-  // over the same head-of-queue rows.
+  // This shard can't fill a batch — top it up from the whole pool instead of
+  // letting the node idle. A fixed partition splits the backlog evenly by id
+  // but NOT by how fast each half fetches, so one node finishes first: on
+  // 2026-09-14 wharf-syd-1 (odd ids) was down to 27 rows while stereo-nz
+  // still held ~6,600. Note the trigger is "couldn't fill the batch", not
+  // "had nothing": those 27 were all hosts that time out and are correctly
+  // left pending, so the shard never actually empties and an
+  // only-when-zero rule would never have fired.
+  //
+  // There is deliberately no lease (a duplicate PUT only wastes a download),
+  // so a helper takes from the OLDEST end and the two runners converge on the
+  // middle rather than racing over the same head of queue.
+  const want = cap - rows.results.length;
   const helper = await env.DB.prepare(
     `SELECT id, cover AS url, title FROM abb_posts WHERE cover IS NOT NULL AND cover_r2 IS NULL AND cover_error IS NULL
        ORDER BY posted_ts ASC, id ASC LIMIT ?`,
-  ).bind(cap).all<{ id: number; url: string; title: string }>();
-  return helper.results;
+  ).bind(Math.min(want + rows.results.length, 1000)).all<{ id: number; url: string; title: string }>();
+  const seen = new Set(rows.results.map((r) => r.id));
+  return rows.results.concat(helper.results.filter((r) => !seen.has(r.id)).slice(0, want));
 }
 
 export async function coverStore(env: Env, id: number, webp: ArrayBuffer): Promise<boolean> {
