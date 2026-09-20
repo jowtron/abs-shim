@@ -212,7 +212,23 @@ Migrations in `migrations/`. Initial schema (0001) plus storage additions (0002)
   `William Carlos Williams`. Without the equality check the shim would
   publish a sourced-looking bio and photo of the wrong person. The hole it
   cannot close is two real people sharing one name — no name comparison can.
-  A "wrong author, clear this" button in /admin (clearing `author_meta` and
+  Since 2026-09-21 that comparison runs through
+  `personNameKey`, which also strips post-nominals, so our "Paul T. Mason"
+  matches their "M.S. Paul T. Mason"; nothing else is loosened, the
+  remaining words must still be identical.
+- **Audnexus keeps several ASINs per author and only some carry the photo**
+  (Rick Riordan's `B0C7WDNTN3` is empty, his `B001HD0WE8` has the picture and
+  a 1,143-character bio). The lookup used to take the first exact-name match,
+  and `needsLookup()` then stopped forever at "has an ASIN", so an author who
+  landed on an empty record never got a picture. It now opens up to 4
+  matching ASINs and keeps the fullest (a picture beats none, then a bio),
+  retries a row that has an ASIN but no picture on the same 30-day clock as a
+  miss, and merges on write so a thin retry can't wipe a photo already held.
+  A changed image URL drops the R2 copy; the edge copy is immutable for 30
+  days and can't be purged from a Worker, which only matters when replacing a
+  photo, not when gaining one. An author still without one (Andrew Child,
+  Jessica Townsend) genuinely has no picture at Audnexus.
+- A "wrong author, clear this" button in /admin (clearing `author_meta` and
   recording a miss) was offered to Joseph on 2026-09-07 and not yet built. Lookups run in the background, four per authors-listing request,
   and synchronously when one author is opened; a miss is remembered for 30
   days, a network failure for an hour. `/api/authors/:id/image` is
@@ -224,3 +240,10 @@ Migrations in `migrations/`. Initial schema (0001) plus storage additions (0002)
   matches `.local/fixtures/login.json` key for key, `userDefaultLibraryId`
   included (real ABS sends `null` too). Whatever they choke on is a later
   request; capture it with `wrangler tail` while logging in.
+
+## Derived ids are hashed from the LIBRARY id (2026-09-21)
+
+Author and series ids are not rows, they are `derivedId(libraryId, 'author'|'series', name)` hashes, and three places reverse them: `/api/authors/:id`, `/api/series/:id` and `resolveItemIdFromUuid` in `src/lib/ids.ts` (which turns an author or series id back into a book so the cover route can answer). **Anything that emits one of these ids must salt it with the library id.** `buildBookMetadataDetail` salted with the *item* id until 2026-09-21, so every author link on a book page answered `{"error":"Author not found"}` 404 while the same author opened fine from the Authors tab, and search had the same bug.
+
+The other half of the rule: an id is a hash of the *name*, so every place that splits an `"A, B & C"` author string has to split it identically. There were five copies of that split and the search route's also broke on `;`, `&` and ` and `. **`src/lib/names.ts` is now the only splitter** (`splitPersonNames`, plus `personNameKey` for third-party matching). It also drops post-nominals, because `"Paul T. Mason, MS, Randi Kreger"` split into three authors and the bogus "MS" got its own id, its own Audnexus miss and its own blank photo in the listing. Jr/Sr/II/III are deliberately kept (they belong to the name), a trailing period is never trimmed (`"Martin Luther King Jr."` must not become a different hash), and a credential only counts when written with periods or in capitals, so the surname in "Yo-Yo Ma" is safe. Don't write another `.split(',')`.
+
