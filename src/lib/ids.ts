@@ -4,6 +4,8 @@
 // tables, but clients still expect stable string ids — so we hash them
 // deterministically from a parent id + a discriminator.
 
+import { splitPersonNames } from './names';
+
 const enc = new TextEncoder();
 
 async function sha256(input: string): Promise<Uint8Array> {
@@ -88,7 +90,7 @@ async function buildMap(db: D1Database): Promise<IdMap> {
 
   for (const row of meta.results) {
     if (row.author_name) {
-      for (const a of row.author_name.split(',').map((s) => s.trim()).filter(Boolean)) {
+      for (const a of splitPersonNames(row.author_name)) {
         const key = `${row.library_id}|author|${a}`;
         if (seenAuthor.has(key)) continue;
         seenAuthor.add(key);

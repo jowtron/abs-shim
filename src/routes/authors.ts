@@ -5,6 +5,7 @@ import {
   listLibraries, listAllBookMetadata,
 } from '../db/library';
 import { derivedId } from '../lib/ids';
+import { splitPersonNames } from '../lib/names';
 import { buildItemDetail } from '../lib/abs-shapes';
 import { buildItemBundle } from './library';
 import { placeholderImage } from '../lib/placeholder';
@@ -75,7 +76,7 @@ authorRoutes.get('/:authorId', async (c) => {
     const itemsByAuthor = new Map<string, string[]>();
     for (const m of metadata) {
       if (!m.author_name) continue;
-      for (const a of m.author_name.split(',').map((s) => s.trim()).filter(Boolean)) {
+      for (const a of splitPersonNames(m.author_name)) {
         const arr = itemsByAuthor.get(a) ?? [];
         arr.push(m.library_item_id);
         itemsByAuthor.set(a, arr);

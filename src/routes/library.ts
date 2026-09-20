@@ -10,6 +10,7 @@ import {
   buildFilterData, buildItemMinified, buildLibrary, buildPersonalizedShelves,
 } from '../lib/abs-shapes';
 import { derivedId } from '../lib/ids';
+import { splitPersonNames } from '../lib/names';
 import { listProgressByUser, progressToAbs, type MediaProgressRow } from '../db/progress';
 import { libraryStats } from '../db/stats';
 import { authorJson, ensureAuthorMeta, getAuthorMetasForLibrary, needsLookup } from '../lib/audnexus';
@@ -204,10 +205,11 @@ libraryRoutes.get('/:id/search', async (c) => {
       matchKey,
       matchText,
     });
-    for (const name of splitList(r.author_name)) {
-      if (has(name) && !authors.has(name)) authors.set(name, await derivedId(item.id, 'author', name));
+    for (const name of splitPersonNames(r.author_name)) {
+      // Salt with the library id, like every other author id (see abs-shapes).
+      if (has(name) && !authors.has(name)) authors.set(name, await derivedId(id, 'author', name));
     }
-    for (const name of splitList(r.narrator_name)) if (has(name)) narrators.add(name);
+    for (const name of splitPersonNames(r.narrator_name)) if (has(name)) narrators.add(name);
     if (has(r.series_name) && r.series_name) seriesNames.add(r.series_name);
   }
 
@@ -223,10 +225,6 @@ libraryRoutes.get('/:id/search', async (c) => {
   });
 });
 
-// Author and narrator columns hold "A, B & C" style lists.
-function splitList(v: string | null): string[] {
-  return (v ?? '').split(/,|;|&| and /i).map((s) => s.trim()).filter(Boolean);
-}
 
 // Authors aggregated across the library's books. Sorted by name.
 // GET /api/libraries/:id/authors. Two response shapes, like real ABS: with
@@ -245,7 +243,7 @@ libraryRoutes.get('/:id/authors', async (c) => {
   const counts = new Map<string, number>();
   for (const m of metadata) {
     if (!m.author_name) continue;
-    for (const a of m.author_name.split(',').map((s) => s.trim()).filter(Boolean)) {
+    for (const a of splitPersonNames(m.author_name)) {
       counts.set(a, (counts.get(a) ?? 0) + 1);
     }
   }

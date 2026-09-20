@@ -7,6 +7,7 @@ import type {
   LibraryItemRow, LibraryRow,
 } from '../db/library';
 import { derivedId } from './ids';
+import { splitPersonNames } from './names';
 import { storageLabel } from './storage-label';
 
 // ─── Library detail ──────────────────────────────────────────────────────────
@@ -94,7 +95,7 @@ export async function buildItemDetail(b: ItemBundle, opts?: { userMediaProgress?
     media: {
       id: mediaId,
       libraryItemId: b.item.id,
-      metadata: await buildBookMetadataDetail(b.item.id, b.metadata),
+      metadata: await buildBookMetadataDetail(b.item.library_id, b.metadata),
       coverPath: b.metadata?.cover_url ?? defaultCoverPath(b.item.id),
       tags: b.metadata ? JSON.parse(b.metadata.tags || '[]') : [],
       audioFiles: await Promise.all(b.audioFiles.map((a) => buildAudioFile(a, b.folder, b.item))),
@@ -123,7 +124,14 @@ export async function buildItemDetail(b: ItemBundle, opts?: { userMediaProgress?
   };
 }
 
-async function buildBookMetadataDetail(itemId: string, m: BookMetadataRow | null) {
+// The author and series ids here MUST be hashed from the library id, not
+// the item id: /api/authors/:id and /api/series/:id reverse the hash by
+// re-deriving every name against the library id, and lib/ids.ts resolves a
+// cover the same way. Salting with the item id (the bug until 2026-09-21)
+// produced ids that matched nothing, so tapping an author on a book page
+// answered "Author not found" 404 while the same author opened fine from
+// the Authors tab.
+async function buildBookMetadataDetail(libraryId: string, m: BookMetadataRow | null) {
   if (!m) {
     return {
       title: null, subtitle: null, authors: [], narrators: [], series: [], genres: [],
@@ -131,13 +139,13 @@ async function buildBookMetadataDetail(itemId: string, m: BookMetadataRow | null
       isbn: null, asin: null, language: null, explicit: false, abridged: false,
     };
   }
-  const authors = await Promise.all(splitNames(m.author_name).map(async (name) => ({
-    id: await derivedId(itemId, 'author', name),
+  const authors = await Promise.all(splitPersonNames(m.author_name).map(async (name) => ({
+    id: await derivedId(libraryId, 'author', name),
     name,
   })));
   const series = m.series_name
     ? [{
-        id: await derivedId(itemId, 'series', m.series_name),
+        id: await derivedId(libraryId, 'series', m.series_name),
         name: m.series_name,
         sequence: m.series_sequence,
       }]
@@ -146,7 +154,7 @@ async function buildBookMetadataDetail(itemId: string, m: BookMetadataRow | null
     title: m.title,
     subtitle: m.subtitle,
     authors,
-    narrators: splitNames(m.narrator_name),
+    narrators: splitPersonNames(m.narrator_name),
     series,
     genres: JSON.parse(m.genres || '[]'),
     // ABS emits publishedYear as a STRING (e.g. "2018"), not a number.
@@ -163,11 +171,6 @@ async function buildBookMetadataDetail(itemId: string, m: BookMetadataRow | null
     explicit: m.explicit === 1,
     abridged: m.abridged === 1,
   };
-}
-
-function splitNames(s: string | null): string[] {
-  if (!s) return [];
-  return s.split(',').map((x) => x.trim()).filter(Boolean);
 }
 
 function synthPath(folder: LibraryFolderRow, item: LibraryItemRow): string {
@@ -415,7 +418,7 @@ export async function buildFilterData(args: {
   const decades = new Set<string>();
 
   for (const m of args.metadata) {
-    for (const a of splitNames(m.author_name)) {
+    for (const a of splitPersonNames(m.author_name)) {
       if (!authorsMap.has(a)) {
         authorsMap.set(a, await derivedId(args.libraryRow.id, 'author', a));
       }
@@ -423,7 +426,7 @@ export async function buildFilterData(args: {
     if (m.series_name && !seriesMap.has(m.series_name)) {
       seriesMap.set(m.series_name, await derivedId(args.libraryRow.id, 'series', m.series_name));
     }
-    for (const n of splitNames(m.narrator_name)) narrators.add(n);
+    for (const n of splitPersonNames(m.narrator_name)) narrators.add(n);
     if (m.language) languages.add(m.language);
     if (m.publisher) publishers.add(m.publisher);
     for (const g of JSON.parse(m.genres || '[]') as string[]) genres.add(g);
@@ -536,7 +539,7 @@ export async function buildPersonalizedShelves(args: {
   // Newest authors: aggregate authors with book counts.
   const authorMap = new Map<string, number>();
   for (const b of args.bundles) {
-    for (const a of splitNames(b.metadata?.author_name ?? null)) {
+    for (const a of splitPersonNames(b.metadata?.author_name ?? null)) {
       authorMap.set(a, (authorMap.get(a) ?? 0) + 1);
     }
   }
