@@ -4,7 +4,7 @@ import { requireAuth, type AuthVars } from '../auth/middleware';
 import {
   countItemsByLibrary, getAudioFiles, getBookMetadata, getChapters,
   getFolderById, getItem, getLibrary, listAllBookMetadata, listFolders,
-  listItemsByLibrary, listLibraries,
+  listItemsByLibrary, listLibraries, loadItemBundles,
 } from '../db/library';
 import {
   buildFilterData, buildItemMinified, buildLibrary, buildPersonalizedShelves,
@@ -53,16 +53,7 @@ libraryRoutes.get('/:id/personalized', async (c) => {
   const items = await listItemsByLibrary(c.env, id, tenantId);
   const t2 = Date.now();
 
-  const bundles = (await Promise.all(items.map(async (item) => {
-    const folder = await getFolderById(c.env, item.folder_id, tenantId);
-    if (!folder) return null;
-    const [metadata, audioFiles, chapters] = await Promise.all([
-      getBookMetadata(c.env, item.id, tenantId),
-      getAudioFiles(c.env, item.id, tenantId),
-      getChapters(c.env, item.id),
-    ]);
-    return { item, folder, metadata, audioFiles, chapters };
-  }))).filter((b): b is NonNullable<typeof b> => b !== null);
+  const bundles = await loadItemBundles(c.env, items, tenantId);
   const t3 = Date.now();
 
   // The caller's book progress feeds the continue-listening shelf and the
@@ -73,7 +64,7 @@ libraryRoutes.get('/:id/personalized', async (c) => {
   const shelves = await buildPersonalizedShelves({ libraryId: id, bundles, progress });
   const t4 = Date.now();
 
-  console.log(`[perf] /personalized lib=${id} items=${items.length} | getLibrary=${t1 - t0}ms listItems=${t2 - t1}ms bundles(N+1)=${t3 - t2}ms shelves=${t4 - t3}ms total=${t4 - t0}ms`);
+  console.log(`[perf] /personalized lib=${id} items=${items.length} | getLibrary=${t1 - t0}ms listItems=${t2 - t1}ms bundles(batched)=${t3 - t2}ms shelves=${t4 - t3}ms total=${t4 - t0}ms`);
   return c.json(shelves);
 });
 
@@ -95,16 +86,9 @@ libraryRoutes.get('/:id/items', async (c) => {
   const items = await listItemsByLibrary(c.env, id, tenantId, { limit, offset, issuesOnly });
   const total = await countItemsByLibrary(c.env, id, tenantId, { issuesOnly });
 
-  const results = await Promise.all(items.map(async (item) => {
-    const folder = await getFolderById(c.env, item.folder_id, tenantId);
-    if (!folder) throw new Error(`folder ${item.folder_id} missing`);
-    const [metadata, audioFiles, chapters] = await Promise.all([
-      getBookMetadata(c.env, item.id, tenantId),
-      getAudioFiles(c.env, item.id, tenantId),
-      getChapters(c.env, item.id),
-    ]);
-    return buildItemMinified({ item, folder, metadata, audioFiles, chapters });
-  }));
+  const bundles = await loadItemBundles(c.env, items, tenantId);
+  if (bundles.length !== items.length) throw new Error('a library item references a missing folder');
+  const results = await Promise.all(bundles.map((b) => buildItemMinified(b)));
 
   return c.json({
     results,
@@ -321,16 +305,7 @@ libraryRoutes.get('/:id/series', async (c) => {
 
   const items = await listItemsByLibrary(c.env, id, tenantId);
   const t1 = Date.now();
-  const bundles = (await Promise.all(items.map(async (item) => {
-    const folder = await getFolderById(c.env, item.folder_id, tenantId);
-    if (!folder) return null;
-    const [metadata, audioFiles, chapters] = await Promise.all([
-      getBookMetadata(c.env, item.id, tenantId),
-      getAudioFiles(c.env, item.id, tenantId),
-      getChapters(c.env, item.id),
-    ]);
-    return { item, folder, metadata, audioFiles, chapters };
-  }))).filter((b): b is NonNullable<typeof b> => b !== null);
+  const bundles = await loadItemBundles(c.env, items, tenantId);
   const t2 = Date.now();
 
   // Group by series_name. A book with no series is excluded entirely.
@@ -389,7 +364,7 @@ libraryRoutes.get('/:id/series', async (c) => {
   const results = limit > 0 ? seriesArr.slice(offset, offset + limit) : seriesArr;
   const t3 = Date.now();
 
-  console.log(`[perf] /series lib=${id} items=${items.length} series=${seriesArr.length} | listItems=${t1 - t0}ms bundles(N+1)=${t2 - t1}ms group+build=${t3 - t2}ms total=${t3 - t0}ms`);
+  console.log(`[perf] /series lib=${id} items=${items.length} series=${seriesArr.length} | listItems=${t1 - t0}ms bundles(batched)=${t2 - t1}ms group+build=${t3 - t2}ms total=${t3 - t0}ms`);
   return c.json({
     results,
     total: seriesArr.length,

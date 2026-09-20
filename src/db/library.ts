@@ -242,3 +242,68 @@ export async function getStreamingTarget(
   if (!audio || !folder) return null;
   return { audio, folder };
 }
+
+// ── Batched bundle loading ────────────────────────────────────────────────
+// /personalized, /series and /items used to fetch each item's folder,
+// metadata, audio files and chapters with four statements per book: 32
+// books = ~130 D1 round trips, 327 ms of a 627 ms /personalized on
+// 2026-09-20, and that endpoint is on Pholia's cold-launch critical path.
+// This loads the same rows for a whole list of items in four statements per
+// chunk. D1 allows 100 bound parameters per statement, hence the chunking.
+const IN_CHUNK = 90;
+
+function chunks<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+async function selectByItemIds<T>(env: Env, sql: (marks: string) => string, ids: string[], extra: unknown[]): Promise<T[]> {
+  const out: T[] = [];
+  for (const part of chunks(ids, IN_CHUNK)) {
+    const marks = part.map(() => '?').join(',');
+    const r = await env.DB.prepare(sql(marks)).bind(...part, ...extra).all<T>();
+    out.push(...r.results);
+  }
+  return out;
+}
+
+export type ItemBundleRows = {
+  item: LibraryItemRow;
+  folder: LibraryFolderRow;
+  metadata: BookMetadataRow | null;
+  audioFiles: AudioFileRow[];
+  chapters: ChapterRow[];
+};
+
+// Items whose folder row is missing (or belongs to another tenant) are
+// dropped, matching what the per-item getFolderById → null path did.
+export async function loadItemBundles(env: Env, items: LibraryItemRow[], tenantId: string): Promise<ItemBundleRows[]> {
+  if (!items.length) return [];
+  const ids = items.map((i) => i.id);
+  const folderIds = Array.from(new Set(items.map((i) => i.folder_id)));
+  const [folders, metas, audio, chaps] = await Promise.all([
+    selectByItemIds<LibraryFolderRow>(env, (m) => `SELECT * FROM library_folders WHERE id IN (${m}) AND tenant_id = ?`, folderIds, [tenantId]),
+    selectByItemIds<BookMetadataRow>(env, (m) => `SELECT * FROM book_metadata WHERE library_item_id IN (${m}) AND tenant_id = ?`, ids, [tenantId]),
+    selectByItemIds<AudioFileRow>(env, (m) => `SELECT * FROM audio_files WHERE library_item_id IN (${m}) AND tenant_id = ? ORDER BY library_item_id, index_no ASC`, ids, [tenantId]),
+    selectByItemIds<ChapterRow>(env, (m) => `SELECT * FROM chapters WHERE library_item_id IN (${m}) ORDER BY library_item_id, chapter_index ASC`, ids, []),
+  ]);
+  const folderById = new Map(folders.map((f) => [f.id, f]));
+  const metaByItem = new Map(metas.map((m) => [m.library_item_id, m]));
+  const audioByItem = new Map<string, AudioFileRow[]>();
+  for (const a of audio) (audioByItem.get(a.library_item_id) ?? audioByItem.set(a.library_item_id, []).get(a.library_item_id)!).push(a);
+  const chapByItem = new Map<string, ChapterRow[]>();
+  for (const ch of chaps) (chapByItem.get(ch.library_item_id) ?? chapByItem.set(ch.library_item_id, []).get(ch.library_item_id)!).push(ch);
+  const out: ItemBundleRows[] = [];
+  for (const item of items) {
+    const folder = folderById.get(item.folder_id);
+    if (!folder) continue;
+    out.push({
+      item, folder,
+      metadata: metaByItem.get(item.id) ?? null,
+      audioFiles: audioByItem.get(item.id) ?? [],
+      chapters: chapByItem.get(item.id) ?? [],
+    });
+  }
+  return out;
+}
