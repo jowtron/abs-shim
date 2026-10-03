@@ -1073,7 +1073,11 @@ adminRoutes.get('/libraries/:libId/items', async (c) => {
             bm.series_name,
             (SELECT COUNT(*) FROM chapters ch WHERE ch.library_item_id = li.id) AS chapter_count,
             (SELECT COALESCE(SUM(af.duration_seconds), 0) FROM audio_files af WHERE af.library_item_id = li.id) AS duration_seconds,
-            (SELECT COALESCE(SUM(af.size_bytes), 0) FROM audio_files af WHERE af.library_item_id = li.id) AS size_bytes
+            (SELECT COALESCE(SUM(af.size_bytes), 0) FROM audio_files af WHERE af.library_item_id = li.id) AS size_bytes,
+            -- File ids in play order, for the Download button: one request
+            -- per file to /api/items/:id/file/:fileId?download=1.
+            (SELECT json_group_array(COALESCE(f.ino, CAST(f.index_no AS TEXT)))
+               FROM (SELECT ino, index_no FROM audio_files af WHERE af.library_item_id = li.id ORDER BY index_no) f) AS file_ids
        FROM library_items li
        LEFT JOIN book_metadata bm ON bm.library_item_id = li.id
       WHERE li.library_id = ? AND li.tenant_id = ?
@@ -1088,8 +1092,11 @@ adminRoutes.get('/libraries/:libId/items', async (c) => {
     chapter_count: number;
     duration_seconds: number;
     size_bytes: number;
+    file_ids: string | null;
   }>();
-  return c.json({ items: rows.results });
+  return c.json({
+    items: rows.results.map((r) => ({ ...r, file_ids: r.file_ids ? JSON.parse(r.file_ids) as string[] : [] })),
+  });
 });
 
 // Re-probe a single item. Useful when chapters or duration came in wrong.

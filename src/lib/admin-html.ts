@@ -3478,6 +3478,9 @@ function renderBooksList(container, items) {
     html += '<span class="meta' + chapCls + '">' + it.chapter_count + ' chapters</span>';
     html += '<span class="meta">' + formatDuration(it.duration_seconds) + '</span>';
     html += '<span class="meta">' + formatBytes(it.size_bytes) + '</span>';
+    if (it.file_ids && it.file_ids.length) {
+      html += '<button class="secondary" data-download-item="' + escapeHtml(it.id) + '" title="' + (it.file_ids.length > 1 ? 'Save all ' + it.file_ids.length + ' audio files' : 'Save the audio file') + '">Download</button>';
+    }
     html += '<button class="secondary" data-reprobe-item="' + escapeHtml(it.id) + '">Re-probe</button>';
     html += '<button class="secondary" data-cover-item="' + escapeHtml(it.id) + '" title="Use the matching AudioBookBay listing artwork, for books whose files carry no cover">Find cover</button>';
     if (window.__role === 'owner') {
@@ -3487,6 +3490,32 @@ function renderBooksList(container, items) {
     html += '</div>';
   }
   container.innerHTML = html;
+
+  // Download: one navigation per audio file to the streaming route with
+  // ?download=1, which adds Content-Disposition so the browser saves rather
+  // than plays. Cookie auth carries it. Multi-file books (mp3 parts) go one
+  // after another; the browser may ask once to allow multiple downloads.
+  const byId = new Map(items.map((it) => [it.id, it]));
+  container.querySelectorAll('[data-download-item]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const it = byId.get(btn.dataset.downloadItem);
+      if (!it) return;
+      const ids = it.file_ids || [];
+      if (ids.length > 1 && !confirm('This book is ' + ids.length + ' files (' + formatBytes(it.size_bytes) + '). Download them all?')) return;
+      btn.disabled = true;
+      for (let i = 0; i < ids.length; i++) {
+        btn.textContent = ids.length > 1 ? (i + 1) + '/' + ids.length : '…';
+        const a = document.createElement('a');
+        a.href = '/api/items/' + encodeURIComponent(it.id) + '/file/' + encodeURIComponent(ids[i]) + '?download=1';
+        a.download = '';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        if (i < ids.length - 1) await new Promise((r) => setTimeout(r, 800));
+      }
+      btn.disabled = false; btn.textContent = 'Download';
+    });
+  });
 
   container.querySelectorAll('[data-reprobe-item]').forEach((btn) => {
     btn.addEventListener('click', async () => {

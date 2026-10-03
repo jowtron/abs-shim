@@ -13,7 +13,7 @@ import { getBookMetadata } from '../db/library';
 import { insertListeningSession } from '../db/sessions';
 import { getProgress, progressToAbs } from '../db/progress';
 import { audioContentType, resolveProbeUrl, resolveStreamUrl, streamAudio } from '../storage/resolve';
-import { getStreamingTarget } from '../db/library';
+import { getStreamingTarget, type AudioFileRow } from '../db/library';
 import { tryServeMoovRange, warmMoovCache } from '../storage/moov-cache';
 import { tryServeByteRange, warmByteChunk, estimateByteOffsetForTime, CHUNK_SIZE } from '../storage/byte-cache';
 
@@ -189,6 +189,13 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
     });
   }
 
+  // ?download=1 (the /admin Download button): same bytes, plus a
+  // Content-Disposition so the browser saves the file under its own name
+  // instead of opening a player. A 302 to a backend URL can't carry it; the
+  // browser then saves under whatever name the backend gives.
+  const download = c.req.query('download') === '1';
+  const finish = (r: Response): Response => (download ? asAttachment(r, target.audio) : r);
+
   const rangeHeader = c.req.header('Range') ?? null;
 
   // Fast path 1: Range overlaps the cached moov atom region — serve from R2
@@ -196,7 +203,7 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
   // MP4s where iOS seeks directly to the moov offset; for fast-start files
   // the SW already has moov from its cached prefix and this never fires.
   const moovHit = await tryServeMoovRange(c.env, target.audio, rangeHeader);
-  if (moovHit) return moovHit;
+  if (moovHit) return finish(moovHit);
 
   // Pre-flight warming strategy:
   //
@@ -214,7 +221,7 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
   // the stitched stream (R2 prefix + pCloud for any uncached suffix).
   // tryServeByteRange returns null when the start chunk isn't cached.
   const byteHit = await tryServeByteRange(c.env, target.folder, target.audio, rangeHeader);
-  if (byteHit) return byteHit;
+  if (byteHit) return finish(byteHit);
 
   // Cache miss: pipe pCloud directly to the client (low TTFB so iOS's
   // ~1 s Range stall budget doesn't trigger cancel-retry) AND fire a
@@ -239,8 +246,24 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
     }
   }
 
-  return streamAudio(c.env, target.folder, target.audio, c.req.raw);
+  return finish(await streamAudio(c.env, target.folder, target.audio, c.req.raw));
 });
+
+function asAttachment(r: Response, audio: AudioFileRow): Response {
+  if (r.status >= 300 && r.status < 400) return r;
+  // rel_path is a plain path; only the legacy filedn_url is URL-encoded.
+  let name = audio.rel_path?.split('/').pop() || '';
+  if (!name && audio.filedn_url) {
+    const last = audio.filedn_url.split('?')[0]!.split('/').pop() || '';
+    try { name = decodeURIComponent(last); } catch { name = last; }
+  }
+  if (!name) name = `audio-${audio.id}`;
+  // RFC 6266: an ASCII fallback plus the UTF-8 name for anything non-ASCII.
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  const headers = new Headers(r.headers);
+  headers.set('Content-Disposition', `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+  return new Response(r.body, { status: r.status, statusText: r.statusText, headers });
+}
 
 // POST /api/items/:id/play — open a listening session. Returns the session
 // shape ABS clients use to drive playback (audioTracks with contentUrls,
