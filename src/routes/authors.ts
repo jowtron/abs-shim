@@ -9,21 +9,26 @@ import { splitPersonNames } from '../lib/names';
 import { buildItemDetail } from '../lib/abs-shapes';
 import { buildItemBundle } from './library';
 import { placeholderImage } from '../lib/placeholder';
-import { authorJson, ensureAuthorMeta, getAuthorMeta } from '../lib/audnexus';
+import { AUTHOR_IMAGE_SIZES, amazonSized, authorImageKey, authorImageKeys, authorJson, ensureAuthorMeta, getAuthorMeta } from '../lib/audnexus';
 
 export const authorRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
-// Author photo: edge cache → R2 (authors/<id>) → the Audnexus image URL in
-// author_meta, fetched once and stored → a 1x1 transparent PNG when there is
-// no picture, so Pholia's <img onerror="…"> doesn't fire. Public (no auth)
+// Author photo: edge cache → R2 (authors/<id>/<px>) → the Audnexus image
+// URL in author_meta, fetched once per size and stored (key: authorImageKey) → a 1x1 transparent
+// PNG when there is no picture, so Pholia's <img onerror="…"> doesn't fire.
+// Two sizes: the default fits in 500 px (lists and the author page header),
+// `?size=full` in 1200 px (Pholia's lightbox). Before 2026-10-04 this served
+// Amazon's originals, up to 3.3 MB for a 100 px thumbnail. Public (no auth)
 // for the same reason cover endpoints are public: <img> tags don't always
 // carry Authorization, and clients pass ?token=… anyway. The placeholder is
 // deliberately not cached at the edge: the picture may turn up on the next
 // authors listing, once the background lookup has run.
 authorRoutes.get('/:authorId/image', async (c) => {
   const id = c.req.param('authorId');
+  const px = c.req.query('size') === 'full' ? AUTHOR_IMAGE_SIZES.full : AUTHOR_IMAGE_SIZES.thumb;
   const cache = caches.default;
-  const cacheKey = new Request(new URL(`/__author_image__/${id}`, c.req.url).toString(), { method: 'GET' });
+  const r2Key = authorImageKey(id, px);
+  const cacheKey = new Request(new URL(`/__author_image__/${r2Key}`, c.req.url).toString(), { method: 'GET' });
   const edgeHit = await cache.match(cacheKey);
   if (edgeHit) return edgeHit;
 
@@ -32,7 +37,6 @@ authorRoutes.get('/:authorId/image', async (c) => {
     if (size !== undefined) h.set('Content-Length', String(size));
     return h;
   };
-  const r2Key = `authors/${id}`;
   const r2Hit = await c.env.COVERS.get(r2Key);
   if (r2Hit) {
     const res = new Response(r2Hit.body, { status: 200, headers: headersFor(r2Hit.httpMetadata?.contentType ?? 'image/jpeg', r2Hit.size) });
@@ -42,7 +46,9 @@ authorRoutes.get('/:authorId/image', async (c) => {
 
   const row = await getAuthorMeta(c.env, id);
   if (!row?.image_url) return placeholderImage();
-  const upstream = await fetch(row.image_url).catch(() => null);
+  // The resized URL first; the original if Amazon won't size this one.
+  let upstream = await fetch(amazonSized(row.image_url, px)).catch(() => null);
+  if (!upstream?.ok) upstream = await fetch(row.image_url).catch(() => null);
   if (!upstream || !upstream.ok) return placeholderImage();
   const contentType = (upstream.headers.get('content-type') ?? 'image/jpeg').split(';')[0]!.trim();
   if (!contentType.startsWith('image/')) return placeholderImage();
@@ -50,6 +56,8 @@ authorRoutes.get('/:authorId/image', async (c) => {
   c.executionCtx.waitUntil(Promise.all([
     c.env.COVERS.put(r2Key, bytes, { httpMetadata: { contentType } }),
     c.env.DB.prepare('UPDATE author_meta SET image_r2 = ? WHERE author_id = ?').bind(r2Key, id).run(),
+    // Earlier copies (the full-size original, then the hour without QL80).
+    c.env.COVERS.delete(authorImageKeys(id).filter((k) => k !== r2Key && !k.endsWith('q80'))),
   ]).catch(() => undefined));
   const res = new Response(bytes, { status: 200, headers: headersFor(contentType, bytes.byteLength) });
   c.executionCtx.waitUntil(cache.put(cacheKey, res.clone()));

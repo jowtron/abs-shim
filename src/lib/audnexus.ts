@@ -137,13 +137,14 @@ export async function ensureAuthorMeta(env: Env, a: { authorId: string; tenantId
     : (existing?.description ?? found?.description ?? null);
   const imageUrl = found?.image ?? existing?.image_url ?? null;
 
-  // The photo bytes are cached in R2 under authors/<id> and at the edge. If
-  // the URL changed, drop the R2 copy so the image route re-fetches. The
+  // The photo bytes are cached in R2 (authors/<id>/<size>, see
+  // authorImageKeys) and at the edge. If the URL changed, drop the R2
+  // copies so the image route re-fetches. The
   // edge copy is immutable for 30 days and cannot be purged from here, but
   // it only exists once a real picture has been served, and an author who
   // had no photo has nothing cached — which is the case this retry is for.
   if (existing?.image_r2 && imageUrl !== existing.image_url) {
-    await env.COVERS.delete(existing.image_r2).catch(() => undefined);
+    await env.COVERS.delete(authorImageKeys(existing.author_id)).catch(() => undefined);
   }
 
   await env.DB.prepare(
@@ -177,4 +178,34 @@ export function authorJson(a: { id: string; name: string; libraryId: string; num
     updatedAt: m?.updated_at ?? 0,
     numBooks: a.numBooks,
   };
+}
+
+// Author photos are stored at two sizes (see the image route in
+// src/routes/authors.ts); the bare authors/<id> key is the full-size
+// original kept before 2026-10-04, listed so a cleanup removes it too.
+export const AUTHOR_IMAGE_SIZES = { thumb: 500, full: 1200 } as const;
+// Part of the R2 and edge cache keys: bump it when the fetched bytes change
+// (it was a bare size for an hour on 2026-10-04, before QL80 was added).
+export const authorImageKey = (authorId: string, px: number) => `authors/${authorId}/${px}q80`;
+export function authorImageKeys(authorId: string): string[] {
+  const sizes = Object.values(AUTHOR_IMAGE_SIZES);
+  return [`authors/${authorId}`, ...sizes.map((n) => `authors/${authorId}/${n}`), ...sizes.map((n) => authorImageKey(authorId, n))];
+}
+
+// Amazon's image CDN resizes on request: `<name>._SL500_QL80_.jpg` is the
+// same picture with its longest side at most 500 px, re-encoded at quality
+// 80. Audnexus hands out the bare originals, some of them 3000 px camera
+// files over 3 MB (Kate Thompson's is 3008x2000, 3.3 MB, shown at ~100 px).
+// QL80 matters even when no resize happens: SL never enlarges, so a 700 px
+// original comes back untouched — Lena Dunham's at 1.4 MB, 51 KB with QL80.
+// Other hosts are left alone.
+export function amazonSized(url: string, px: number): string {
+  try {
+    const u = new URL(url);
+    if (!/(^|\.)(ssl-images-amazon|media-amazon)\.com$/.test(u.hostname)) return url;
+    const m = /^(.*\/[^/.]+)(\.[a-z]+)$/i.exec(u.pathname);
+    if (!m) return url; // already carries a ._XX_ modifier, or no extension
+    u.pathname = `${m[1]}._SL${px}_QL80_${m[2]}`;
+    return u.toString();
+  } catch { return url; }
 }

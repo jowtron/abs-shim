@@ -230,6 +230,7 @@ Migrations in `migrations/`. Initial schema (0001) plus storage additions (0002)
   days and can't be purged from a Worker, which only matters when replacing a
   photo, not when gaining one. An author still without one (Andrew Child,
   Jessica Townsend) genuinely has no picture at Audnexus.
+- **Author photos are served resized (2026-10-04).** Audnexus hands out Amazon's originals, some 3000 px and over 3 MB, which Pholia showed at ~100 px. `/api/authors/:id/image` now asks Amazon's CDN for `<name>._SL500_QL80_.jpg` (default) or `._SL1200_QL80_` (`?size=full`, Pholia's lightbox) via `amazonSized()`, keeping each in R2 under `authorImageKey(id, px)`. **QL80 is not optional**: SL never enlarges, so an original already under the cap comes back untouched (Lena Dunham's 700 px photo is 1.4 MB, 51 KB with QL80). Change the fetched bytes → change the key suffix, since the edge copy is immutable for 30 days. Result: 3–41 KB thumbnails, ≤206 KB full size.
 - A "wrong author, clear this" button in /admin (clearing `author_meta` and
   recording a miss) was offered to Joseph on 2026-09-07 and not yet built. Lookups run in the background, four per authors-listing request,
   and synchronously when one author is opened; a miss is remembered for 30
