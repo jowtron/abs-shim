@@ -6,7 +6,7 @@
 // and "Dennis E. Taylor" — so the candidate must match the requested name
 // exactly once case, punctuation and accents are ignored.
 import type { Env } from '../types';
-import { personNameKey } from './names';
+import { personNameKey, splitPersonNames } from './names';
 
 export type AuthorMetaRow = {
   author_id: string;
@@ -110,6 +110,47 @@ export async function lookupAudnexus(name: string): Promise<AudnexusAuthor | nul
   return best;
 }
 
+// The second route, for authors the name search can't find (2026-10-04):
+// ask Audible's catalogue which author page one of their own books links to.
+// Two things the name search misses and this finds:
+//   - titles sold only outside the US store. The search is region=us and
+//     Sophie Beaumont's books are AU-only, so it never saw her at all;
+//   - pen names. Her book credits "Sophie Beaumont" and links to the author
+//     page B001H6OXBI, which Audible files under her own name, Sophie Masson.
+// This keeps the wrong-person guard intact: the name that has to match is
+// the credit ON THE BOOK, which we hold, and the author page is the one
+// Audible itself links that credit to, so nothing is matched by name alone.
+// Needs book_metadata.asin, which only Audible-synced books carry
+// (src/lib/book-asins.ts).
+const BOOK_REGIONS = ['au', 'us', 'uk', 'ca'];
+
+export async function lookupAudnexusByBooks(env: Env, libraryId: string, tenantId: string, name: string): Promise<AudnexusAuthor | null> {
+  const want = personNameKey(name);
+  const books = (await env.DB.prepare(
+    `SELECT bm.asin, bm.author_name FROM book_metadata bm
+       JOIN library_items li ON li.id = bm.library_item_id
+      WHERE li.library_id = ? AND li.tenant_id = ? AND bm.asin IS NOT NULL AND bm.asin != ''`,
+  ).bind(libraryId, tenantId).all<{ asin: string; author_name: string | null }>()).results
+    .filter((b) => splitPersonNames(b.author_name).some((n) => personNameKey(n) === want))
+    .slice(0, 3);
+  for (const b of books) {
+    for (const region of BOOK_REGIONS) {
+      const r = await fetch(`https://api.audnex.us/books/${encodeURIComponent(b.asin)}?region=${region}`, {
+        headers: { Accept: 'application/json' },
+      }).catch(() => null);
+      // REGION_UNAVAILABLE comes back as a 4xx: try the next store.
+      if (!r?.ok) continue;
+      const j = (await r.json().catch(() => null)) as { authors?: Array<{ asin?: string; name?: string }> } | null;
+      const credit = j?.authors?.find((a) => a?.asin && a.name && personNameKey(a.name) === want);
+      if (!credit?.asin) break;   // the book is there but doesn't credit this name
+      const rec = await fetchAuthorRecord(credit.asin).catch(() => null);
+      if (rec) return rec;
+      break;
+    }
+  }
+  return null;
+}
+
 // Look the author up if due and record the result (or the miss). A network
 // or 5xx failure is recorded so it is retried in an hour, not on every
 // request and not in 30 days.
@@ -120,6 +161,10 @@ export async function ensureAuthorMeta(env: Env, a: { authorId: string; tenantId
   let checkedAt = Date.now();
   try {
     found = await lookupAudnexus(a.name);
+    if (!found?.image) {
+      const viaBook = await lookupAudnexusByBooks(env, a.libraryId, a.tenantId, a.name).catch(() => null);
+      if (viaBook && (viaBook.image || !found)) found = viaBook;
+    }
   } catch (e) {
     console.warn(`[audnexus] ${a.name}: ${(e as Error).message}`);
     checkedAt = Date.now() - RETRY_MISS_MS + RETRY_ERROR_MS;

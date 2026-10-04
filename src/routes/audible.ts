@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { Env } from '../types';
 import { requireAuth, canAddBooks, type AuthVars } from '../auth/middleware';
 import { getTenantSetting, setTenantSetting } from '../db/settings';
+import { recordBookAsins } from '../lib/book-asins';
 import { runAndWait, runAsync, getJob, getJobLog, cancelJob, wharfConfigured, type WharfJob } from '../lib/wharf';
 
 // Audible library backup — mounted at /api/admin/audible. The work runs on
@@ -158,7 +159,14 @@ audibleRoutes.get('/library', async (c) => {
   const refresh = c.req.query('refresh') === '1';
   try {
     return c.json(await cachedOrLive(c, c.get('tenantId'), 'audible_library:' + account, refresh || c.req.query('live') === '1',
-      () => runAndWait<{ ok: boolean; account: string; fetched_at: number; items: unknown[] }>(c.env, PROJECT, 'library', { account, refresh }, refresh ? 240_000 : 30_000)));
+      () => runAndWait<{ ok: boolean; account: string; fetched_at: number; items: unknown[] }>(c.env, PROJECT, 'library', { account, refresh }, refresh ? 240_000 : 30_000)
+        .then((v) => {
+          // Each synced title's ASIN onto its book (src/lib/book-asins.ts).
+          const recs = (v.items as Array<{ asin?: string; synced?: { path?: string } | null }>)
+            .filter((i) => i.asin && i.synced?.path).map((i) => ({ asin: i.asin!, path: i.synced!.path! }));
+          c.executionCtx.waitUntil(recordBookAsins(c.env, c.get('tenantId'), recs).catch(() => 0));
+          return v;
+        })));
   } catch (e) {
     return c.json({ error: err(e) }, 502);
   }
@@ -213,6 +221,13 @@ audibleRoutes.post('/jobs/:id/scanned', async (c) => {
   const recs = await jobRecords(c.env, c.get('tenantId'));
   const r = recs.find((x) => x.id === c.req.param('id'));
   if (r) { r.scanned = true; await setTenantSetting(c.env, c.get('tenantId'), JOBS_KEY, JSON.stringify(recs)); }
+  // The books now exist in D1, so their ASINs can be recorded.
+  try {
+    const job = await getJob(c.env, c.req.param('id'));
+    const done = ((job?.result as { done?: Array<{ asin?: string; path?: string }> } | null)?.done ?? [])
+      .filter((d) => d.asin && d.path).map((d) => ({ asin: d.asin!, path: d.path! }));
+    if (done.length) c.executionCtx.waitUntil(recordBookAsins(c.env, c.get('tenantId'), done).catch(() => 0));
+  } catch { /* router unreachable: the library view records them later */ }
   return c.json({ ok: true });
 });
 
