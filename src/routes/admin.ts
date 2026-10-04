@@ -11,7 +11,7 @@ import {
 } from '../storage/pcloud';
 import { runScan, addBookByPath, reprobeItem, type ScanReport } from '../scanner/scan';
 import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem, getBookMetadata } from '../db/library';
-import { viewFilter, type LibraryViewRow } from '../db/library-views';
+import { resolveLibraryScope, viewFilter, type LibraryViewRow } from '../db/library-views';
 import { probeM4b } from '../prober/m4b';
 import { probeMp3 } from '../prober/mp3';
 import { resolveProbeUrl } from '../storage/resolve';
@@ -609,12 +609,13 @@ adminRoutes.delete('/storage/folder/:id', requireTenantOwner, async (c) => {
 // clock is fine inside one Worker invocation.
 adminRoutes.post('/libraries/:id/scan', async (c) => {
   const tenantId = c.get('tenantId');
-  const id = c.req.param('id');
-  const lib = await getLibrary(c.env, id, tenantId);
-  if (!lib) return c.json({ error: 'Library not found' }, 404);
+  // A view id scans the library it filters: Pholia's Rescan sends
+  // whichever library is selected in its picker.
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
   let report: ScanReport;
   try {
-    report = await runScan(c.env, id, tenantId);
+    report = await runScan(c.env, scope.library.id, tenantId);
   } catch (e) {
     return c.json({ error: 'Scan failed', detail: (e as Error).message }, 502);
   }
