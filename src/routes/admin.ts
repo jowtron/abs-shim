@@ -11,6 +11,7 @@ import {
 } from '../storage/pcloud';
 import { runScan, addBookByPath, reprobeItem, type ScanReport } from '../scanner/scan';
 import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem, getBookMetadata } from '../db/library';
+import { viewFilter, type LibraryViewRow } from '../db/library-views';
 import { probeM4b } from '../prober/m4b';
 import { probeMp3 } from '../prober/mp3';
 import { resolveProbeUrl } from '../storage/resolve';
@@ -1056,6 +1057,78 @@ adminRoutes.get('/storage/folder/:folderId/extract/status', requireCanAdd, async
   if (!relPath) return c.json({ error: 'relPath required' }, 400);
   const res = await extractJobStub(c.env, c.get('tenantId'), loaded.folder.id, relPath).fetch('https://do/status');
   return c.json(await res.json(), res.status as 200);
+});
+
+// ─── Library views ──────────────────────────────────────────────────────────
+// Filters over a library that clients see as extra libraries (migration 0015,
+// src/db/library-views.ts). Listing is open to the tenant; changes are
+// owner-only, like everything else that reshapes the library.
+
+// GET → this library's views with their book counts, plus `suggestions`:
+// the top-level folders (and each Audible account) with how many books
+// sit under each, so the form can offer them instead of asking for a path.
+adminRoutes.get('/libraries/:libId/views', async (c) => {
+  const tenantId = c.get('tenantId');
+  const libId = c.req.param('libId');
+  if (!await getLibrary(c.env, libId, tenantId)) return c.json({ error: 'Library not found' }, 404);
+  const views = (await c.env.DB.prepare(
+    'SELECT * FROM library_views WHERE library_id = ? AND tenant_id = ? ORDER BY display_order, name COLLATE NOCASE',
+  ).bind(libId, tenantId).all<LibraryViewRow>()).results;
+  const counted = await Promise.all(views.map(async (v) => {
+    const f = viewFilter(v, '');
+    const r = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM library_items WHERE library_id = ? AND tenant_id = ?${f.sql}`)
+      .bind(libId, tenantId, ...f.binds).first<{ n: number }>();
+    return { ...v, bookCount: r?.n ?? 0 };
+  }));
+  const paths = (await c.env.DB.prepare('SELECT rel_path FROM library_items WHERE library_id = ? AND tenant_id = ?')
+    .bind(libId, tenantId).all<{ rel_path: string }>()).results;
+  const tally = new Map<string, number>();
+  for (const { rel_path } of paths) {
+    const parts = (rel_path || '').split('/');
+    if (parts.length < 2) continue;
+    const top = parts[0] + '/';
+    tally.set(top, (tally.get(top) ?? 0) + 1);
+    if (parts[0] === 'Audible' && parts.length > 2) {
+      const acct = top + parts[1] + '/';
+      tally.set(acct, (tally.get(acct) ?? 0) + 1);
+    }
+  }
+  const suggestions = [...tally].map(([prefix, count]) => ({ prefix, count }))
+    .sort((a, b) => a.prefix.localeCompare(b.prefix));
+  return c.json({ views: counted, suggestions });
+});
+
+adminRoutes.post('/libraries/:libId/views', requireTenantOwner, async (c) => {
+  const tenantId = c.get('tenantId');
+  const libId = c.req.param('libId');
+  if (!await getLibrary(c.env, libId, tenantId)) return c.json({ error: 'Library not found' }, 404);
+  const body = await c.req.json<{ name?: string; folderId?: string; includePrefix?: string; excludePrefix?: string; displayOrder?: number }>().catch(() => ({} as Record<string, never>));
+  const name = (body.name ?? '').trim();
+  if (!name) return c.json({ error: 'A view needs a name' }, 400);
+  // A path prefix is a folder: always ends in '/', never starts with one, so
+  // "Audible/liz" can't also catch "Audible/lizzie".
+  const prefix = (p: string | undefined) => {
+    const t = (p ?? '').trim().replace(/^\/+/, '');
+    return t ? (t.endsWith('/') ? t : t + '/') : null;
+  };
+  const include = prefix(body.includePrefix);
+  const exclude = prefix(body.excludePrefix);
+  const folderId = body.folderId?.trim() || null;
+  if (folderId && !(await getFolderById(c.env, folderId, tenantId))) return c.json({ error: 'Unknown storage folder' }, 400);
+  if (!include && !exclude && !folderId) return c.json({ error: 'A view with no filter would just repeat the library' }, 400);
+  const id = 'view-' + crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO library_views (id, tenant_id, library_id, name, folder_id, include_prefix, exclude_prefix, display_order, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(id, tenantId, libId, name, folderId, include, exclude, Number(body.displayOrder) || 0, Date.now()).run();
+  return c.json({ id });
+});
+
+adminRoutes.delete('/views/:viewId', requireTenantOwner, async (c) => {
+  const r = await c.env.DB.prepare('DELETE FROM library_views WHERE id = ? AND tenant_id = ?')
+    .bind(c.req.param('viewId'), c.get('tenantId')).run();
+  if (!r.meta.changes) return c.json({ error: 'View not found' }, 404);
+  return c.json({ ok: true });
 });
 
 // ─── Library item management ────────────────────────────────────────────────

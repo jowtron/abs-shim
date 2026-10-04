@@ -1148,6 +1148,7 @@ function renderLibraries(status, libraries) {
       html += '<button class="secondary" data-upload-toggle="' + escapeHtml(lib.id) + '">Upload audiobook…</button>';
     }
     html += '<button class="secondary" data-show-books="' + escapeHtml(lib.id) + '">Show books (' + s.bookCount + ')</button>';
+    html += '<button class="secondary" data-views="' + escapeHtml(lib.id) + '" title="Extra libraries that show only part of this one, e.g. one Audible account. Apps list them beside this library.">Views</button>';
     html += '<button class="secondary" data-duplicates="' + escapeHtml(lib.id) + '" title="Titles registered more than once, usually one release grabbed twice into different folders">Find duplicates</button>';
     html += '<button class="secondary" data-reprobe-missing="' + escapeHtml(lib.id) + '">Re-probe books missing chapters</button>';
     html += '<button class="secondary" data-reprobe-all="' + escapeHtml(lib.id) + '">Re-probe all</button>';
@@ -1155,6 +1156,7 @@ function renderLibraries(status, libraries) {
     // Per-book progress rows for the re-probe buttons (same rows as uploads).
     html += '<div id="reprobe-list-' + escapeHtml(lib.id) + '" class="upload-list"></div>';
 
+    html += '<div id="views-panel-' + escapeHtml(lib.id) + '" class="books-list" style="display:none"></div>';
     // Hidden book list — populated lazily on first "Show books" click.
     html += '<div id="books-list-' + escapeHtml(lib.id) + '" class="books-list" style="display:none">Loading…</div>';
 
@@ -1360,6 +1362,16 @@ function renderLibraries(status, libraries) {
       } catch (e) {
         box.textContent = 'Could not check: ' + e.message;
       }
+    });
+  });
+
+  body.querySelectorAll('[data-views]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const panel = document.getElementById('views-panel-' + btn.dataset.views);
+      if (!panel) return;
+      if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+      panel.style.display = 'block';
+      loadViewsPanel(btn.dataset.views, panel);
     });
   });
 
@@ -3458,6 +3470,65 @@ function formatDuration(seconds) {
   const m = Math.floor((seconds % 3600) / 60);
   if (h > 0) return h + 'h ' + m + 'm';
   return m + 'm';
+}
+
+// Library views: filters over this library that apps list as extra
+// libraries (Pholia shows a library picker once there is more than one).
+async function loadViewsPanel(libId, panel) {
+  panel.textContent = 'Loading…';
+  let data;
+  try { data = await api('/api/admin/libraries/' + libId + '/views'); }
+  catch (e) { panel.textContent = 'Could not load views: ' + e.message; return; }
+  const owner = window.__role === 'owner';
+  let html = '<p class="muted" style="margin:0 0 0.5rem">Each view shows up in Pholia and other apps as its own library. Books stay where they are; this library still shows everything.</p>';
+  if (!data.views.length) html += '<p class="muted">No views yet.</p>';
+  for (const v of data.views) {
+    const rule = [v.include_prefix ? 'books under ' + v.include_prefix : '', v.exclude_prefix ? 'leaving out ' + v.exclude_prefix : '', v.folder_id ? 'one storage backend' : ''].filter(Boolean).join(', ');
+    html += '<div class="book-row"><span class="title">' + escapeHtml(v.name) + ' <span class="meta">· ' + escapeHtml(rule) + '</span></span>';
+    html += '<span class="meta">' + v.bookCount + ' books</span>';
+    if (owner) html += '<button class="danger" data-view-delete="' + escapeHtml(v.id) + '">Remove</button>';
+    html += '</div>';
+  }
+  if (owner) {
+    const opts = '<option value="">(anything)</option>' + data.suggestions.map((sg) =>
+      '<option value="' + escapeHtml(sg.prefix) + '">' + escapeHtml(sg.prefix) + ' (' + sg.count + ')</option>').join('');
+    html += '<div class="row" style="flex-wrap:wrap;gap:0.5rem;margin-top:0.75rem;align-items:center">';
+    html += '<input type="text" data-view-name placeholder="Name, e.g. Liz\'s Audible" style="flex:1;min-width:12rem">';
+    html += '<label class="muted">Only books under <select data-view-include>' + opts + '</select></label>';
+    html += '<label class="muted">Leave out <select data-view-exclude>' + opts + '</select></label>';
+    html += '<button data-view-add>Add view</button>';
+    html += '</div>';
+  }
+  panel.innerHTML = html;
+
+  panel.querySelectorAll('[data-view-delete]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('Remove this view? No books are touched.')) return;
+    b.disabled = true;
+    try { await api('/api/admin/views/' + b.dataset.viewDelete, { method: 'DELETE' }); loadViewsPanel(libId, panel); }
+    catch (e) { showError('Remove failed: ' + e.message); b.disabled = false; }
+  }));
+  const inc = panel.querySelector('[data-view-include]');
+  const nameEl = panel.querySelector('[data-view-name]');
+  // Picking an Audible account fills in a name to start from.
+  if (inc) inc.addEventListener('change', () => {
+    const m = /^Audible\/([^/]+)\/$/.exec(inc.value);
+    if (m && !nameEl.value) nameEl.value = m[1].charAt(0).toUpperCase() + m[1].slice(1) + '\'s Audible';
+  });
+  const add = panel.querySelector('[data-view-add]');
+  if (add) add.addEventListener('click', async () => {
+    const body = {
+      name: nameEl.value.trim(),
+      includePrefix: inc.value,
+      excludePrefix: panel.querySelector('[data-view-exclude]').value,
+    };
+    add.disabled = true;
+    try {
+      await api('/api/admin/libraries/' + libId + '/views', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      loadViewsPanel(libId, panel);
+    } catch (e) { showError('Add failed: ' + e.message); add.disabled = false; }
+  });
 }
 
 // Render the books-list panel. Each row is title/author + chapter count +

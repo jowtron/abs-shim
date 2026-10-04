@@ -17,7 +17,7 @@ function parseGenres(s: string | null): string[] {
   } catch { return []; }
 }
 
-export async function libraryStats(env: Env, libraryId: string, tenantId: string) {
+export async function libraryStats(env: Env, libraryId: string, tenantId: string, view?: { sql: string; binds: string[] }) {
   const perItem = (await env.DB.prepare(
     `SELECT li.id, bm.title, bm.author_name, bm.genres,
             COALESCE(SUM(af.size_bytes), 0) AS size,
@@ -26,9 +26,9 @@ export async function libraryStats(env: Env, libraryId: string, tenantId: string
      FROM library_items li
      LEFT JOIN book_metadata bm ON bm.library_item_id = li.id
      LEFT JOIN audio_files af ON af.library_item_id = li.id
-     WHERE li.library_id = ? AND li.tenant_id = ?
+     WHERE li.library_id = ? AND li.tenant_id = ?${view?.sql ?? ''}
      GROUP BY li.id`,
-  ).bind(libraryId, tenantId).all<{ id: string; title: string | null; author_name: string | null; genres: string | null; size: number; duration: number; tracks: number }>()).results;
+  ).bind(libraryId, tenantId, ...(view?.binds ?? [])).all<{ id: string; title: string | null; author_name: string | null; genres: string | null; size: number; duration: number; tracks: number }>()).results;
 
   const authorCounts = new Map<string, number>();
   const genreCounts = new Map<string, number>();

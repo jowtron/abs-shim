@@ -13,6 +13,7 @@ import { derivedId } from '../lib/ids';
 import { splitPersonNames } from '../lib/names';
 import { listProgressByUser, progressToAbs, type MediaProgressRow } from '../db/progress';
 import { libraryStats } from '../db/stats';
+import { listViews, resolveLibraryScope, viewAsLibraryRow } from '../db/library-views';
 import { authorJson, ensureAuthorMeta, getAuthorMetasForLibrary, needsLookup } from '../lib/audnexus';
 
 export const libraryRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
@@ -21,37 +22,42 @@ libraryRoutes.use('*', requireAuth);
 
 libraryRoutes.get('/', async (c) => {
   const tenantId = c.get('tenantId');
-  const rows = await listLibraries(c.env, tenantId);
+  const [rows, views] = await Promise.all([listLibraries(c.env, tenantId), listViews(c.env, tenantId)]);
   const libraries = await Promise.all(rows.map(async (row) => {
     const folders = await listFolders(c.env, row.id, tenantId);
-    return buildLibrary(row, folders);
+    // Views list straight after their library (see src/db/library-views.ts).
+    return [buildLibrary(row, folders), ...views.filter((v) => v.library_id === row.id)
+      .map((v) => buildLibrary(viewAsLibraryRow(v, row), folders))];
   }));
-  return c.json({ libraries });
+  return c.json({ libraries: libraries.flat() });
 });
 
 libraryRoutes.get('/:id', async (c) => {
   const tenantId = c.get('tenantId');
-  const row = await getLibrary(c.env, c.req.param('id'), tenantId);
-  if (!row) return c.json({ error: 'Library not found' }, 404);
-  const folders = await listFolders(c.env, row.id, tenantId);
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  const folders = await listFolders(c.env, scope.library.id, tenantId);
+  const shown = scope.view ? viewAsLibraryRow(scope.view, scope.library) : scope.library;
 
   const include = (c.req.query('include') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   if (include.includes('filterdata')) {
-    const metadata = await listAllBookMetadata(c.env, row.id, tenantId);
-    return c.json(await buildFilterData({ libraryRow: row, folders, metadata }));
+    const metadata = await listAllBookMetadata(c.env, scope.library.id, tenantId, scope.filter('li.'));
+    // Ids are salted with the real library; the library shown is the view.
+    const fd = await buildFilterData({ libraryRow: scope.library, folders, metadata });
+    return c.json({ ...fd, library: buildLibrary(shown, folders) });
   }
-  return c.json(buildLibrary(row, folders));
+  return c.json(buildLibrary(shown, folders));
 });
 
 libraryRoutes.get('/:id/personalized', async (c) => {
   const t0 = Date.now();
   const tenantId = c.get('tenantId');
-  const id = c.req.param('id');
-  const row = await getLibrary(c.env, id, tenantId);
-  if (!row) return c.json({ error: 'Library not found' }, 404);
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  const id = scope.library.id;
   const t1 = Date.now();
 
-  const items = await listItemsByLibrary(c.env, id, tenantId);
+  const items = await listItemsByLibrary(c.env, id, tenantId, { view: scope.filter('') });
   const t2 = Date.now();
 
   const bundles = await loadItemBundles(c.env, items, tenantId);
@@ -65,15 +71,16 @@ libraryRoutes.get('/:id/personalized', async (c) => {
   const shelves = await buildPersonalizedShelves({ libraryId: id, bundles, progress });
   const t4 = Date.now();
 
-  console.log(`[perf] /personalized lib=${id} items=${items.length} | getLibrary=${t1 - t0}ms listItems=${t2 - t1}ms bundles(batched)=${t3 - t2}ms shelves=${t4 - t3}ms total=${t4 - t0}ms`);
+  console.log(`[perf] /personalized lib=${scope.id} items=${items.length} | getLibrary=${t1 - t0}ms listItems=${t2 - t1}ms bundles(batched)=${t3 - t2}ms shelves=${t4 - t3}ms total=${t4 - t0}ms`);
   return c.json(shelves);
 });
 
 libraryRoutes.get('/:id/items', async (c) => {
   const tenantId = c.get('tenantId');
-  const id = c.req.param('id');
-  const row = await getLibrary(c.env, id, tenantId);
-  if (!row) return c.json({ error: 'Library not found' }, 404);
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  const id = scope.library.id;
+  const row = scope.library;
 
   const limit = Number(c.req.query('limit') ?? '0');
   const page = Number(c.req.query('page') ?? '0');
@@ -84,8 +91,9 @@ libraryRoutes.get('/:id/items', async (c) => {
   const filter = c.req.query('filter') ?? '';
   const issuesOnly = filter === 'issues';
 
-  const items = await listItemsByLibrary(c.env, id, tenantId, { limit, offset, issuesOnly });
-  const total = await countItemsByLibrary(c.env, id, tenantId, { issuesOnly });
+  const view = scope.filter('');
+  const items = await listItemsByLibrary(c.env, id, tenantId, { limit, offset, issuesOnly, view });
+  const total = await countItemsByLibrary(c.env, id, tenantId, { issuesOnly, view });
 
   const bundles = await loadItemBundles(c.env, items, tenantId);
   if (bundles.length !== items.length) throw new Error('a library item references a missing folder');
@@ -111,9 +119,9 @@ libraryRoutes.get('/:id/items', async (c) => {
 // "0 books" in Absorb's library list.
 libraryRoutes.get('/:id/stats', async (c) => {
   const tenantId = c.get('tenantId');
-  const id = c.req.param('id');
-  if (!(await getLibrary(c.env, id, tenantId))) return c.json({ error: 'Library not found' }, 404);
-  return c.json(await libraryStats(c.env, id, tenantId));
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  return c.json(await libraryStats(c.env, scope.library.id, tenantId, scope.filter('li.')));
 });
 
 // Stub: trigger a (re)scan. We don't have a scanner yet, so 200 OK and noop.
@@ -135,9 +143,10 @@ libraryRoutes.post('/:id/scan', async (c) => c.text('OK'));
 // nothing next to the per-item bundle building below.
 libraryRoutes.get('/:id/search', async (c) => {
   const tenantId = c.get('tenantId');
-  const id = c.req.param('id');
-  const row = await getLibrary(c.env, id, tenantId);
-  if (!row) return c.json({ error: 'Library not found' }, 404);
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  const id = scope.library.id;
+  const view = scope.filter('li.');
 
   const q = (c.req.query('q') ?? '').trim();
   const limit = Math.min(Math.max(Number(c.req.query('limit') ?? '12') || 12, 1), 50);
@@ -158,7 +167,7 @@ libraryRoutes.get('/:id/search', async (c) => {
     `SELECT li.id AS item_id, bm.title, bm.subtitle, bm.author_name, bm.narrator_name, bm.series_name
        FROM library_items li
        JOIN book_metadata bm ON bm.library_item_id = li.id
-      WHERE li.library_id = ? AND li.tenant_id = ? AND li.is_missing = 0
+      WHERE li.library_id = ? AND li.tenant_id = ? AND li.is_missing = 0${view.sql}
         AND (lower(COALESCE(bm.title, '')) LIKE ? ESCAPE '\\'
           OR lower(COALESCE(bm.subtitle, '')) LIKE ? ESCAPE '\\'
           OR lower(COALESCE(bm.author_name, '')) LIKE ? ESCAPE '\\'
@@ -168,7 +177,7 @@ libraryRoutes.get('/:id/search', async (c) => {
         CASE WHEN lower(COALESCE(bm.title, '')) LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END,
         bm.title COLLATE NOCASE
       LIMIT ?`,
-  ).bind(id, tenantId, pattern, pattern, pattern, pattern, pattern, pattern, limit).all<{
+  ).bind(id, tenantId, ...view.binds, pattern, pattern, pattern, pattern, pattern, pattern, limit).all<{
     item_id: string; title: string | null; subtitle: string | null;
     author_name: string | null; narrator_name: string | null; series_name: string | null;
   }>();
@@ -237,9 +246,10 @@ libraryRoutes.get('/:id/search', async (c) => {
 // up in the background, a few per request, so a second load has them.
 libraryRoutes.get('/:id/authors', async (c) => {
   const tenantId = c.get('tenantId');
-  const id = c.req.param('id');
-  if (!(await getLibrary(c.env, id, tenantId))) return c.json({ error: 'Library not found' }, 404);
-  const metadata = await listAllBookMetadata(c.env, id, tenantId);
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  const id = scope.library.id;
+  const metadata = await listAllBookMetadata(c.env, id, tenantId, scope.filter('li.'));
   const counts = new Map<string, number>();
   for (const m of metadata) {
     if (!m.author_name) continue;
@@ -298,10 +308,11 @@ libraryRoutes.get('/:id/authors', async (c) => {
 libraryRoutes.get('/:id/series', async (c) => {
   const t0 = Date.now();
   const tenantId = c.get('tenantId');
-  const id = c.req.param('id');
-  if (!(await getLibrary(c.env, id, tenantId))) return c.json({ error: 'Library not found' }, 404);
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  const id = scope.library.id;
 
-  const items = await listItemsByLibrary(c.env, id, tenantId);
+  const items = await listItemsByLibrary(c.env, id, tenantId, { view: scope.filter('') });
   const t1 = Date.now();
   const bundles = await loadItemBundles(c.env, items, tenantId);
   const t2 = Date.now();
@@ -377,8 +388,7 @@ libraryRoutes.get('/:id/series', async (c) => {
 
 libraryRoutes.get('/:id/collections', async (c) => {
   const tenantId = c.get('tenantId');
-  const id = c.req.param('id');
-  if (!(await getLibrary(c.env, id, tenantId))) return c.json({ error: 'Library not found' }, 404);
+  if (!(await resolveLibraryScope(c.env, c.req.param('id'), tenantId))) return c.json({ error: 'Library not found' }, 404);
   return c.json(emptyPagedResult());
 });
 

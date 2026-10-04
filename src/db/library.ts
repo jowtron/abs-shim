@@ -141,23 +141,28 @@ export async function getFolderByIdUnscoped(env: Env, id: string): Promise<Libra
 // `issuesOnly` is ABS's `filter=issues` (items flagged missing or invalid).
 // Absorb lists those as "missing or invalid items"; before the filter was
 // honoured every book in the library came back and was shown as broken.
-export async function listItemsByLibrary(env: Env, libraryId: string, tenantId: string, opts: { limit?: number; offset?: number; issuesOnly?: boolean } = {}): Promise<LibraryItemRow[]> {
+// `view` narrows to a library view's books (src/db/library-views.ts):
+// pass scope.filter('') for this unaliased table.
+export type ItemFilter = { sql: string; binds: string[] };
+
+export async function listItemsByLibrary(env: Env, libraryId: string, tenantId: string, opts: { limit?: number; offset?: number; issuesOnly?: boolean; view?: ItemFilter } = {}): Promise<LibraryItemRow[]> {
   const limit = opts.limit ?? 0;
   const offset = opts.offset ?? 0;
-  const where = 'library_id = ? AND tenant_id = ?' + (opts.issuesOnly ? ' AND (is_missing = 1 OR is_invalid = 1)' : '');
+  const where = 'library_id = ? AND tenant_id = ?' + (opts.issuesOnly ? ' AND (is_missing = 1 OR is_invalid = 1)' : '') + (opts.view?.sql ?? '');
+  const vb = opts.view?.binds ?? [];
   const sql = limit > 0
     ? `SELECT * FROM library_items WHERE ${where} ORDER BY created_at ASC LIMIT ? OFFSET ?`
     : `SELECT * FROM library_items WHERE ${where} ORDER BY created_at ASC`;
   const stmt = limit > 0
-    ? env.DB.prepare(sql).bind(libraryId, tenantId, limit, offset)
-    : env.DB.prepare(sql).bind(libraryId, tenantId);
+    ? env.DB.prepare(sql).bind(libraryId, tenantId, ...vb, limit, offset)
+    : env.DB.prepare(sql).bind(libraryId, tenantId, ...vb);
   const r = await stmt.all<LibraryItemRow>();
   return r.results;
 }
 
-export async function countItemsByLibrary(env: Env, libraryId: string, tenantId: string, opts: { issuesOnly?: boolean } = {}): Promise<number> {
-  const where = 'library_id = ? AND tenant_id = ?' + (opts.issuesOnly ? ' AND (is_missing = 1 OR is_invalid = 1)' : '');
-  const r = await env.DB.prepare(`SELECT COUNT(*) AS n FROM library_items WHERE ${where}`).bind(libraryId, tenantId).first<{ n: number }>();
+export async function countItemsByLibrary(env: Env, libraryId: string, tenantId: string, opts: { issuesOnly?: boolean; view?: ItemFilter } = {}): Promise<number> {
+  const where = 'library_id = ? AND tenant_id = ?' + (opts.issuesOnly ? ' AND (is_missing = 1 OR is_invalid = 1)' : '') + (opts.view?.sql ?? '');
+  const r = await env.DB.prepare(`SELECT COUNT(*) AS n FROM library_items WHERE ${where}`).bind(libraryId, tenantId, ...(opts.view?.binds ?? [])).first<{ n: number }>();
   return r?.n ?? 0;
 }
 
@@ -187,12 +192,13 @@ export async function getChapters(env: Env, itemId: string): Promise<ChapterRow[
   return r.results;
 }
 
-export async function listAllBookMetadata(env: Env, libraryId: string, tenantId: string): Promise<BookMetadataRow[]> {
+// `view`: scope.filter('li.').
+export async function listAllBookMetadata(env: Env, libraryId: string, tenantId: string, view?: ItemFilter): Promise<BookMetadataRow[]> {
   const r = await env.DB.prepare(
     `SELECT bm.* FROM book_metadata bm
      JOIN library_items li ON li.id = bm.library_item_id
-     WHERE li.library_id = ? AND bm.tenant_id = ?`,
-  ).bind(libraryId, tenantId).all<BookMetadataRow>();
+     WHERE li.library_id = ? AND bm.tenant_id = ?${view?.sql ?? ''}`,
+  ).bind(libraryId, tenantId, ...(view?.binds ?? [])).all<BookMetadataRow>();
   return r.results;
 }
 

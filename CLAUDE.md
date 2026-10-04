@@ -243,6 +243,16 @@ Migrations in `migrations/`. Initial schema (0001) plus storage additions (0002)
   included (real ABS sends `null` too). Whatever they choke on is a later
   request; capture it with `wrangler tail` while logging in.
 
+## Library views (2026-10-04)
+
+A **view** is a filter over a real library that clients see as an extra library: `library_views` (migration 0015) holds a name plus optional `folder_id`, `include_prefix` and `exclude_prefix` on `library_items.rel_path`. `/api/libraries` lists each view right after its library, and every `/api/libraries/:id/*` route goes through `resolveLibraryScope()` (`src/db/library-views.ts`), which accepts either kind of id and returns the real library plus a `filter(col)` SQL fragment. Prod has three on `lib-audiobooks-001`: "Joseph's Audible" (`Audible/bestijow/`), "Liz's Audible" (`Audible/liz/`) and "Other" (excluding `Audible/`). They are made and removed in /admin's **Views** panel (owner-only; prefixes are normalised to end in `/` so `Audible/liz/` can't catch `Audible/lizzie/`).
+
+Rules that keep it working:
+- **Author and series ids are salted with the REAL library id, never the view id** (the reverse lookups in `src/lib/ids.ts` walk real `library_items.library_id`). So an author opened from a view is the same author, and `/api/authors/:id` shows all of that author's books, not just the view's.
+- A book's own `libraryId` stays the real library. Pholia doesn't compare it to the selected library; check a strict client before relying on that elsewhere.
+- **A new library route must call `resolveLibraryScope`, not `getLibrary`**, or a view id answers 404 there.
+- Views need no scan changes: new Audible syncs land under `Audible/<account>/` and appear in that account's view by themselves.
+
 ## Derived ids are hashed from the LIBRARY id (2026-09-21)
 
 Author and series ids are not rows, they are `derivedId(libraryId, 'author'|'series', name)` hashes, and three places reverse them: `/api/authors/:id`, `/api/series/:id` and `resolveItemIdFromUuid` in `src/lib/ids.ts` (which turns an author or series id back into a book so the cover route can answer). **Anything that emits one of these ids must salt it with the library id.** `buildBookMetadataDetail` salted with the *item* id until 2026-09-21, so every author link on a book page answered `{"error":"Author not found"}` 404 while the same author opened fine from the Authors tab, and search had the same bug.
