@@ -138,13 +138,62 @@ function cleanItunes(d: ItunesRaw): ItunesPodcast {
   };
 }
 
+// Apple rate-limits per IP (about 20 calls a minute), and a Worker's egress
+// IPs are shared with everyone else's Workers, so from production this
+// answers 403 or 429 as often as not (2026-10-06: 403 from the deployed
+// Worker, 429 on the third call of a burst from a preview, 200 from a home
+// IP). Pholia and /admin therefore search Apple from the browser, which
+// sends CORS headers, and come here only for a pasted feed URL or when that
+// fails; this route retries once and then falls back to fyyd.
 export async function itunesSearch(term: string, country = 'us', limit = 25): Promise<ItunesPodcast[]> {
   const q = new URLSearchParams({ term, entity: 'podcast', media: 'podcast', country, limit: String(limit) });
-  const res = await fetch(`https://itunes.apple.com/search?${q}`, { signal: AbortSignal.timeout(15_000) });
-  if (!res.ok) throw new PodcastError(502, `iTunes search answered HTTP ${res.status}`);
-  const data = await res.json() as { results?: ItunesRaw[] };
+  let res: Response | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, 700));
+    res = await fetch(`https://itunes.apple.com/search?${q}`, {
+      headers: { 'User-Agent': FEED_UA }, signal: AbortSignal.timeout(15_000),
+    });
+    if (res.ok || (res.status !== 403 && res.status !== 429)) break;
+  }
+  if (!res!.ok) throw new PodcastError(502, `iTunes search answered HTTP ${res!.status}`);
+  const data = await res!.json() as { results?: ItunesRaw[] };
   // Results without a feed URL can't be subscribed to (Apple-only shows).
   return (data.results ?? []).filter((r) => r.feedUrl).map(cleanItunes);
+}
+
+// fyyd.de: an open podcast directory with no key and no per-IP wall, used
+// when Apple refuses the Worker. Smaller than Apple's catalogue but has the
+// big shows; mapped into the same shape.
+async function fyydSearch(term: string, limit = 25): Promise<ItunesPodcast[]> {
+  const q = new URLSearchParams({ title: term, count: String(limit) });
+  const res = await fetch(`https://api.fyyd.de/0.2/search/podcast?${q}`, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new PodcastError(502, `fyyd search answered HTTP ${res.status}`);
+  const data = await res.json() as { data?: Array<Record<string, unknown>> };
+  const s = (v: unknown) => (typeof v === 'string' ? v : '');
+  return (data.data ?? []).filter((p) => s(p['xmlURL'])).map((p) => ({
+    id: 0,
+    artistId: null,
+    title: s(p['title']),
+    artistName: s(p['author']),
+    description: s(p['description']),
+    descriptionPlain: s(p['description']),
+    releaseDate: s(p['lastpub']),
+    genres: [],
+    cover: s(p['smallImageURL']) || s(p['imgURL']),
+    trackCount: Number(p['episode_count']) || 0,
+    feedUrl: s(p['xmlURL']),
+    pageUrl: s(p['htmlURL']),
+    explicit: false,
+  }));
+}
+
+export async function searchPodcasts(term: string, country = 'us'): Promise<ItunesPodcast[]> {
+  try {
+    return await itunesSearch(term, country);
+  } catch (e) {
+    console.warn(`[podcasts] iTunes search failed (${(e as Error).message}); trying fyyd`);
+    return fyydSearch(term);
+  }
 }
 
 const feedKey = (u: string) => u.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/+$/, '');

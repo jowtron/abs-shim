@@ -1580,13 +1580,35 @@ function wirePodcastLibraries(body, status) {
   body.querySelectorAll('[data-pod-opml]').forEach((inp) => inp.addEventListener('change', () => podImportOpml(inp.dataset.podOpml, inp, body)));
 }
 
+// Apple's directory searched from the browser: Apple rate-limits per IP and
+// refuses the Worker's shared egress IPs (see src/lib/podcasts.ts), but it
+// sends CORS headers, so each person's own IP does the asking. A pasted feed
+// URL, or Apple failing, goes through the shim (which falls back to fyyd).
+async function podDirectorySearch(term, country) {
+  if (!/^https?:\/\//i.test(term)) {
+    try {
+      const q = new URLSearchParams({ term, entity: 'podcast', media: 'podcast', country, limit: '25' });
+      const r = await fetch('https://itunes.apple.com/search?' + q, { credentials: 'omit' });
+      if (r.ok) {
+        const d = await r.json();
+        return (d.results || []).filter((x) => x.feedUrl).map((x) => ({
+          id: x.collectionId, artistId: x.artistId || null, title: x.collectionName, artistName: x.artistName,
+          genres: x.genres || [], cover: x.artworkUrl600 || x.artworkUrl100 || '', trackCount: x.trackCount,
+          feedUrl: x.feedUrl, pageUrl: x.collectionViewUrl,
+        }));
+      }
+    } catch (e) { /* fall through to the shim */ }
+  }
+  return api('/api/search/podcast?term=' + encodeURIComponent(term) + '&country=' + country);
+}
+
 async function podSearch(libId, term, body) {
   const out = body.querySelector('[data-pod-results="' + libId + '"]');
   if (!term) return;
   out.innerHTML = '<p class="muted">Searching…</p>';
   let results;
   try {
-    results = await api('/api/search/podcast?term=' + encodeURIComponent(term) + '&country=au');
+    results = await podDirectorySearch(term, 'au');
   } catch (e) {
     out.innerHTML = '<p class="warn">' + escapeHtml(e.message) + '</p>';
     return;

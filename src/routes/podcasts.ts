@@ -5,7 +5,7 @@ import { getFolderById, getItem, type LibraryFolderRow, type LibraryItemRow } fr
 import { getEpisode, getPodcast, listShowEpisodes, type EpisodeRow, type PodcastRow } from '../db/podcasts';
 import { buildEpisode, buildEpisodeExpanded, buildPodcastItemExpanded } from '../lib/podcast-shapes';
 import {
-  canArchive, createPodcast, fetchAndParse, itunesSearch, PodcastError, refreshPodcast, validFeedUrl,
+  canArchive, createPodcast, fetchAndParse, PodcastError, refreshPodcast, searchPodcasts, validFeedUrl,
 } from '../lib/podcasts';
 import { parseOpml } from '../lib/rss';
 
@@ -395,6 +395,6 @@ podcastSearchRoutes.get('/podcast', async (c) => {
       }]);
     }
     const country = (c.req.query('country') ?? 'us').toLowerCase().replace(/[^a-z]/g, '').slice(0, 2) || 'us';
-    return c.json(await itunesSearch(term, country));
+    return c.json(await searchPodcasts(term, country));
   } catch (e) { return fail(c, e); }
 });
