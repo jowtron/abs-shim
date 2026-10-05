@@ -179,7 +179,10 @@ async function fyydSearch(term: string, limit = 25): Promise<ItunesPodcast[]> {
     descriptionPlain: s(p['description']),
     releaseDate: s(p['lastpub']),
     genres: [],
-    cover: s(p['smallImageURL']) || s(p['imgURL']),
+    // No artwork: fyyd's thumbnails refuse requests without a fyyd Referer
+    // (hotlink protection), so they'd only ever show as broken images. A show
+    // subscribed from here takes its feed's own image.
+    cover: '',
     trackCount: Number(p['episode_count']) || 0,
     feedUrl: s(p['xmlURL']),
     pageUrl: s(p['htmlURL']),
