@@ -31,6 +31,9 @@ export function storageLabel(folder: { provider?: string | null; config_json?: s
       const base = String(config['baseUrl'] ?? '') || folder.filedn_base_url || '';
       return { provider, name: hostOf(base), detail: '' };
     }
+    // A podcast library with no storage of its own: episodes stream from
+    // their publishers and nothing can be archived (src/lib/podcasts.ts).
+    case 'remote': return { provider, name: 'Stream only', detail: '' };
     default: return { provider, name: provider, detail: '' };
   }
 }

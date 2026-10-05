@@ -123,8 +123,10 @@ export async function progressToAbs(env: Env, row: MediaProgressRow): Promise<un
     userId: row.user_id,
     libraryItemId: row.library_item_id,
     episodeId: row.episode_id,
-    mediaItemId: await derivedId(row.library_item_id, 'media'),
-    mediaItemType: row.episode_id ? 'episode' : 'book',
+    // ABS: an episode's progress belongs to the episode (mediaItemId is the
+    // episode id, mediaItemType 'podcastEpisode'), a book's to the book.
+    mediaItemId: row.episode_id ?? await derivedId(row.library_item_id, 'media'),
+    mediaItemType: row.episode_id ? 'podcastEpisode' : 'book',
     duration: row.duration_seconds,
     progress: row.progress,
     currentTime: row.current_time_seconds,

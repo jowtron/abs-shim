@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { Env } from '../types';
-import { requireAuth, type AuthVars } from '../auth/middleware';
+import { requireAuth, requireCanAdd, type AuthVars } from '../auth/middleware';
 import { buildItemDetail } from '../lib/abs-shapes';
 import { buildItemBundle } from './library';
 import { probeM4b } from '../prober/m4b';
@@ -9,11 +9,12 @@ import { probeWebm } from '../prober/webm';
 import { probeMp3 } from '../prober/mp3';
 import { resolveItemIdFromUuid } from '../lib/ids';
 import { findCatalogCover } from '../lib/cover-from-catalog';
-import { getBookMetadata } from '../db/library';
 import { insertListeningSession } from '../db/sessions';
 import { getProgress, progressToAbs } from '../db/progress';
-import { audioContentType, resolveProbeUrl, resolveStreamUrl, streamAudio } from '../storage/resolve';
-import { getStreamingTarget, type AudioFileRow } from '../db/library';
+import { audioContentType, resolveProbeUrl, resolveStreamUrl, streamAudio, streamRemoteAudio } from '../storage/resolve';
+import { getEpisode, getPodcast, listShowEpisodes } from '../db/podcasts';
+import { buildEpisodeExpanded, buildPodcastItemExpanded, podcastMetadata } from '../lib/podcast-shapes';
+import { getBookMetadata, getFolderById, getItem, getStreamingTarget, type AudioFileRow } from '../db/library';
 import { tryServeMoovRange, warmMoovCache } from '../storage/moov-cache';
 import { tryServeByteRange, warmByteChunk, estimateByteOffsetForTime, CHUNK_SIZE } from '../storage/byte-cache';
 
@@ -85,9 +86,35 @@ itemRoutes.get('/:id/cover', async (c) => {
   // Public route — discover the item's own tenant (only on this cache-miss
   // probe path, never on the hot Tier 1/2 cache hits above) so buildItemBundle
   // can run tenant-scoped.
-  const trow = await c.env.DB.prepare('SELECT tenant_id FROM library_items WHERE id = ? LIMIT 1')
-    .bind(id).first<{ tenant_id: string }>();
+  const trow = await c.env.DB.prepare('SELECT tenant_id, media_type FROM library_items WHERE id = ? LIMIT 1')
+    .bind(id).first<{ tenant_id: string; media_type: string }>();
   if (!trow) return c.json({ error: 'Item not found' }, 404);
+
+  // A podcast's cover is its artwork URL — Apple's 600 px copy when the show
+  // was matched on iTunes, else the feed's own image (see lib/podcasts.ts).
+  if (trow.media_type === 'podcast') {
+    const p = await c.env.DB.prepare('SELECT cover_url, image_url FROM podcasts WHERE library_item_id = ?')
+      .bind(id).first<{ cover_url: string | null; image_url: string | null }>();
+    const src = p?.cover_url || p?.image_url;
+    if (!src) return placeholderImage();
+    let img: Response;
+    try {
+      img = await fetch(src, { signal: AbortSignal.timeout(15_000) });
+    } catch {
+      return placeholderImage();
+    }
+    const type = img.headers.get('content-type') ?? '';
+    if (!img.ok || !type.startsWith('image/')) return placeholderImage();
+    const bytes = new Uint8Array(await img.arrayBuffer());
+    const res = new Response(bytes, {
+      headers: { 'Content-Type': type, 'Cache-Control': 'public, max-age=2592000, immutable', 'Content-Length': String(bytes.byteLength) },
+    });
+    c.executionCtx.waitUntil(Promise.all([
+      cache.put(cacheKey, res.clone()),
+      c.env.COVERS.put(r2Key, bytes, { httpMetadata: { contentType: type } }),
+    ]));
+    return res;
+  }
   const bundle = await buildItemBundle(c.env, id, trow.tenant_id);
   if (!bundle) return c.json({ error: 'Item not found' }, 404);
   const audio = bundle.audioFiles[0];
@@ -150,6 +177,8 @@ itemRoutes.use('*', requireAuth);
 
 itemRoutes.get('/:id', async (c) => {
   const userRow = c.get('user');
+  const show = await loadPodcastItem(c.env, c.req.param('id'), c.get('tenantId'));
+  if (show) return c.json(await buildPodcastItemExpanded(show.item, show.folder, show.podcast, await listShowEpisodes(c.env, show.item.id, c.get('tenantId'))));
   const bundle = await buildItemBundle(c.env, c.req.param('id'), c.get('tenantId'));
   if (!bundle) return c.json({ error: 'Item not found' }, 404);
   // Stock ABS gates `userMediaProgress` on ?include=progress, but Plappa and
@@ -197,6 +226,21 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
   const finish = (r: Response): Response => (download ? asAttachment(r, target.audio) : r);
 
   const rangeHeader = c.req.header('Range') ?? null;
+
+  // Podcast episodes skip the moov and byte caches: those exist for pCloud's
+  // slow first byte on books people come back to for weeks, and an R2 copy
+  // of every episode anyone plays would only grow. Not archived → the
+  // publisher's CDN, proxied; archived → the library's storage, like a book.
+  if (target.episode) {
+    if (!target.audio.rel_path) {
+      const episodeId = target.episode.id;
+      return finish(await streamRemoteAudio(target.audio, c.req.raw, (size) => {
+        c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE podcast_episodes SET size_bytes = ? WHERE id = ?')
+          .bind(size, episodeId).run().then(() => undefined, () => undefined));
+      }));
+    }
+    return finish(await streamAudio(c.env, target.folder, target.audio, c.req.raw));
+  }
 
   // Fast path 1: Range overlaps the cached moov atom region — serve from R2
   // (~50ms) instead of pCloud (~800ms). Specifically targets non-fast-start
@@ -274,6 +318,7 @@ itemRoutes.post('/:id/play', async (c) => {
   const userRow = c.get('user');
   const bundle = await buildItemBundle(c.env, c.req.param('id'), c.get('tenantId'));
   if (!bundle) return c.json({ error: 'Item not found' }, 404);
+  if (bundle.item.media_type === 'podcast') return c.json({ error: 'A podcast plays one episode: POST /api/items/:id/play/:episodeId' }, 400);
 
   const body = await c.req.json().catch(() => ({}));
   const detail = await buildItemDetail(bundle);
@@ -372,4 +417,127 @@ itemRoutes.post('/:id/play', async (c) => {
     audioTracks,
     libraryItem: detail,
   });
+});
+
+// ─── Podcasts ────────────────────────────────────────────────────────────────
+
+async function loadPodcastItem(env: Env, itemId: string, tenantId: string) {
+  const item = await getItem(env, itemId, tenantId);
+  if (!item || item.media_type !== 'podcast') return null;
+  const [folder, podcast] = await Promise.all([getFolderById(env, item.folder_id, tenantId), getPodcast(env, itemId, tenantId)]);
+  return folder && podcast ? { item, folder, podcast } : null;
+}
+
+// POST /api/items/:id/play/:episodeId — ABS's startEpisodePlaybackSession:
+// one audio track (the episode), the show's metadata as mediaMetadata, the
+// episode title as displayTitle and the show's author as displayAuthor.
+itemRoutes.post('/:id/play/:episodeId', async (c) => {
+  const userRow = c.get('user');
+  const tenantId = c.get('tenantId');
+  const show = await loadPodcastItem(c.env, c.req.param('id'), tenantId);
+  if (!show) return c.json({ error: 'Podcast not found' }, 404);
+  const ep = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), tenantId);
+  if (!ep) return c.json({ error: 'Episode not found' }, 404);
+  // Playing an episode from the feed that isn't on the show puts it there:
+  // Continue Listening and Latest only list episodes on a show.
+  if (ep.in_library !== 1) {
+    await c.env.DB.prepare('UPDATE podcast_episodes SET in_library = 1, removed = 0, updated_at = ? WHERE id = ?')
+      .bind(Date.now(), ep.id).run();
+  }
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  const episode = await buildEpisodeExpanded(ep, show.item, show.folder);
+
+  const progress = await getProgress(c.env, userRow.id, show.item.id, ep.id);
+  const resumeAt = progress && progress.is_finished !== 1 ? progress.current_time_seconds : 0;
+  const now = Date.now();
+  const date = new Date(now);
+  const sessionId = crypto.randomUUID();
+  await insertListeningSession(c.env, {
+    id: sessionId,
+    user_id: userRow.id,
+    library_item_id: show.item.id,
+    episode_id: ep.id,
+    display_title: ep.title,
+    display_author: show.podcast.author,
+    duration_seconds: ep.duration_seconds,
+    play_method: 0,
+    media_player: String(body['mediaPlayer'] ?? 'unknown'),
+    device_info: JSON.stringify(body['deviceInfo'] ?? {}),
+    server_version: '2.34.0',
+    date_started: now,
+    current_time_seconds: resumeAt,
+    time_listening_seconds: 0,
+    start_time_seconds: resumeAt,
+    closed_at: null,
+    updated_at: now,
+  });
+
+  return c.json({
+    id: sessionId,
+    userId: userRow.id,
+    libraryId: show.item.library_id,
+    libraryItemId: show.item.id,
+    bookId: null,
+    episodeId: ep.id,
+    mediaType: 'podcast',
+    mediaMetadata: podcastMetadata(show.podcast),
+    chapters: episode.chapters,
+    displayTitle: ep.title,
+    displayAuthor: show.podcast.author,
+    coverPath: `/metadata/items/${show.item.id}/cover.jpg`,
+    duration: ep.duration_seconds,
+    playMethod: 0,
+    mediaPlayer: body['mediaPlayer'] ?? 'unknown',
+    deviceInfo: body['deviceInfo'] ?? {},
+    serverVersion: '2.34.0',
+    date: date.toISOString().slice(0, 10),
+    dayOfWeek: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][date.getUTCDay()]!,
+    timeListening: 0,
+    startTime: resumeAt,
+    currentTime: resumeAt,
+    startedAt: now,
+    updatedAt: now,
+    audioTracks: [episode.audioTrack],
+    libraryItem: await buildPodcastItemExpanded(show.item, show.folder, show.podcast, [ep]),
+  });
+});
+
+// PATCH /api/items/:id/media — how ABS clients change a podcast's settings
+// (autoDownloadEpisodes, maxEpisodesToKeep, maxNewEpisodesToDownload,
+// autoDownloadSchedule, tags). Shim extra: `archive`. Books aren't editable
+// here (their metadata comes from the files); that answers 400.
+itemRoutes.patch('/:id/media', requireCanAdd, async (c) => {
+  const tenantId = c.get('tenantId');
+  const show = await loadPodcastItem(c.env, c.req.param('id'), tenantId);
+  if (!show) return c.json({ error: 'Only podcast settings can be changed here' }, 400);
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  const bool = (k: string, col: string) => { if (typeof body[k] === 'boolean') { sets.push(`${col} = ?`); binds.push(body[k] ? 1 : 0); } };
+  const int = (k: string, col: string) => {
+    const v = body[k];
+    if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 10000) { sets.push(`${col} = ?`); binds.push(v); }
+  };
+  bool('autoDownloadEpisodes', 'auto_download');
+  bool('archive', 'archive');
+  int('maxEpisodesToKeep', 'max_episodes_to_keep');
+  int('maxNewEpisodesToDownload', 'max_new_episodes_to_download');
+  if (typeof body['autoDownloadSchedule'] === 'string') { sets.push('auto_download_schedule = ?'); binds.push(body['autoDownloadSchedule']); }
+  if (Array.isArray(body['tags'])) { sets.push('tags = ?'); binds.push(JSON.stringify((body['tags'] as unknown[]).filter((t) => typeof t === 'string'))); }
+  const md = body['metadata'] as Record<string, unknown> | undefined;
+  if (md && typeof md === 'object') {
+    for (const [k, col] of [['title', 'title'], ['author', 'author'], ['description', 'description'], ['language', 'language']] as const) {
+      if (typeof md[k] === 'string') { sets.push(`${col} = ?`); binds.push(md[k]); }
+    }
+    if (typeof md['feedUrl'] === 'string' && /^https?:\/\//i.test(md['feedUrl'])) {
+      sets.push('feed_url = ?, feed_etag = NULL, feed_last_modified = NULL'); binds.push(md['feedUrl']);
+    }
+  }
+  if (sets.length) {
+    await c.env.DB.prepare(`UPDATE podcasts SET ${sets.join(', ')}, updated_at = ? WHERE library_item_id = ?`)
+      .bind(...binds, Date.now(), show.item.id).run();
+  }
+  const fresh = (await loadPodcastItem(c.env, show.item.id, tenantId))!;
+  const libraryItem = await buildPodcastItemExpanded(fresh.item, fresh.folder, fresh.podcast, await listShowEpisodes(c.env, show.item.id, tenantId));
+  return c.json({ updated: sets.length > 0, libraryItem });
 });

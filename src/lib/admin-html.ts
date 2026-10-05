@@ -716,6 +716,7 @@ function describeFolder(f) {
   if (f.provider === 'pcloud_oauth') return 'root: ' + escapeHtml(c.rootPath || '/') + ' · profile: ' + escapeHtml(f.profileId || '(missing)');
   if (f.provider === 's3') return escapeHtml(c.endpoint || '') + ' / ' + escapeHtml(c.bucket || '') + (c.prefix ? ' / ' + escapeHtml(c.prefix) : '');
   if (f.provider === 'webdav') return escapeHtml(c.baseUrl || '') + (c.rootPath ? ' / ' + escapeHtml(c.rootPath) : '') + ' (user: ' + escapeHtml(c.username || '?') + ')';
+  if (f.provider === 'remote') return 'no storage: episodes stream from their publishers';
   return '';
 }
 
@@ -1099,9 +1100,12 @@ function renderLibraries(status, libraries) {
   const isOwner = status.role === 'owner';
   const canAdd = !!status.canAdd;
   let html = '';
-  for (const lib of libraries) {
+  // Views (view-…) are managed in their library's Views panel, not listed
+  // as libraries of their own: they have no storage and nothing to scan.
+  for (const lib of libraries.filter((l) => !String(l.id).startsWith('view-'))) {
     const folders = foldersByLib[lib.id] || [];
     const s = stats[lib.id] || { bookCount: 0, missingCount: 0, totalDurationSeconds: 0, totalSizeBytes: 0 };
+    if (lib.mediaType === 'podcast') { html += podcastLibraryHtml(lib, folders, s, isOwner, canAdd, status); continue; }
     html += '<div style="margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border);">';
     html += '<strong>' + escapeHtml(lib.name) + '</strong> ';
     html += '<span class="muted">· ' + escapeHtml(lib.id) + '</span><br>';
@@ -1193,7 +1197,10 @@ function renderLibraries(status, libraries) {
 
     html += '</div>';
   }
+  if (isOwner) html += newLibraryHtml(status);
   body.innerHTML = html;
+  wirePodcastLibraries(body, status);
+  wireNewLibrary(body, status);
 
   body.querySelectorAll('[data-remove-folder]').forEach((btn) => {
     btn.addEventListener('click', async () => {
@@ -1229,7 +1236,10 @@ function renderLibraries(status, libraries) {
         // Always shown, even for "no changes": the Last-scan card lives at
         // the bottom of the page and clicking Scan gave no visible feedback.
         await refresh();
-        const summary = (report.added > 0 ? 'Added ' + report.added + ' book(s)' : 'No changes')
+        const summary = report.feedsChecked != null
+          ? 'Checked ' + report.feedsChecked + ' feed(s) (each is checked at most every 5 minutes), ' + report.added + ' new episode(s)'
+            + (report.errors.length ? ', ' + report.errors.length + ' failed' : '')
+          : (report.added > 0 ? 'Added ' + report.added + ' book(s)' : 'No changes')
           + ' — ' + report.skipped + ' already in library'
           + (report.errors && report.errors.length ? ', ' + report.errors.length + ' error(s) — see "Last scan" at the bottom' : '')
           + ' · ' + (report.durationMs / 1000).toFixed(1) + 's';
@@ -1505,6 +1515,276 @@ function renderLibraries(status, libraries) {
         showError('Attach failed: ' + e.message);
       }
     });
+  });
+}
+
+// ─── Podcast libraries ──────────────────────────────────────────────────────
+//
+// A podcast library's shows come from feeds (src/lib/podcasts.ts), so its
+// block has no upload, scan-a-folder or re-probe: search Apple's directory
+// (or paste a feed URL) to subscribe, import and export OPML, and per show
+// check the feed, switch archiving to pCloud, or unsubscribe.
+
+function podcastLibraryHtml(lib, folders, s, isOwner, canAdd, status) {
+  const id = escapeHtml(lib.id);
+  const pc = folders.find((f) => f.provider === 'pcloud_oauth');
+  let h = '<div style="margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border);">';
+  h += '<strong>' + escapeHtml(lib.name) + '</strong> <span class="muted">· podcasts · ' + id + '</span><br>';
+  h += '<span class="muted" style="font-size:0.85rem;">' + s.bookCount + ' show' + (s.bookCount === 1 ? '' : 's') + ' · '
+    + (pc ? 'can archive episodes to pCloud ' + escapeHtml((pc.config && pc.config.rootPath) || '/')
+      : 'stream only: episodes play from their publishers and nothing is archived') + '</span>';
+  h += '<div class="row" style="flex-wrap:wrap; gap:0.5rem; margin-top:0.5rem">';
+  h += '<button data-scan="' + id + '" title="Check every show for new episodes now. The server also checks each feed hourly.">Check feeds now</button>';
+  h += '<button class="secondary" data-pod-shows="' + id + '" data-pod-pcloud="' + (pc ? '1' : '') + '">Shows (' + s.bookCount + ')</button>';
+  if (canAdd) h += '<button class="secondary" data-pod-add="' + id + '">Add podcast…</button>';
+  h += '<a class="btn secondary" href="/api/libraries/' + id + '/opml" download="' + escapeHtml(lib.name) + '.opml" title="Every show\'s feed, for importing into another podcast app">Export OPML</a>';
+  if (isOwner && !pc && (status.profiles || []).some((p) => p.provider === 'pcloud')) {
+    h += '<button class="secondary" data-attach-pcloud="' + id + '" title="Move this library onto pCloud so episodes can be archived there. Episodes keep playing from their publishers until archived.">Archive to pCloud…</button>';
+  }
+  h += '</div>';
+  if (canAdd) {
+    h += '<div class="upload-area" id="pod-add-' + id + '">';
+    h += '<div class="upload-row"><input type="text" data-pod-term="' + id + '" placeholder="Search Apple Podcasts, or paste a feed URL">';
+    h += '<button data-pod-search="' + id + '">Search</button></div>';
+    if (pc) h += '<label class="muted" style="display:block;margin-bottom:0.5rem"><input type="checkbox" data-pod-archive="' + id + '"> Archive new episodes to pCloud</label>';
+    h += '<div data-pod-results="' + id + '"></div>';
+    h += '<div class="upload-row" style="margin-top:0.6rem"><span class="muted">Or import an OPML file from another podcast app:</span>';
+    h += '<input type="file" accept=".opml,.xml,text/xml,text/x-opml" data-pod-opml="' + id + '"></div>';
+    h += '<div data-pod-opml-out="' + id + '" class="muted"></div>';
+    h += '</div>';
+  }
+  h += '<div id="pod-shows-' + id + '" class="books-list" style="display:none"></div>';
+  h += '</div>';
+  return h;
+}
+
+function wirePodcastLibraries(body, status) {
+  body.querySelectorAll('[data-pod-add]').forEach((btn) => btn.addEventListener('click', () => {
+    const area = document.getElementById('pod-add-' + btn.dataset.podAdd);
+    area.classList.toggle('open');
+    if (area.classList.contains('open')) area.querySelector('[data-pod-term]').focus();
+  }));
+  body.querySelectorAll('[data-pod-shows]').forEach((btn) => btn.addEventListener('click', () => {
+    const panel = document.getElementById('pod-shows-' + btn.dataset.podShows);
+    const open = panel.style.display === 'none';
+    panel.style.display = open ? '' : 'none';
+    if (open) podLoadShows(btn.dataset.podShows, panel, status, !!btn.dataset.podPcloud);
+  }));
+  body.querySelectorAll('[data-pod-search]').forEach((btn) => {
+    const libId = btn.dataset.podSearch;
+    const input = body.querySelector('[data-pod-term="' + libId + '"]');
+    const go = () => podSearch(libId, input.value.trim(), body);
+    btn.addEventListener('click', go);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+  });
+  body.querySelectorAll('[data-pod-opml]').forEach((inp) => inp.addEventListener('change', () => podImportOpml(inp.dataset.podOpml, inp, body)));
+}
+
+async function podSearch(libId, term, body) {
+  const out = body.querySelector('[data-pod-results="' + libId + '"]');
+  if (!term) return;
+  out.innerHTML = '<p class="muted">Searching…</p>';
+  let results;
+  try {
+    results = await api('/api/search/podcast?term=' + encodeURIComponent(term) + '&country=au');
+  } catch (e) {
+    out.innerHTML = '<p class="warn">' + escapeHtml(e.message) + '</p>';
+    return;
+  }
+  if (!results.length) { out.innerHTML = '<p class="muted">Nothing found.</p>'; return; }
+  let h = '';
+  results.forEach((r, i) => {
+    h += '<div style="display:flex;gap:0.6rem;align-items:center;padding:0.4rem 0;border-bottom:1px solid var(--border)">';
+    if (r.cover) h += '<img src="' + escapeHtml(r.cover) + '" alt="" loading="lazy" style="width:48px;height:48px;border-radius:4px;object-fit:cover;flex-shrink:0">';
+    h += '<div style="flex:1;min-width:0"><strong>' + escapeHtml(r.title) + '</strong><br><span class="muted" style="font-size:0.85rem">'
+      + escapeHtml(r.artistName || '') + (r.trackCount ? ' · ' + r.trackCount + ' episodes' : '')
+      + (r.genres && r.genres.length ? ' · ' + escapeHtml(r.genres[0]) : '') + '</span></div>';
+    h += '<button data-pod-sub="' + i + '">Subscribe</button></div>';
+  });
+  out.innerHTML = h;
+  out.querySelectorAll('[data-pod-sub]').forEach((b) => b.addEventListener('click', async () => {
+    const r = results[Number(b.dataset.podSub)];
+    const archiveBox = body.querySelector('[data-pod-archive="' + libId + '"]');
+    b.disabled = true; b.textContent = 'Subscribing…';
+    try {
+      const item = await api('/api/podcasts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          libraryId: libId,
+          media: {
+            metadata: {
+              feedUrl: r.feedUrl, title: r.title, author: r.artistName, imageUrl: r.cover || null, genres: r.genres || [],
+              itunesId: r.id ? String(r.id) : null, itunesArtistId: r.artistId ? String(r.artistId) : null, itunesPageUrl: r.pageUrl || null,
+            },
+            autoDownloadEpisodes: true,
+            archive: !!(archiveBox && archiveBox.checked),
+          },
+        }),
+      });
+      b.textContent = '✓ ' + item.media.numEpisodes + ' episode' + (item.media.numEpisodes === 1 ? '' : 's');
+      b.className = 'secondary';
+    } catch (e) {
+      b.disabled = false; b.textContent = 'Subscribe';
+      showError('Subscribe failed: ' + e.message);
+    }
+  }));
+}
+
+async function podImportOpml(libId, inp, body) {
+  const out = body.querySelector('[data-pod-opml-out="' + libId + '"]');
+  const file = inp.files && inp.files[0];
+  if (!file) return;
+  try {
+    const parsed = await api('/api/podcasts/opml/parse', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ opmlText: await file.text() }),
+    });
+    if (!parsed.feeds.length) { out.textContent = 'No podcast feeds in that file.'; return; }
+    if (!confirm('Subscribe to ' + parsed.feeds.length + ' podcast' + (parsed.feeds.length === 1 ? '' : 's') + ' from ' + file.name + '?')) return;
+    const r = await api('/api/podcasts/opml/create', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ libraryId: libId, feeds: parsed.feeds }),
+    });
+    out.textContent = 'Added ' + r.created + ' show' + (r.created === 1 ? '' : 's')
+      + (r.skipped.length ? '; skipped ' + r.skipped.length + ' (' + r.skipped.map((s) => s.reason).join('; ') + ')' : '')
+      + '. Their episodes arrive over the next few minutes as the server checks each feed.';
+  } catch (e) {
+    out.textContent = 'Import failed: ' + e.message;
+  } finally {
+    inp.value = '';
+  }
+}
+
+async function podLoadShows(libId, panel, status, hasPcloud) {
+  panel.innerHTML = 'Loading…';
+  let d;
+  try {
+    d = await api('/api/admin/libraries/' + libId + '/podcasts');
+  } catch (e) {
+    panel.innerHTML = '<p class="warn">' + escapeHtml(e.message) + '</p>';
+    return;
+  }
+  if (!d.podcasts.length) { panel.innerHTML = '<p class="muted">No shows yet. Use "Add podcast…".</p>'; return; }
+  const owner = status.role === 'owner';
+  const canAdd = !!status.canAdd;
+  let h = '';
+  for (const p of d.podcasts) {
+    const id = escapeHtml(p.library_item_id);
+    h += '<div style="display:flex;gap:0.6rem;align-items:center;padding:0.45rem 0;border-bottom:1px solid var(--border);flex-wrap:wrap">';
+    h += '<img src="/api/items/' + id + '/cover" alt="" loading="lazy" style="width:40px;height:40px;border-radius:4px;object-fit:cover">';
+    h += '<div style="flex:1;min-width:12rem"><strong>' + escapeHtml(p.title || p.feed_url) + '</strong><br><span class="muted" style="font-size:0.8rem">'
+      + p.on_show + ' on the show · ' + p.in_feed + ' in the feed'
+      + (p.archive ? ' · archived ' + p.archived + (p.archiving ? ', ' + p.archiving + ' in progress' : '')
+        + (p.archive_errors ? ', <span class="warn">' + p.archive_errors + ' failed</span>' : '') : '')
+      + ' · checked ' + abbAgo(p.last_episode_check)
+      + (p.last_error ? '<br><span class="warn">' + escapeHtml(p.last_error) + '</span>' : '') + '</span></div>';
+    if (canAdd) {
+      h += '<button class="secondary" data-pod-check="' + id + '">Check now</button>';
+      if (hasPcloud) {
+        h += '<label class="muted" style="font-size:0.85rem" title="Copy each new episode into pCloud as it comes out"><input type="checkbox" data-pod-arch="' + id + '"' + (p.archive ? ' checked' : '') + '> Archive</label>';
+        if (p.archive) h += '<button class="secondary" data-pod-archall="' + id + '" title="Queue every episode on the show that isn\'t archived yet">Archive all</button>';
+      }
+    }
+    if (owner) h += '<button class="danger" data-pod-remove="' + id + '" data-pod-title="' + escapeHtml(p.title || '') + '" data-pod-archived="' + p.archived + '">Unsubscribe</button>';
+    h += '</div>';
+  }
+  panel.innerHTML = h;
+  const reload = () => podLoadShows(libId, panel, status, hasPcloud);
+
+  panel.querySelectorAll('[data-pod-check]').forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true; b.textContent = 'Checking…';
+    try {
+      const r = await api('/api/podcasts/' + b.dataset.podCheck + '/checknew');
+      b.textContent = r.episodes.length ? '+' + r.episodes.length + ' new' : 'Nothing new';
+      setTimeout(reload, 1200);
+    } catch (e) {
+      b.disabled = false; b.textContent = 'Check now';
+      showError('Check failed: ' + e.message);
+    }
+  }));
+  panel.querySelectorAll('[data-pod-arch]').forEach((box) => box.addEventListener('change', async () => {
+    try {
+      await api('/api/items/' + box.dataset.podArch + '/media', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ archive: box.checked }),
+      });
+      reload();
+    } catch (e) {
+      box.checked = !box.checked;
+      showError('Change failed: ' + e.message);
+    }
+  }));
+  panel.querySelectorAll('[data-pod-archall]').forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    try {
+      const r = await api('/api/podcasts/' + b.dataset.podArchall + '/archive', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      b.textContent = r.queued + ' queued';
+      setTimeout(reload, 1200);
+    } catch (e) {
+      b.disabled = false;
+      showError('Archive failed: ' + e.message);
+    }
+  }));
+  panel.querySelectorAll('[data-pod-remove]').forEach((b) => b.addEventListener('click', async () => {
+    const title = b.dataset.podTitle || 'this podcast';
+    if (!confirm('Unsubscribe from ' + title + '? Its listening progress goes with it.')) return;
+    const archived = Number(b.dataset.podArchived || '0');
+    const files = archived > 0 && confirm('Also delete its ' + archived + ' archived episode' + (archived === 1 ? '' : 's') + ' from pCloud?\n\nCancel keeps the files.');
+    b.disabled = true;
+    try {
+      await api('/api/admin/items/' + b.dataset.podRemove + (files ? '?deleteFiles=1' : ''), { method: 'DELETE' });
+      reload();
+      refresh();
+    } catch (e) {
+      b.disabled = false;
+      showError('Unsubscribe failed: ' + e.message);
+    }
+  }));
+}
+
+// Owner-only "New library" form at the foot of the Libraries card. Book
+// libraries need storage; a podcast library may have none (stream only).
+function newLibraryHtml(status) {
+  const profiles = (status.profiles || []).filter((p) => p.provider === 'pcloud');
+  let h = '<details style="margin-top:0.5rem"><summary>New library…</summary>';
+  h += '<div class="upload-row" style="margin-top:0.5rem">';
+  h += '<input type="text" data-newlib-name placeholder="Name, e.g. Podcasts" style="flex:1;min-width:10rem">';
+  h += '<select data-newlib-type><option value="podcast">Podcasts</option><option value="book">Audiobooks</option></select>';
+  h += '<select data-newlib-storage>';
+  for (const p of profiles) h += '<option value="' + escapeHtml(p.id) + '">pCloud ' + escapeHtml(p.account_label || p.id) + '</option>';
+  h += '<option value="none">No storage (podcasts stream only)</option></select>';
+  h += '<input type="text" data-newlib-root placeholder="pCloud folder, e.g. Podcasts" style="max-width:13rem">';
+  h += '<button data-newlib-go>Create</button></div>';
+  h += '<p class="muted" style="font-size:0.85rem;margin:0">A podcast library on pCloud can archive episodes there as they come out; one with no storage plays every episode from its publisher. Apps list the new library beside the others.</p>';
+  h += '</details>';
+  return h;
+}
+
+function wireNewLibrary(body) {
+  const go = body.querySelector('[data-newlib-go]');
+  if (!go) return;
+  const storageSel = body.querySelector('[data-newlib-storage]');
+  const rootInput = body.querySelector('[data-newlib-root]');
+  const sync = () => { rootInput.style.display = storageSel.value === 'none' ? 'none' : ''; };
+  storageSel.addEventListener('change', sync);
+  sync();
+  go.addEventListener('click', async () => {
+    const name = body.querySelector('[data-newlib-name]').value.trim();
+    const type = body.querySelector('[data-newlib-type]').value;
+    if (!name) { showError('Give the library a name'); return; }
+    const storage = storageSel.value === 'none' ? 'none'
+      : { profileId: storageSel.value, rootPath: rootInput.value.trim() || (type === 'podcast' ? 'Podcasts' : 'Audiobooks') };
+    go.disabled = true;
+    try {
+      await api('/api/admin/libraries', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, mediaType: type, storage }),
+      });
+      refresh();
+    } catch (e) {
+      go.disabled = false;
+      showError('Create failed: ' + e.message);
+    }
   });
 }
 

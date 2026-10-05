@@ -1,4 +1,6 @@
 import type { Env } from '../types';
+import { getEpisodeForFile, type EpisodeRow } from './podcasts';
+import { episodeExt, episodeMime } from '../lib/podcast-shapes';
 
 export type LibraryRow = {
   id: string;
@@ -213,13 +215,26 @@ export async function getStreamingTarget(
   itemId: string,
   fileId: string,
   tenantId: string,
-): Promise<{ audio: AudioFileRow; folder: LibraryFolderRow } | null> {
+): Promise<{ audio: AudioFileRow; folder: LibraryFolderRow; episode?: EpisodeRow } | null> {
   // Tenant filter is a single extra predicate on the existing index — NOT a
   // JOIN — to keep this Range hot path cheap (see migration 0004 rationale).
   const item = await env.DB.prepare(
-    'SELECT folder_id FROM library_items WHERE id = ? AND tenant_id = ? LIMIT 1',
-  ).bind(itemId, tenantId).first<{ folder_id: string }>();
+    'SELECT folder_id, media_type FROM library_items WHERE id = ? AND tenant_id = ? LIMIT 1',
+  ).bind(itemId, tenantId).first<{ folder_id: string; media_type: string }>();
   if (!item) return null;
+
+  // A podcast's audio is its episodes (migration 0016), addressed by the
+  // episode's ino. No fall-back-to-the-first-file here: playing the wrong
+  // episode is worse than a 404.
+  if (item.media_type === 'podcast') {
+    const [episode, folder] = await Promise.all([
+      getEpisodeForFile(env, itemId, fileId, tenantId),
+      env.DB.prepare('SELECT * FROM library_folders WHERE id = ? AND tenant_id = ? LIMIT 1')
+        .bind(item.folder_id, tenantId).first<LibraryFolderRow>(),
+    ]);
+    if (!episode || !folder) return null;
+    return { audio: episodeAudioRow(episode), folder, episode };
+  }
 
   const numericFid = Number(fileId);
   const numericLookup = Number.isFinite(numericFid) ? numericFid : -1;
@@ -247,6 +262,35 @@ export async function getStreamingTarget(
 
   if (!audio || !folder) return null;
   return { audio, folder };
+}
+
+// An episode dressed as an audio_files row, so the streaming code that takes
+// one doesn't need a second path. Archived: rel_path on the library's own
+// storage. Not archived: no rel_path and the enclosure URL in filedn_url —
+// the streaming route sends those through streamRemoteAudio.
+export function episodeAudioRow(e: EpisodeRow): AudioFileRow {
+  const archived = e.archive_state === 'done' && !!e.archive_rel_path;
+  return {
+    id: e.id,
+    library_item_id: e.library_item_id,
+    tenant_id: e.tenant_id,
+    index_no: 1,
+    filedn_url: archived ? '' : e.enclosure_url,
+    ino: e.ino,
+    duration_seconds: e.duration_seconds,
+    size_bytes: e.size_bytes,
+    mime_type: episodeMime(e),
+    format: episodeExt(e),
+    codec: null,
+    bitrate: null,
+    sample_rate: null,
+    channels: null,
+    added_at: e.created_at,
+    rel_path: archived ? e.archive_rel_path : null,
+    provider_file_id: null,
+    moov_offset: null,
+    moov_size: null,
+  };
 }
 
 // ── Batched bundle loading ────────────────────────────────────────────────

@@ -12,6 +12,8 @@ import {
 import { runScan, addBookByPath, reprobeItem, type ScanReport } from '../scanner/scan';
 import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem, getBookMetadata } from '../db/library';
 import { resolveLibraryScope, viewFilter, type LibraryViewRow } from '../db/library-views';
+import type { PodcastRow } from '../db/podcasts';
+import { refreshPodcast } from '../lib/podcasts';
 import { probeM4b } from '../prober/m4b';
 import { probeMp3 } from '../prober/mp3';
 import { resolveProbeUrl } from '../storage/resolve';
@@ -171,6 +173,79 @@ adminRoutes.get('/storage/status', async (c) => {
     membersCanAdd: membersMayAdd,
     canAdd: isOwner || membersMayAdd,
   });
+});
+
+// ─── Creating a library ─────────────────────────────────────────────────────
+//
+// Owner-only. Until podcasts (2026-10-06) libraries were only ever made by
+// seed SQL. Body: {name, mediaType: 'book'|'podcast', storage}, where storage
+// is {profileId, rootPath} to put the library on a connected pCloud account,
+// or 'none' for a podcast library that only streams from the publishers.
+// /admin lists libraries by their folders, so one is always created with it.
+adminRoutes.post('/libraries', requireTenantOwner, async (c) => {
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  const tenantId = c.get('tenantId');
+  const name = String(body['name'] ?? '').trim().slice(0, 80);
+  const mediaType = body['mediaType'] === 'podcast' ? 'podcast' : 'book';
+  if (!name) return c.json({ error: 'name required' }, 400);
+  const storage = body['storage'];
+  let provider: string;
+  let config: string;
+  let profileId: string | null = null;
+  if (storage === 'none') {
+    if (mediaType !== 'podcast') return c.json({ error: 'A book library needs storage' }, 400);
+    provider = 'remote';
+    config = '{}';
+  } else if (storage && typeof storage === 'object' && typeof (storage as Record<string, unknown>)['profileId'] === 'string') {
+    const s = storage as Record<string, unknown>;
+    const profile = await c.env.DB.prepare(`SELECT id FROM oauth_profiles WHERE id = ? AND provider = 'pcloud' AND tenant_id = ?`)
+      .bind(s['profileId'], tenantId).first<{ id: string }>();
+    if (!profile) return c.json({ error: 'pCloud profile not found' }, 404);
+    const rootPath = '/' + String(s['rootPath'] ?? (mediaType === 'podcast' ? 'Podcasts' : 'Audiobooks')).trim().replace(/^\/+|\/+$/g, '');
+    provider = 'pcloud_oauth';
+    config = JSON.stringify({ rootPath });
+    profileId = profile.id;
+  } else {
+    return c.json({ error: "storage must be {profileId, rootPath} or 'none'" }, 400);
+  }
+  const now = Date.now();
+  const order = await c.env.DB.prepare('SELECT COALESCE(MAX(display_order), 0) AS m FROM libraries WHERE tenant_id = ?')
+    .bind(tenantId).first<{ m: number }>();
+  const libraryId = 'lib-' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+  const folderId = crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO libraries (id, name, display_order, media_type, icon, provider, settings, created_at, updated_at, tenant_id)
+       VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, ?)`,
+    ).bind(libraryId, name, (order?.m ?? 0) + 10, mediaType, mediaType === 'podcast' ? 'podcast' : 'audiobookshelf',
+      mediaType === 'podcast' ? 'itunes' : 'audible', now, now, tenantId),
+    c.env.DB.prepare(
+      `INSERT INTO library_folders (id, library_id, tenant_id, filedn_base_url, added_at, provider, config_json, profile_id)
+       VALUES (?, ?, ?, '', ?, ?, ?, ?)`,
+    ).bind(folderId, libraryId, tenantId, now, provider, config, profileId),
+  ]);
+  return c.json({ libraryId, folderId });
+});
+
+// ─── Podcasts (owner/member overview for /admin) ────────────────────────────
+
+// Every show in a podcast library with what /admin's Podcasts panel shows:
+// episode counts, archive progress, the last check and its error.
+adminRoutes.get('/libraries/:libId/podcasts', async (c) => {
+  const tenantId = c.get('tenantId');
+  const r = await c.env.DB.prepare(
+    `SELECT p.library_item_id, p.title, p.author, p.feed_url, p.archive, p.auto_download, p.last_episode_check,
+            p.next_check_at, p.last_error, p.check_failures, li.rel_path,
+            (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.in_library = 1) AS on_show,
+            (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id) AS in_feed,
+            (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.archive_state = 'done') AS archived,
+            (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.archive_state IN ('queued', 'fetching')) AS archiving,
+            (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.archive_state = 'error') AS archive_errors
+       FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
+      WHERE li.library_id = ? AND p.tenant_id = ?
+      ORDER BY p.title COLLATE NOCASE`,
+  ).bind(c.req.param('libId'), tenantId).all();
+  return c.json({ podcasts: r.results });
 });
 
 // Owner-only: the one per-tenant permission switch. Body {membersCanAdd: bool}.
@@ -613,6 +688,24 @@ adminRoutes.post('/libraries/:id/scan', async (c) => {
   // whichever library is selected in its picker.
   const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
   if (!scope) return c.json({ error: 'Library not found' }, 404);
+  // A podcast library has nothing to walk — its shows come from feeds. A
+  // "scan" there (Pholia's Rescan, /admin's Scan) checks those feeds now,
+  // skipping any checked in the last five minutes, the rest left to the cron.
+  if (scope.library.media_type === 'podcast') {
+    const due = await c.env.DB.prepare(
+      `SELECT p.* FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
+        WHERE li.library_id = ? AND p.tenant_id = ? AND COALESCE(p.last_episode_check, 0) < ?
+        ORDER BY COALESCE(p.last_episode_check, 0) ASC LIMIT 15`,
+    ).bind(scope.library.id, tenantId, Date.now() - 5 * 60 * 1000).all<PodcastRow>();
+    let added = 0;
+    const errors: Array<{ relPath: string; reason: string }> = [];
+    for (const p of due.results) {
+      const r = await refreshPodcast(c.env, p);
+      added += r.added.length;
+      if (r.error) errors.push({ relPath: p.title ?? p.feed_url, reason: r.error });
+    }
+    return c.json({ libraryId: scope.library.id, added, skipped: 0, errors, folders: [], durationMs: 0, feedsChecked: due.results.length });
+  }
   let report: ScanReport;
   try {
     report = await runScan(c.env, scope.library.id, tenantId);
@@ -1294,9 +1387,14 @@ adminRoutes.delete('/items/:itemId', requireTenantOwner, async (c) => {
     if (!loaded.ok) {
       filesReason = `files left in place: ${loaded.error}`;
     } else {
+      // A podcast's files are its archived episodes; the publisher's copies
+      // are never ours to delete.
       const files = await c.env.DB.prepare(
-        'SELECT rel_path FROM audio_files WHERE library_item_id = ? AND rel_path IS NOT NULL',
-      ).bind(itemId).all<{ rel_path: string }>();
+        `SELECT rel_path FROM audio_files WHERE library_item_id = ? AND rel_path IS NOT NULL
+         UNION ALL
+         SELECT archive_rel_path AS rel_path FROM podcast_episodes
+          WHERE library_item_id = ? AND archive_state = 'done' AND archive_rel_path IS NOT NULL`,
+      ).bind(itemId, itemId).all<{ rel_path: string }>();
       try {
         for (const f of files.results) {
           await pcloudDeleteFile(loaded.profile, joinPcloudPath(loaded.rootPath, f.rel_path));
@@ -1317,6 +1415,8 @@ adminRoutes.delete('/items/:itemId', requireTenantOwner, async (c) => {
     c.env.DB.prepare('DELETE FROM media_progress WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM bookmarks WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM listening_sessions WHERE library_item_id = ?').bind(itemId),
+    c.env.DB.prepare('DELETE FROM podcast_episodes WHERE library_item_id = ?').bind(itemId),
+    c.env.DB.prepare('DELETE FROM podcasts WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM library_items WHERE id = ?').bind(itemId),
   ]);
   try { await c.env.COVERS.delete(`covers/${itemId}`); } catch { /* non-fatal */ }

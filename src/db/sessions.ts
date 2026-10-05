@@ -4,6 +4,9 @@ export type ListeningSessionRow = {
   id: string;
   user_id: string;
   library_item_id: string | null;
+  // Migration 0016: the episode a podcast session plays. Optional so book
+  // callers don't have to name it.
+  episode_id?: string | null;
   display_title: string | null;
   display_author: string | null;
   duration_seconds: number;
@@ -22,13 +25,13 @@ export type ListeningSessionRow = {
 export async function insertListeningSession(env: Env, row: ListeningSessionRow): Promise<void> {
   await env.DB.prepare(
     `INSERT INTO listening_sessions (
-       id, user_id, library_item_id, display_title, display_author,
+       id, user_id, library_item_id, episode_id, display_title, display_author,
        duration_seconds, play_method, media_player, device_info,
        server_version, date_started, current_time_seconds,
        time_listening_seconds, start_time_seconds, closed_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).bind(
-    row.id, row.user_id, row.library_item_id, row.display_title, row.display_author,
+    row.id, row.user_id, row.library_item_id, row.episode_id ?? null, row.display_title, row.display_author,
     row.duration_seconds, row.play_method, row.media_player, row.device_info,
     row.server_version, row.date_started, row.current_time_seconds,
     row.time_listening_seconds, row.start_time_seconds, row.closed_at, row.updated_at,

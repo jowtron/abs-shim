@@ -114,6 +114,58 @@ export async function streamAudio(
   return Response.redirect(stream.url, 302);
 }
 
+// A podcast episode that isn't archived: bytes come from the publisher's
+// enclosure URL, proxied rather than redirected. A 302 would leave the
+// client following a chain of tracking redirects to a CDN that sends no CORS
+// headers, which breaks Pholia's service-worker fetches (every response in
+// one iOS media load must share a CORS status — see CLAUDE.md), and would
+// show the publisher the listener's IP instead of Cloudflare's.
+//
+// The feed's enclosure length is often wrong or missing, so size_bytes stays
+// 0 until a response states the real total; `onSize` records it, after which
+// the file route can answer HEAD from D1 like any other file.
+export async function streamRemoteAudio(
+  audio: AudioFileRow,
+  req: Request,
+  onSize?: (size: number) => void,
+): Promise<Response> {
+  const fwd = new Headers({ 'User-Agent': 'audiobookshelf (+https://audiobookshelf.org; like iTMS)' });
+  const range = req.headers.get('Range');
+  const head = req.method === 'HEAD';
+  // HEAD with an unknown size: a one-byte GET says the total without
+  // starting a whole download.
+  if (head) fwd.set('Range', 'bytes=0-0');
+  else if (range) fwd.set('Range', range);
+  let upstream: Response;
+  try {
+    upstream = await fetchWithHeaderTimeout(audio.filedn_url, fwd);
+    if (upstream.status >= 500) throw new Error(`publisher ${upstream.status}`);
+  } catch {
+    upstream = await fetchWithHeaderTimeout(audio.filedn_url, fwd);
+  }
+  const total = Number(/\/(\d+)\s*$/.exec(upstream.headers.get('content-range') ?? '')?.[1]
+    ?? (upstream.status === 200 ? upstream.headers.get('content-length') ?? '' : ''));
+  if (Number.isFinite(total) && total > 0 && total !== audio.size_bytes) onSize?.(total);
+
+  if (head) {
+    await upstream.body?.cancel().catch(() => undefined);
+    const h = new Headers({ 'Content-Type': audioContentType(audio), 'Accept-Ranges': 'bytes' });
+    if (total > 0) h.set('Content-Length', String(total));
+    return new Response(null, { status: upstream.ok ? 200 : upstream.status, headers: h });
+  }
+  // Pass through only what describes the bytes; the publisher's CORS,
+  // cookies and caching headers aren't ours to forward.
+  const h = new Headers({ 'Content-Type': audioContentType(audio), 'Accept-Ranges': 'bytes' });
+  for (const k of ['content-length', 'content-range', 'etag', 'last-modified']) {
+    const v = upstream.headers.get(k);
+    if (v) h.set(k, v);
+  }
+  // The runtime hands us a compressed body already decoded, so its length
+  // header no longer describes what we send.
+  if (upstream.headers.get('content-encoding')) h.delete('content-length');
+  return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: h });
+}
+
 export function audioContentType(audio: AudioFileRow): string {
   if (audio.mime_type && audio.mime_type !== 'application/octet-stream') {
     return audio.mime_type;

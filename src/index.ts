@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import type { Env } from './types';
@@ -19,6 +19,8 @@ import { adminRoutes } from './routes/admin';
 import { abbRoutes } from './routes/abb';
 import { passkeyRoutes } from './routes/passkeys';
 import { audibleRoutes } from './routes/audible';
+import { podcastRoutes, podcastSearchRoutes } from './routes/podcasts';
+import { runPodcastTick } from './lib/podcasts';
 import { runCatalogTick } from './lib/abb-catalog';
 import { signupRoutes } from './routes/signup';
 import { renderSignupHtml } from './lib/signup-html';
@@ -283,7 +285,8 @@ app.get('/api/me', requireAuth, async (c) => {
 
 // Per-item progress: read + write. Pholia and the official UI hit these every
 // few seconds while playing.
-app.patch('/api/me/progress/:itemId', requireAuth, async (c) => {
+// `/:episodeId` is ABS's podcast form: one progress row per episode.
+const patchProgress = async (c: Context<{ Bindings: Env; Variables: AuthVars }>) => {
   const userRow = c.get('user');
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const patch: Parameters<typeof upsertProgress>[1]['patch'] = {};
@@ -294,18 +297,23 @@ app.patch('/api/me/progress/:itemId', requireAuth, async (c) => {
   if (typeof body['hideFromContinueListening'] === 'boolean') patch.hideFromContinueListening = body['hideFromContinueListening'];
   const row = await upsertProgress(c.env, {
     userId: userRow.id,
-    itemId: c.req.param('itemId'),
+    itemId: c.req.param('itemId')!,
+    episodeId: c.req.param('episodeId') ?? null,
     patch,
   });
   return c.json(await progressToAbs(c.env, row));
-});
+};
+app.patch('/api/me/progress/:itemId', requireAuth, patchProgress);
+app.patch('/api/me/progress/:itemId/:episodeId', requireAuth, patchProgress);
 
-app.get('/api/me/progress/:itemId', requireAuth, async (c) => {
+const readProgress = async (c: Context<{ Bindings: Env; Variables: AuthVars }>) => {
   const userRow = c.get('user');
-  const row = await getProgress(c.env, userRow.id, c.req.param('itemId'));
+  const row = await getProgress(c.env, userRow.id, c.req.param('itemId')!, c.req.param('episodeId') ?? null);
   if (!row) return c.json({ error: 'Not found' }, 404);
   return c.json(await progressToAbs(c.env, row));
-});
+};
+app.get('/api/me/progress/:itemId', requireAuth, readProgress);
+app.get('/api/me/progress/:itemId/:episodeId', requireAuth, readProgress);
 
 // Batch progress update. ShelfPlayer fires this in addition to per-session
 // sync — it bulk-uploads pending progress entries that may have been written
@@ -324,7 +332,8 @@ app.patch('/api/me/progress/batch/update', requireAuth, async (c) => {
     if (typeof entry['currentTime'] === 'number') patch.currentTime = entry['currentTime'];
     if (typeof entry['isFinished'] === 'boolean') patch.isFinished = entry['isFinished'];
     if (typeof entry['hideFromContinueListening'] === 'boolean') patch.hideFromContinueListening = entry['hideFromContinueListening'];
-    await upsertProgress(c.env, { userId: userRow.id, itemId, patch });
+    const episodeId = typeof entry['episodeId'] === 'string' && entry['episodeId'] ? entry['episodeId'] : null;
+    await upsertProgress(c.env, { userId: userRow.id, itemId, episodeId, patch });
   }
   return c.body(null, 200);
 });
@@ -345,7 +354,7 @@ app.post('/api/session/:id/sync', requireAuth, async (c) => {
   const sid = c.req.param('id');
   const session = await c.env.DB.prepare(
     'SELECT * FROM listening_sessions WHERE id = ? AND user_id = ?',
-  ).bind(sid, userRow.id).first<{ library_item_id: string | null; duration_seconds: number }>();
+  ).bind(sid, userRow.id).first<{ library_item_id: string | null; episode_id: string | null; duration_seconds: number }>();
   if (!session) return c.json({ error: 'Session not found' }, 404);
 
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
@@ -360,14 +369,25 @@ app.post('/api/session/:id/sync', requireAuth, async (c) => {
   ).bind(currentTime, timeListened, now, sid).run();
 
   // Mirror into media_progress so the next /login or /api/me reflects position.
-  if (session.library_item_id && session.duration_seconds > 0) {
+  // An episode whose feed gave no duration has 0 here; the client's own
+  // `duration` (the player knows it) fills in.
+  const duration = session.duration_seconds > 0 ? session.duration_seconds
+    : typeof body['duration'] === 'number' && body['duration'] > 0 ? body['duration'] : 0;
+  if (session.library_item_id && duration > 0) {
+    // ABS marks media finished within markAsFinishedTimeRemaining (10 s) of
+    // the end. Done here for episodes only: an episode left "99%" sits in
+    // Continue Listening for good, and books have their own long-settled
+    // behaviour that this isn't the place to change.
+    const finished = !!session.episode_id && currentTime >= duration - 10;
     await upsertProgress(c.env, {
       userId: userRow.id,
       itemId: session.library_item_id,
+      episodeId: session.episode_id,
       patch: {
         currentTime,
-        duration: session.duration_seconds,
-        progress: currentTime / session.duration_seconds,
+        duration,
+        progress: Math.min(currentTime / duration, 1),
+        ...(finished ? { isFinished: true } : {}),
       },
     });
   }
@@ -461,6 +481,8 @@ app.get('/api/me/listening-sessions', requireAuth, async (c) => {
 
 app.route('/api/libraries', libraryRoutes);
 app.route('/api/items', itemRoutes);
+app.route('/api/podcasts', podcastRoutes);
+app.route('/api/search', podcastSearchRoutes);
 app.route('/api/authors', authorRoutes);
 app.route('/api/auth/passkey', passkeyRoutes);
 app.route('/api/admin/abb', abbRoutes);
@@ -552,7 +574,8 @@ app.post('/api/session/local', requireAuth, async (c) => {
   if (!itemExists) return c.json({ success: true, applied: 0 });
   const currentTime = typeof s?.['currentTime'] === 'number' ? s['currentTime'] as number : null;
   if (currentTime == null) return c.json({ success: true, applied: 0 });
-  const existing = await getProgress(c.env, userRow.id, itemId, null);
+  const episodeId = typeof s?.['episodeId'] === 'string' && s['episodeId'] ? s['episodeId'] as string : null;
+  const existing = await getProgress(c.env, userRow.id, itemId, episodeId);
   if (existing && existing.current_time_seconds > currentTime) {
     return c.json({ success: true, applied: 0, skipped: 'forward-only' });
   }
@@ -562,7 +585,7 @@ app.post('/api/session/local', requireAuth, async (c) => {
     patch.duration = duration;
     patch.progress = currentTime / duration;
   }
-  await upsertProgress(c.env, { userId: userRow.id, itemId, patch });
+  await upsertProgress(c.env, { userId: userRow.id, itemId, episodeId, patch });
   return c.json({ success: true, applied: 1 });
 });
 
@@ -591,7 +614,8 @@ app.post('/api/session/local-all', requireAuth, async (c) => {
     // based guard doesn't help. Real-time progress goes via /api/session/
     // :id/sync; the local-all endpoint exists purely to backfill offline gaps,
     // and a bulk import that goes _backwards_ is almost always stale data.
-    const existing = await getProgress(c.env, userRow.id, itemId, null);
+    const episodeId = typeof s?.episodeId === 'string' && s.episodeId ? s.episodeId as string : null;
+    const existing = await getProgress(c.env, userRow.id, itemId, episodeId);
     if (existing && existing.current_time_seconds > currentTime) continue;
     const duration = typeof s?.duration === 'number' ? s.duration : null;
     const patch: { currentTime: number; duration?: number; progress?: number } = { currentTime };
@@ -599,7 +623,7 @@ app.post('/api/session/local-all', requireAuth, async (c) => {
       patch.duration = duration;
       patch.progress = currentTime / duration;
     }
-    await upsertProgress(c.env, { userId: userRow.id, itemId, patch });
+    await upsertProgress(c.env, { userId: userRow.id, itemId, episodeId, patch });
     applied++;
   }
   return c.json({ success: true, applied, ignored: sessions.length - applied });
@@ -784,6 +808,12 @@ export default {
       runCatalogTick(env)
         .then((r) => { if (r.ran) console.log('[abb-catalog] ' + r.log.join(' | ')); })
         .catch((e: Error) => console.error('[abb-catalog] tick failed: ' + e.message)),
+    );
+    // Podcast feeds due a check, then the archive queue (src/lib/podcasts.ts).
+    ctx.waitUntil(
+      runPodcastTick(env)
+        .then((log) => { if (log.length) console.log('[podcasts] ' + log.join(' | ')); })
+        .catch((e: Error) => console.error('[podcasts] tick failed: ' + e.message)),
     );
   },
 };

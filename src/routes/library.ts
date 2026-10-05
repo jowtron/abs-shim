@@ -1,11 +1,16 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { Env } from '../types';
 import { requireAuth, type AuthVars } from '../auth/middleware';
 import {
   countItemsByLibrary, getAudioFiles, getBookMetadata, getChapters,
   getFolderById, getItem, getLibrary, listAllBookMetadata, listFolders,
   listItemsByLibrary, listLibraries, loadItemBundles,
+  type LibraryFolderRow, type LibraryItemRow,
 } from '../db/library';
+import { getEpisodeCounts, getPodcasts, type EpisodeRow, type PodcastRow } from '../db/podcasts';
+import { buildEpisodeExpanded, buildPodcastItemMinified, buildPodcastOld } from '../lib/podcast-shapes';
+import { buildOpml } from '../lib/rss';
+import { downloadJson } from './podcasts';
 import {
   buildFilterData, buildItemMinified, buildLibrary, buildPersonalizedShelves,
 } from '../lib/abs-shapes';
@@ -40,6 +45,9 @@ libraryRoutes.get('/:id', async (c) => {
   const shown = scope.view ? viewAsLibraryRow(scope.view, scope.library) : scope.library;
 
   const include = (c.req.query('include') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (include.includes('filterdata') && scope.library.media_type === 'podcast') {
+    return c.json(await podcastFilterData(c.env, scope, tenantId, folders));
+  }
   if (include.includes('filterdata')) {
     const metadata = await listAllBookMetadata(c.env, scope.library.id, tenantId, scope.filter('li.'));
     // Ids are salted with the real library; the library shown is the view.
@@ -55,6 +63,7 @@ libraryRoutes.get('/:id/personalized', async (c) => {
   const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
   if (!scope) return c.json({ error: 'Library not found' }, 404);
   const id = scope.library.id;
+  if (scope.library.media_type === 'podcast') return podcastPersonalized(c, scope);
   const t1 = Date.now();
 
   const items = await listItemsByLibrary(c.env, id, tenantId, { view: scope.filter('') });
@@ -81,6 +90,7 @@ libraryRoutes.get('/:id/items', async (c) => {
   if (!scope) return c.json({ error: 'Library not found' }, 404);
   const id = scope.library.id;
   const row = scope.library;
+  if (row.media_type === 'podcast') return podcastItems(c, scope);
 
   const limit = Number(c.req.query('limit') ?? '0');
   const page = Number(c.req.query('page') ?? '0');
@@ -155,6 +165,7 @@ libraryRoutes.get('/:id/search', async (c) => {
     series: [] as unknown[], narrators: [] as unknown[], tags: [] as unknown[],
   };
   if (!q) return c.json(empty);
+  if (scope.library.media_type === 'podcast') return podcastSearch(c, scope, q, limit);
 
   // LIKE with an escaped pattern: a title containing % or _ would otherwise
   // turn into a wildcard.
@@ -422,4 +433,266 @@ export async function buildItemBundle(env: Env, itemId: string, tenantId: string
     getChapters(env, item.id),
   ]);
   return { item, folder, metadata, audioFiles, chapters };
+}
+
+// ─── Podcast libraries ───────────────────────────────────────────────────────
+//
+// A library whose media_type is 'podcast' holds shows, not books (migration
+// 0016). These build ABS's podcast-library answers; the routes above branch
+// to them on scope.library.media_type.
+
+type PodcastScope = NonNullable<Awaited<ReturnType<typeof resolveLibraryScope>>>;
+
+async function podcastItemsMinified(env: Env, items: LibraryItemRow[], tenantId: string) {
+  const ids = items.map((i) => i.id);
+  const [pods, counts] = await Promise.all([getPodcasts(env, ids, tenantId), getEpisodeCounts(env, ids, tenantId)]);
+  return Promise.all(items.filter((i) => pods.has(i.id)).map((i) => buildPodcastItemMinified(i, pods.get(i.id)!, counts.get(i.id))));
+}
+
+const byTitle = (a: { media: { metadata: { titleIgnorePrefix: string | null } } }, b: typeof a) =>
+  (a.media.metadata.titleIgnorePrefix ?? '').localeCompare(b.media.metadata.titleIgnorePrefix ?? '', undefined, { sensitivity: 'base' });
+
+async function podcastItems(c: Context<{ Bindings: Env; Variables: AuthVars }>, scope: PodcastScope) {
+  const tenantId = c.get('tenantId');
+  const items = await listItemsByLibrary(c.env, scope.library.id, tenantId, { view: scope.filter('') });
+  const all = await podcastItemsMinified(c.env, items, tenantId);
+  const sort = c.req.query('sort') ?? 'media.metadata.title';
+  const desc = c.req.query('desc') === '1';
+  all.sort((a, b) => {
+    const cmp = sort === 'addedAt' ? a.addedAt - b.addedAt
+      : sort === 'media.numTracks' || sort === 'media.numEpisodes' ? a.media.numEpisodes - b.media.numEpisodes
+        : byTitle(a, b);
+    return desc ? -cmp : cmp;
+  });
+  const limit = Number(c.req.query('limit') ?? '0');
+  const page = Number(c.req.query('page') ?? '0');
+  const offset = limit > 0 ? page * limit : 0;
+  return c.json({
+    results: limit > 0 ? all.slice(offset, offset + limit) : all,
+    total: all.length, limit, page, sortBy: sort, sortDesc: desc, mediaType: 'podcast',
+    minified: false, collapseseries: false, include: '', offset,
+  });
+}
+
+type EpisodeWithShow = EpisodeRow & { li_library_id: string };
+
+// Episodes on the shows of one library, joined to the caller's progress.
+async function libraryEpisodes(env: Env, scope: PodcastScope, tenantId: string, userId: string, opts: {
+  where: string; order: string; limit: number; offset?: number;
+}) {
+  const view = scope.filter('li.');
+  const r = await env.DB.prepare(
+    `SELECT e.*, li.library_id AS li_library_id FROM podcast_episodes e
+       JOIN library_items li ON li.id = e.library_item_id
+       LEFT JOIN media_progress mp ON mp.library_item_id = e.library_item_id AND mp.episode_id = e.id AND mp.user_id = ?
+      WHERE li.library_id = ? AND e.tenant_id = ? AND e.in_library = 1${view.sql} AND ${opts.where}
+      ORDER BY ${opts.order} LIMIT ? OFFSET ?`,
+  ).bind(userId, scope.library.id, tenantId, ...view.binds, opts.limit, opts.offset ?? 0).all<EpisodeWithShow>();
+  return r.results;
+}
+
+async function showsFor(env: Env, itemIds: string[], tenantId: string) {
+  const uniq = [...new Set(itemIds)];
+  const items = new Map<string, LibraryItemRow>();
+  for (let i = 0; i < uniq.length; i += 90) {
+    const part = uniq.slice(i, i + 90);
+    const r = await env.DB.prepare(`SELECT * FROM library_items WHERE id IN (${part.map(() => '?').join(',')}) AND tenant_id = ?`)
+      .bind(...part, tenantId).all<LibraryItemRow>();
+    for (const row of r.results) items.set(row.id, row);
+  }
+  const [pods, counts] = await Promise.all([getPodcasts(env, uniq, tenantId), getEpisodeCounts(env, uniq, tenantId)]);
+  const folderIds = [...new Set([...items.values()].map((i) => i.folder_id))];
+  const folders = new Map<string, LibraryFolderRow>();
+  for (const id of folderIds) {
+    const f = await getFolderById(env, id, tenantId);
+    if (f) folders.set(id, f);
+  }
+  return { items, pods, counts, folders };
+}
+
+// ABS's recent-episodes entry: the expanded episode, plus `podcast` (the show
+// with an empty episode list) and `libraryId`.
+async function recentEpisodeEntries(env: Env, eps: EpisodeWithShow[], tenantId: string, progress?: Map<string, unknown>) {
+  const { items, pods, folders } = await showsFor(env, eps.map((e) => e.library_item_id), tenantId);
+  const out = [];
+  for (const e of eps) {
+    const item = items.get(e.library_item_id);
+    const p = pods.get(e.library_item_id);
+    const folder = item ? folders.get(item.folder_id) : undefined;
+    if (!item || !p || !folder) continue;
+    out.push({
+      ...await buildEpisodeExpanded(e, item, folder),
+      podcast: await buildPodcastOld(item, p),
+      libraryId: item.library_id,
+      ...(progress?.has(e.id) ? { mediaProgress: progress.get(e.id) } : {}),
+    });
+  }
+  return out;
+}
+
+// Shelf entities for episode shelves: the show (minified) with the episode
+// as `recentEpisode`, which is how ABS shapes continue-listening and
+// newest-episodes in a podcast library.
+async function episodeShelfEntities(env: Env, eps: EpisodeWithShow[], tenantId: string, progress: Map<string, unknown>) {
+  const { items, pods, counts, folders } = await showsFor(env, eps.map((e) => e.library_item_id), tenantId);
+  const out = [];
+  for (const e of eps) {
+    const item = items.get(e.library_item_id);
+    const p = pods.get(e.library_item_id);
+    const folder = item ? folders.get(item.folder_id) : undefined;
+    if (!item || !p || !folder) continue;
+    const show = await buildPodcastItemMinified(item, p, counts.get(item.id));
+    out.push({
+      ...show,
+      recentEpisode: await buildEpisodeExpanded(e, item, folder),
+      ...(progress.has(e.id) ? { mediaProgress: progress.get(e.id) } : {}),
+    });
+  }
+  return out;
+}
+
+async function episodeProgress(env: Env, userId: string) {
+  const rows = (await listProgressByUser(env, userId)).filter((p) => p.episode_id);
+  const map = new Map<string, unknown>();
+  for (const p of rows) map.set(p.episode_id!, await progressToAbs(env, p));
+  return map;
+}
+
+async function podcastPersonalized(c: Context<{ Bindings: Env; Variables: AuthVars }>, scope: PodcastScope) {
+  const tenantId = c.get('tenantId');
+  const userId = c.get('userId');
+  const progress = await episodeProgress(c.env, userId);
+  const [inProgress, newest, finished] = await Promise.all([
+    libraryEpisodes(c.env, scope, tenantId, userId, {
+      where: 'mp.progress > 0 AND mp.is_finished = 0 AND mp.hide_from_continue_listening = 0',
+      order: 'mp.last_update DESC', limit: 20,
+    }),
+    libraryEpisodes(c.env, scope, tenantId, userId, { where: 'COALESCE(mp.is_finished, 0) = 0', order: 'e.published_at DESC', limit: 25 }),
+    libraryEpisodes(c.env, scope, tenantId, userId, { where: 'mp.is_finished = 1', order: 'mp.finished_at DESC', limit: 20 }),
+  ]);
+  const items = await listItemsByLibrary(c.env, scope.library.id, tenantId, { view: scope.filter('') });
+  const shows = await podcastItemsMinified(c.env, items, tenantId);
+  const recentlyAdded = [...shows].sort((a, b) => b.addedAt - a.addedAt);
+  const continueListening = await episodeShelfEntities(c.env, inProgress, tenantId, progress);
+  const newestEpisodes = await episodeShelfEntities(c.env, newest, tenantId, progress);
+  const listenAgain = await episodeShelfEntities(c.env, finished, tenantId, progress);
+  const shelf = (id: string, label: string, key: string, type: string, entities: unknown[]) =>
+    ({ id, label, labelStringKey: key, type, entities, total: entities.length });
+  return c.json([
+    shelf('continue-listening', 'Continue Listening', 'LabelContinueListening', 'episode', continueListening),
+    shelf('newest-episodes', 'Newest Episodes', 'LabelNewestEpisodes', 'episode', newestEpisodes),
+    shelf('recently-added', 'Recently Added', 'LabelRecentlyAdded', 'podcast', recentlyAdded),
+    shelf('listen-again', 'Listen Again', 'LabelListenAgain', 'episode', listenAgain),
+    shelf('discover', 'Discover', 'LabelDiscover', 'podcast', [...shows].sort(byTitle)),
+  ].filter((s) => s.entities.length));
+}
+
+libraryRoutes.get('/:id/recent-episodes', async (c) => {
+  const tenantId = c.get('tenantId');
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope || scope.library.media_type !== 'podcast') return c.json({ error: 'Not a podcast library' }, 404);
+  const limit = Math.min(Math.max(Number(c.req.query('limit') ?? '25') || 25, 1), 200);
+  const page = Math.max(Number(c.req.query('page') ?? '0') || 0, 0);
+  const eps = await libraryEpisodes(c.env, scope, tenantId, c.get('userId'), {
+    where: 'COALESCE(mp.is_finished, 0) = 0', order: 'e.published_at DESC', limit, offset: page * limit,
+  });
+  const progress = await episodeProgress(c.env, c.get('userId'));
+  return c.json({ episodes: await recentEpisodeEntries(c.env, eps, tenantId, progress), limit, page });
+});
+
+libraryRoutes.get('/:id/podcast-titles', async (c) => {
+  const tenantId = c.get('tenantId');
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  const view = scope.filter('li.');
+  const r = await c.env.DB.prepare(
+    `SELECT p.title, p.itunes_id, li.id, li.library_id FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
+      WHERE li.library_id = ? AND p.tenant_id = ?${view.sql}`,
+  ).bind(scope.library.id, tenantId, ...view.binds).all<{ title: string; itunes_id: string | null; id: string; library_id: string }>();
+  return c.json({ podcasts: r.results.map((p) => ({ title: p.title, itunesId: p.itunes_id, libraryItemId: p.id, libraryId: p.library_id })) });
+});
+
+// The archive queue across the library, in ABS's episode-download shape.
+libraryRoutes.get('/:id/episode-downloads', async (c) => {
+  const tenantId = c.get('tenantId');
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  const r = await c.env.DB.prepare(
+    `SELECT e.*, li.library_id AS li_library_id FROM podcast_episodes e JOIN library_items li ON li.id = e.library_item_id
+      WHERE li.library_id = ? AND e.tenant_id = ? AND e.archive_state IN ('queued', 'fetching') ORDER BY e.updated_at ASC LIMIT 100`,
+  ).bind(scope.library.id, tenantId).all<EpisodeWithShow>();
+  const { items, pods } = await showsFor(c.env, r.results.map((e) => e.library_item_id), tenantId);
+  const rows = r.results.filter((e) => items.has(e.library_item_id) && pods.has(e.library_item_id))
+    .map((e) => downloadJson(e, { item: items.get(e.library_item_id)!, podcast: pods.get(e.library_item_id)! }));
+  const current = rows.find((d) => d.startedAt != null) ?? null;
+  return c.json({ currentDownload: current, queue: rows.filter((d) => d !== current) });
+});
+
+libraryRoutes.get('/:id/opml', async (c) => {
+  const tenantId = c.get('tenantId');
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  const view = scope.filter('li.');
+  const r = await c.env.DB.prepare(
+    `SELECT p.* FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
+      WHERE li.library_id = ? AND p.tenant_id = ?${view.sql} ORDER BY p.title COLLATE NOCASE`,
+  ).bind(scope.library.id, tenantId, ...view.binds).all<PodcastRow>();
+  const xml = buildOpml(scope.view?.name ?? scope.library.name, r.results.map((p) => ({
+    title: p.title ?? p.feed_url, feedUrl: p.feed_url, description: p.description, pageUrl: p.itunes_page_url, language: p.language,
+  })));
+  return c.body(xml, 200, { 'Content-Type': 'application/xml; charset=utf-8' });
+});
+
+async function podcastFilterData(env: Env, scope: PodcastScope, tenantId: string, folders: LibraryFolderRow[]) {
+  const view = scope.filter('li.');
+  const r = await env.DB.prepare(
+    `SELECT p.genres, p.language, p.tags FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
+      WHERE li.library_id = ? AND p.tenant_id = ?${view.sql}`,
+  ).bind(scope.library.id, tenantId, ...view.binds).all<{ genres: string; language: string | null; tags: string }>();
+  const genres = new Set<string>();
+  const tags = new Set<string>();
+  const languages = new Set<string>();
+  for (const p of r.results) {
+    for (const g of JSON.parse(p.genres || '[]') as string[]) genres.add(g);
+    for (const t of JSON.parse(p.tags || '[]') as string[]) tags.add(t);
+    if (p.language) languages.add(p.language);
+  }
+  const shown = scope.view ? viewAsLibraryRow(scope.view, scope.library) : scope.library;
+  return {
+    library: buildLibrary(shown, folders),
+    filterdata: {
+      authors: [], genres: [...genres], tags: [...tags], series: [], narrators: [], languages: [...languages],
+      publishers: [], publishedDecades: [], bookCount: 0, authorCount: 0, seriesCount: 0,
+      podcastCount: r.results.length, numIssues: 0, loadedAt: Date.now(),
+    },
+    issues: 0,
+    numUserPlaylists: 0,
+  };
+}
+
+// Search a podcast library: shows by title/author, episodes by title. ABS's
+// shape puts shows in `podcast` and episode hits in `episodes`.
+async function podcastSearch(c: Context<{ Bindings: Env; Variables: AuthVars }>, scope: PodcastScope, q: string, limit: number) {
+  const tenantId = c.get('tenantId');
+  const view = scope.filter('li.');
+  const pattern = '%' + q.replace(/[\\%_]/g, (ch) => '\\' + ch).toLowerCase() + '%';
+  const shows = await c.env.DB.prepare(
+    `SELECT li.* FROM library_items li JOIN podcasts p ON p.library_item_id = li.id
+      WHERE li.library_id = ? AND li.tenant_id = ?${view.sql}
+        AND (lower(COALESCE(p.title, '')) LIKE ? ESCAPE '\\' OR lower(COALESCE(p.author, '')) LIKE ? ESCAPE '\\')
+      LIMIT ?`,
+  ).bind(scope.library.id, tenantId, ...view.binds, pattern, pattern, limit).all<LibraryItemRow>();
+  const showJson = await podcastItemsMinified(c.env, shows.results, tenantId);
+  const epRows = await c.env.DB.prepare(
+    `SELECT e.*, li.library_id AS li_library_id FROM podcast_episodes e JOIN library_items li ON li.id = e.library_item_id
+      WHERE li.library_id = ? AND e.tenant_id = ? AND e.in_library = 1${view.sql} AND lower(COALESCE(e.title, '')) LIKE ? ESCAPE '\\'
+      ORDER BY e.published_at DESC LIMIT ?`,
+  ).bind(scope.library.id, tenantId, ...view.binds, pattern, limit).all<EpisodeWithShow>();
+  const progress = await episodeProgress(c.env, c.get('userId'));
+  const episodeEntities = await episodeShelfEntities(c.env, epRows.results, tenantId, progress);
+  return c.json({
+    book: [], authors: [], series: [], narrators: [], tags: [],
+    podcast: showJson.map((s) => ({ libraryItem: s, matchKey: 'title', matchText: s.media.metadata.title ?? '' })),
+    episodes: episodeEntities.map((s) => ({ libraryItem: s, matchKey: 'title', matchText: s.recentEpisode.title })),
+  });
 }
