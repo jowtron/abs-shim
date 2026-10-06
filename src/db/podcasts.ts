@@ -25,6 +25,7 @@ export type PodcastRow = {
   max_episodes_to_keep: number;
   max_new_episodes_to_download: number;
   archive: number;
+  parse_version: number;           // migration 0018
   feed_etag: string | null;
   feed_last_modified: string | null;
   last_episode_check: number | null;
@@ -64,6 +65,8 @@ export type EpisodeRow = {
   archive_error: string | null;
   in_library: number;
   removed: number;
+  chapters_url: string | null;     // migration 0018: <podcast:chapters url>
+  chapters_checked_at: number | null;
   created_at: number;
   updated_at: number;
 };

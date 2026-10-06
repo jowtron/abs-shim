@@ -13,6 +13,7 @@ import { insertListeningSession } from '../db/sessions';
 import { getProgress, progressToAbs } from '../db/progress';
 import { audioContentType, resolveProbeUrl, resolveStreamUrl, streamAudio, streamRemoteAudio } from '../storage/resolve';
 import { getEpisode, getPodcast, listShowEpisodes } from '../db/podcasts';
+import { ensureEpisodeChapters } from '../lib/podcasts';
 import { buildEpisodeExpanded, buildPodcastItemExpanded, podcastMetadata } from '../lib/podcast-shapes';
 import { getBookMetadata, getFolderById, getItem, getStreamingTarget, type AudioFileRow } from '../db/library';
 import { tryServeMoovRange, warmMoovCache } from '../storage/moov-cache';
@@ -436,8 +437,17 @@ itemRoutes.post('/:id/play/:episodeId', async (c) => {
   const tenantId = c.get('tenantId');
   const show = await loadPodcastItem(c.env, c.req.param('id'), tenantId);
   if (!show) return c.json({ error: 'Podcast not found' }, 404);
-  const ep = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), tenantId);
+  let ep = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), tenantId);
   if (!ep) return c.json({ error: 'Episode not found' }, 404);
+  // Chapters not looked up yet (the cron gets to every episode, newest
+  // first, but not instantly): look now, for at most 4 s, so this play has
+  // them. A slower lookup finishes in the background for next time.
+  if (ep.chapters_checked_at == null) {
+    const lookup = ensureEpisodeChapters(c.env, ep);
+    c.executionCtx.waitUntil(lookup.then(() => undefined, () => undefined));
+    const done = await Promise.race([lookup.then(() => true, () => false), new Promise<boolean>((r) => setTimeout(() => r(false), 4000))]);
+    if (done) ep = (await getEpisode(c.env, show.item.id, ep.id, tenantId)) ?? ep;
+  }
   // Playing an episode from the feed that isn't on the show puts it there:
   // Continue Listening and Latest only list episodes on a show.
   if (ep.in_library !== 1) {

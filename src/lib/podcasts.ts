@@ -39,6 +39,11 @@ const TICK_FEEDS = 5;
 const ARCHIVE_STARTS_PER_TICK = 3;
 const ARCHIVE_POLLS_PER_TICK = 10;
 const ARCHIVE_GIVE_UP_MS = 6 * 60 * 60 * 1000;
+// Raise when the parser starts storing a field older rows lack: each show's
+// next poll then re-reads its whole feed once (migration 0018: chapters_url).
+const PARSE_VERSION = 1;
+const CHAPTERS_PER_TICK = 15;
+const CHAPTERS_RECHECK_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ─── Fetching ────────────────────────────────────────────────────────────────
 
@@ -349,7 +354,7 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<string> {
 
 const EP_COLS = `id, library_item_id, tenant_id, ino, guid, idx, season, episode, episode_type, title, subtitle,
   description, pub_date, published_at, enclosure_url, enclosure_type, enclosure_length, duration_seconds,
-  chapters, in_library, removed, created_at, updated_at`;
+  chapters, chapters_url, in_library, removed, created_at, updated_at`;
 
 function lengthOf(s: string | null): number | null {
   const n = Number(s);
@@ -366,22 +371,27 @@ async function upsertEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], start
   const ordered = [...eps].sort((x, y) => (x.publishedAt ?? 0) - (y.publishedAt ?? 0));
   const stmts = ordered.map((e, i) => env.DB.prepare(
     `INSERT INTO podcast_episodes (${EP_COLS})
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
      ON CONFLICT(library_item_id, guid) DO UPDATE SET
        enclosure_url = excluded.enclosure_url, enclosure_type = excluded.enclosure_type,
        enclosure_length = excluded.enclosure_length, title = excluded.title, subtitle = excluded.subtitle,
-       description = excluded.description, duration_seconds = excluded.duration_seconds, updated_at = excluded.updated_at
+       description = excluded.description,
+       duration_seconds = CASE WHEN excluded.duration_seconds > 0 THEN excluded.duration_seconds ELSE podcast_episodes.duration_seconds END,
+       chapters_url = excluded.chapters_url,
+       chapters_checked_at = CASE WHEN podcast_episodes.chapters_url IS NOT excluded.chapters_url THEN NULL ELSE podcast_episodes.chapters_checked_at END,
+       updated_at = excluded.updated_at
      WHERE podcast_episodes.enclosure_url IS NOT excluded.enclosure_url
         OR podcast_episodes.title IS NOT excluded.title
         OR podcast_episodes.description IS NOT excluded.description
-        OR podcast_episodes.duration_seconds IS NOT excluded.duration_seconds
+        OR (excluded.duration_seconds > 0 AND podcast_episodes.duration_seconds IS NOT excluded.duration_seconds)
+        OR podcast_episodes.chapters_url IS NOT excluded.chapters_url
      RETURNING id, published_at, created_at`,
   ).bind(
     crypto.randomUUID(), p.library_item_id, p.tenant_id, String(Math.floor(Math.random() * 0xffffffff)),
     episodeKey(e), startIdx + i + 1, e.season || null, e.episode || null, e.episodeType || null,
     e.title || null, e.subtitle || null, e.description || null, e.pubDate || null, e.publishedAt,
     e.enclosure.url, e.enclosure.type, lengthOf(e.enclosure.length), e.durationSeconds ?? 0,
-    JSON.stringify(e.chapters), now, now,
+    JSON.stringify(e.chapters), e.chaptersUrl, now, now,
   ));
   for (let i = 0; i < stmts.length; i += 100) {
     const res = await env.DB.batch<{ id: string; published_at: number | null; created_at: number }>(stmts.slice(i, i + 100));
@@ -443,8 +453,12 @@ export async function refreshPodcast(env: Env, p: PodcastRow, opts: { force?: bo
   const have = await env.DB.prepare('SELECT COUNT(*) AS n FROM podcast_episodes WHERE library_item_id = ?')
     .bind(p.library_item_id).first<{ n: number }>();
   const firstFill = !have?.n;
+  // A show stored by an older parser re-reads its whole feed once, so
+  // every stored episode gains the new field (no conditional GET, no early
+  // stop).
+  const reparse = (p.parse_version ?? 0) < PARSE_VERSION;
   try {
-    const got = await fetchFeed(p.feed_url, opts.force || firstFill ? undefined : { etag: p.feed_etag, lastModified: p.feed_last_modified });
+    const got = await fetchFeed(p.feed_url, opts.force || firstFill || reparse ? undefined : { etag: p.feed_etag, lastModified: p.feed_last_modified });
     if (got.notModified) {
       await env.DB.prepare(
         'UPDATE podcasts SET last_episode_check = ?, next_check_at = ?, check_failures = 0, last_error = NULL WHERE library_item_id = ?',
@@ -454,7 +468,7 @@ export async function refreshPodcast(env: Env, p: PodcastRow, opts: { force?: bo
     const known = new Set((await env.DB.prepare(
       'SELECT guid FROM podcast_episodes WHERE library_item_id = ? ORDER BY published_at DESC LIMIT 30',
     ).bind(p.library_item_id).all<{ guid: string }>()).results.map((r) => r.guid));
-    const feed = parseFeed(got.xml, firstFill ? {} : { known, stopAfterKnown: 5 });
+    const feed = parseFeed(got.xml, firstFill || reparse ? {} : { known, stopAfterKnown: 5 });
     if (!feed) throw new PodcastError(502, "The feed no longer parses as podcast RSS");
 
     const md = feed.metadata;
@@ -468,12 +482,12 @@ export async function refreshPodcast(env: Env, p: PodcastRow, opts: { force?: bo
          language = COALESCE(?, language), podcast_type = COALESCE(?, podcast_type),
          genres = CASE WHEN ? = '[]' THEN genres ELSE ? END, feed_url = COALESCE(?, feed_url),
          feed_etag = ?, feed_last_modified = ?, last_episode_check = ?, next_check_at = ?,
-         check_failures = 0, last_error = NULL, updated_at = ?
+         check_failures = 0, last_error = NULL, parse_version = ?, updated_at = ?
        WHERE library_item_id = ?`,
     ).bind(
       md.title, md.author, md.description, md.image, md.image, md.language, md.type,
       JSON.stringify(md.categories), JSON.stringify(md.categories), moved,
-      got.etag, got.lastModified, now, now + POLL_EVERY_MS, now, p.library_item_id,
+      got.etag, got.lastModified, now, now + POLL_EVERY_MS, PARSE_VERSION, now, p.library_item_id,
     ).run();
     // OPML imports skip the iTunes match at creation; do it on the first fill.
     if (firstFill && !p.itunes_id && md.title) {
@@ -515,7 +529,103 @@ export async function runPodcastTick(env: Env): Promise<string[]> {
     log.push(`${p.title ?? p.library_item_id}: ${r.error ? 'error ' + r.error : r.notModified ? '304' : `+${r.added.length}`}`);
   }
   log.push(...await archivePump(env));
+  log.push(...await chapterPump(env));
   return log;
+}
+
+// ─── Chapters ────────────────────────────────────────────────────────────────
+//
+// Two sources, in order: the feed's <podcast:chapters> JSON (Podcasting 2.0;
+// Linux & Open Source News and LINUX Unplugged publish one per episode), then
+// chapters embedded in the audio (ID3 CHAP frames in an mp3, chpl/QuickTime
+// chapters in an m4a), read with the book probers over a few Range requests.
+// The mp3 probe also yields a duration, which fills in episodes whose feed
+// gave no itunes:duration (without one, resume can't place the playhead).
+
+type Chapter = { id: number; start: number; end: number; title: string };
+
+// JSON chapters per podcastindex.org's spec: {version, chapters: [{startTime,
+// endTime?, title?, toc?}]}. Some publishers write the numbers as strings
+// (LINUX Unplugged does); `toc: false` marks a silent chapter (an image or
+// link change) that isn't a navigation point.
+export function parseJsonChapters(data: unknown, duration: number): Chapter[] {
+  const raw = (data as { chapters?: unknown })?.chapters;
+  if (!Array.isArray(raw)) return [];
+  const items = raw
+    .filter((c): c is Record<string, unknown> => !!c && typeof c === 'object' && (c as Record<string, unknown>)['toc'] !== false)
+    .map((c) => ({ start: Number(c['startTime']), end: Number(c['endTime']), title: typeof c['title'] === 'string' ? c['title'].trim() : '' }))
+    .filter((c) => Number.isFinite(c.start) && c.start >= 0)
+    .sort((a, b) => a.start - b.start);
+  return items.map((c, i) => {
+    const next = items[i + 1]?.start;
+    const end = Number.isFinite(c.end) && c.end > c.start ? c.end : next ?? (duration > c.start ? duration : c.start);
+    return { id: i, start: c.start, end, title: c.title || `Chapter ${i + 1}` };
+  });
+}
+
+async function chaptersFromJson(url: string, duration: number): Promise<Chapter[]> {
+  const res = await fetch(url, { headers: { 'User-Agent': FEED_UA, Accept: 'application/json+chapters, application/json' }, signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) throw new Error(`chapters JSON answered HTTP ${res.status}`);
+  const len = Number(res.headers.get('content-length') ?? '');
+  if (Number.isFinite(len) && len > 2_000_000) throw new Error('chapters JSON too large');
+  return parseJsonChapters(await res.json(), duration);
+}
+
+async function chaptersFromAudio(e: EpisodeRow): Promise<{ chapters: Chapter[]; duration: number | null }> {
+  const ext = episodeExt(e);
+  if (ext === 'mp3') {
+    const { probeMp3 } = await import('../prober/mp3');
+    const p = await probeMp3(e.enclosure_url, e.size_bytes || undefined);
+    return { chapters: p.chapters.map((c, i) => ({ id: i, start: c.start, end: c.end, title: c.title || `Chapter ${i + 1}` })), duration: p.durationSeconds };
+  }
+  if (ext === 'm4a' || ext === 'mp4' || ext === 'm4b' || ext === 'aac') {
+    const { probeM4b } = await import('../prober/m4b');
+    const p = await probeM4b(e.enclosure_url);
+    const dur = p.durationSeconds ?? e.duration_seconds;
+    return {
+      chapters: p.chapters.map((c, i, all) => ({ id: i, start: c.start, end: all[i + 1]?.start ?? dur, title: c.title || `Chapter ${i + 1}` })),
+      duration: p.durationSeconds ?? null,
+    };
+  }
+  return { chapters: [], duration: null };
+}
+
+// Look one episode's chapters up and store them. Chapters already in the
+// row (psc:chapters inline in the feed) are kept. A failure is retried the
+// next day, an episode without any a week later.
+export async function ensureEpisodeChapters(env: Env, e: EpisodeRow): Promise<Chapter[]> {
+  const now = Date.now();
+  const have = JSON.parse(e.chapters || '[]') as Chapter[];
+  let chapters: Chapter[] = have;
+  let duration: number | null = null;
+  try {
+    if (!have.length && e.chapters_url) chapters = await chaptersFromJson(e.chapters_url, e.duration_seconds);
+    if (!chapters.length || !e.duration_seconds) {
+      const fromAudio = await chaptersFromAudio(e).catch(() => ({ chapters: [] as Chapter[], duration: null }));
+      if (!chapters.length) chapters = fromAudio.chapters;
+      if (!e.duration_seconds && fromAudio.duration) duration = fromAudio.duration;
+    }
+    await env.DB.prepare(
+      `UPDATE podcast_episodes SET chapters = ?, chapters_checked_at = ?${duration ? ', duration_seconds = ?' : ''} WHERE id = ?`,
+    ).bind(JSON.stringify(chapters), now, ...(duration ? [Math.round(duration * 1000) / 1000] : []), e.id).run();
+    return chapters;
+  } catch (err) {
+    await env.DB.prepare('UPDATE podcast_episodes SET chapters_checked_at = ? WHERE id = ?')
+      .bind(now - CHAPTERS_RECHECK_MS + 24 * 60 * 60 * 1000, e.id).run();
+    console.warn(`[podcasts] chapters for ${e.id}: ${(err as Error).message}`);
+    return have;
+  }
+}
+
+export async function chapterPump(env: Env): Promise<string[]> {
+  const due = await env.DB.prepare(
+    `SELECT * FROM podcast_episodes
+      WHERE in_library = 1 AND (chapters_checked_at IS NULL OR (chapters = '[]' AND chapters_checked_at < ?))
+      ORDER BY chapters_checked_at IS NOT NULL, published_at DESC LIMIT ?`,
+  ).bind(Date.now() - CHAPTERS_RECHECK_MS, CHAPTERS_PER_TICK).all<EpisodeRow>();
+  let found = 0;
+  for (const e of due.results) if ((await ensureEpisodeChapters(env, e)).length) found++;
+  return due.results.length ? [`chapters: ${due.results.length} checked, ${found} with chapters`] : [];
 }
 
 // ─── Archiving ───────────────────────────────────────────────────────────────
