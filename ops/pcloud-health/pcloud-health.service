@@ -1,0 +1,12 @@
+[Unit]
+Description=Check rclone's pCloud token and report to the shim
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# The owner of the rclone config. systemd reads the root-only env file
+# before dropping to this user.
+User=wharf
+EnvironmentFile=/etc/pcloud-health.env
+ExecStart=/usr/local/bin/pcloud-health

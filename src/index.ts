@@ -34,6 +34,8 @@ import { ADMIN_HTML } from './lib/admin-html';
 import { LANDING_HTML } from './lib/landing-html';
 import { OPS_HTML } from './lib/ops-html';
 import { opsRoutes } from './routes/ops';
+import { nodeHealthRoutes } from './routes/node-health';
+import { checkSilentNodes } from './lib/node-health';
 import { requireOpsAccess } from './ops/access';
 import { verifyProxyUrl } from './storage/proxy-url';
 import { getAdapter } from './storage/factory';
@@ -497,6 +499,10 @@ app.route('/api/signup', signupRoutes);
 app.get('/signup', (c) => c.html(renderSignupHtml(c.env.TURNSTILE_SITE_KEY)));
 app.get('/signup/', (c) => c.html(renderSignupHtml(c.env.TURNSTILE_SITE_KEY)));
 
+// wharf nodes' hourly pCloud-token reports (ops/pcloud-health/), keyed by
+// the NODE_HEALTH_KEY secret rather than a user. See src/lib/node-health.ts.
+app.route('/api/node-health', nodeHealthRoutes);
+
 // Internal ops dashboard — gated by Cloudflare Access (NOT user auth). Both the
 // page and its API live under the Access application; requireOpsAccess verifies
 // the signed Cf-Access-Jwt-Assertion as defense-in-depth. See src/ops/access.ts.
@@ -810,5 +816,8 @@ export default {
         .then((log) => { if (log.length) console.log('[podcasts] ' + log.join(' | ')); })
         .catch((e: Error) => console.error('[podcasts] tick failed: ' + e.message)),
     );
+    // A node that stopped reporting on rclone's pCloud token is as quiet as
+    // a revoked one.
+    ctx.waitUntil(checkSilentNodes(env).catch((e: Error) => console.error('[node-health] ' + e.message)));
   },
 };

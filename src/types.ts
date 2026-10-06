@@ -40,4 +40,7 @@ export type Env = {
   // notification is sent. PUSHOVER_TOKEN = app token, PUSHOVER_USER_KEY = user.
   PUSHOVER_TOKEN?: string;
   PUSHOVER_USER_KEY?: string;
+  // Shared key the wharf nodes send with their hourly pCloud-token report
+  // (POST /api/node-health, ops/pcloud-health/). Unset = the route answers 503.
+  NODE_HEALTH_KEY?: string;
 };

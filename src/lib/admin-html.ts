@@ -2354,10 +2354,16 @@ async function audibleLoadJobs() {
       if (show) audibleTailLog(j.id, log, running ? j : undefined);
       if (j.state === 'succeeded') {
         const res = j.result || {};
-        row.complete('Done: ' + (res.done || []).length + ' backed up, ' + (res.failed || []).length + ' failed, ' + (res.skipped || []).length + ' already there');
+        const tally = (res.done || []).length + ' backed up, ' + (res.failed || []).length + ' failed, ' + (res.skipped || []).length + ' already there';
+        // A sync stops early when pCloud refuses rclone's token: every later
+        // title would download for minutes and then fail the same way.
+        if (res.stopped) row.fail('Stopped (' + tally + '): ' + String(res.stopped).slice(0, 200));
+        else row.complete('Done: ' + tally);
         if (!j.scanned) audibleAfterSync(j);
       } else if (j.state === 'failed' || j.state === 'cancelled' || j.state === 'interrupted') {
-        row.fail(j.state + (j.error ? ': ' + String(j.error).split('\n')[0].slice(0, 160) : ''));
+        // The handler's own reason (e.g. the pCloud preflight) is in its result; wharf's error is often just the exit status.
+        const why = (j.result && j.result.error) || j.error;
+        row.fail(j.state + (why ? ': ' + String(why).split('\n')[0].slice(0, 200) : ''));
       } else {
         row.setStatus(j.state + '…');
         row.addButton('Cancel', async () => { await api('/api/admin/audible/jobs/' + encodeURIComponent(j.id) + '/cancel', { method: 'POST' }); audibleLoadJobs(); });

@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly check of rclone's pCloud token
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

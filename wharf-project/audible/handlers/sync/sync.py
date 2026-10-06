@@ -171,6 +171,13 @@ def pcloud_token():
 
 
 PCLOUD_API = "https://api.pcloud.com"
+# 1000 log in required, 2000 log in failed, 2094 invalid token, 2095 revoked.
+PCLOUD_AUTH_ERRORS = {1000, 2000, 2094, 2095}
+
+
+class PcloudAuthError(RuntimeError):
+    """pCloud refused rclone's token. Every later title would fail the same
+    way, after its whole Audible download, so the run stops."""
 
 
 def pcloud_api(method, params, token, timeout=60):
@@ -179,11 +186,16 @@ def pcloud_api(method, params, token, timeout=60):
     for attempt in range(4):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.load(r)
+                d = json.load(r)
+            break
         except Exception as e:  # noqa: BLE001 — pCloud's API sits behind Cloudflare and 5xx/drops now and then
             if attempt == 3:
                 raise RuntimeError(f"pCloud {method}: {e}") from e
             time.sleep(2 ** attempt)
+    if d.get("result") in PCLOUD_AUTH_ERRORS:
+        raise PcloudAuthError(f"pCloud refused rclone's token ({d.get('result')} {d.get('error', '')}). "
+                              "Re-authorise with ops/pcloud-health/pcloud-reauth.sh on the Mac, then sync again.")
+    return d
 
 
 def pcloud_ensure_folder(token, abs_path):
@@ -364,7 +376,20 @@ want = args.get("asins")
 asins = list(by_asin) if want == "all" or want is None else [a for a in want if isinstance(a, str)]
 synced = L.load_json(L.SYNCED_DIR / f"{account}.json", {})
 
+# Check pCloud before downloading anything. On 2026-10-05 pCloud revoked
+# rclone's token (2095) and each title spent ~13 min downloading from Audible
+# before failing at the pCloud step; this fails the job in seconds instead.
+if any(force or a not in synced for a in asins):
+    try:
+        info = pcloud_api("userinfo", {}, pcloud_token(), timeout=30)
+    except RuntimeError as e:   # PcloudAuthError included
+        L.fail(f"pCloud preflight: {e}")
+    if info.get("result") != 0:
+        L.fail(f"pCloud preflight: {info.get('result')} {info.get('error', '')}")
+    L.log("pCloud token OK")
+
 done, failed, skipped = [], [], []
+stopped = None
 L.log(f"sync {account}: {len(asins)} title(s) → pcloud:{dest_root}")
 for n, asin in enumerate(asins, 1):
     item = by_asin.get(asin)
@@ -384,8 +409,15 @@ for n, asin in enumerate(asins, 1):
     except subprocess.TimeoutExpired:
         failed.append({"asin": asin, "title": item.get("title"), "error": "timed out"})
         L.log(f"[{asin}] timed out")
+    except PcloudAuthError as e:
+        failed.append({"asin": asin, "title": item.get("title"), "error": str(e)[:400]})
+        stopped = str(e)
+        L.log(f"[{asin}] FAILED: {e}")
+        L.log(f"stopping: {len(asins) - n} title(s) not attempted")
+        break
     except Exception as e:  # noqa: BLE001
         failed.append({"asin": asin, "title": item.get("title"), "error": str(e)[:400]})
         L.log(f"[{asin}] FAILED: {e}")
 L.log(f"finished: {len(done)} synced, {len(failed)} failed, {len(skipped)} already there")
-L.emit({"ok": True, "account": account, "done": done, "failed": failed, "skipped": skipped})
+# `stopped` still succeeds the job, so /admin scans the titles that did land.
+L.emit({"ok": True, "account": account, "done": done, "failed": failed, "skipped": skipped, "stopped": stopped})
