@@ -592,7 +592,10 @@ async function chaptersFromAudio(e: EpisodeRow): Promise<{ chapters: Chapter[]; 
 
 // Look one episode's chapters up and store them. Chapters already in the
 // row (psc:chapters inline in the feed) are kept. A failure is retried the
-// next day, an episode without any a week later.
+// next day, an episode without any a week later, but only while it's under
+// 30 days old: publishers add chapters to new episodes, not old ones, and a
+// show without any (Linux Matters) would otherwise re-read every episode's
+// mp3 header every week.
 export async function ensureEpisodeChapters(env: Env, e: EpisodeRow): Promise<Chapter[]> {
   const now = Date.now();
   const have = JSON.parse(e.chapters || '[]') as Chapter[];
@@ -620,9 +623,10 @@ export async function ensureEpisodeChapters(env: Env, e: EpisodeRow): Promise<Ch
 export async function chapterPump(env: Env): Promise<string[]> {
   const due = await env.DB.prepare(
     `SELECT * FROM podcast_episodes
-      WHERE in_library = 1 AND (chapters_checked_at IS NULL OR (chapters = '[]' AND chapters_checked_at < ?))
+      WHERE in_library = 1 AND (chapters_checked_at IS NULL
+         OR (chapters = '[]' AND chapters_checked_at < ? AND published_at > ?))
       ORDER BY chapters_checked_at IS NOT NULL, published_at DESC LIMIT ?`,
-  ).bind(Date.now() - CHAPTERS_RECHECK_MS, CHAPTERS_PER_TICK).all<EpisodeRow>();
+  ).bind(Date.now() - CHAPTERS_RECHECK_MS, Date.now() - 30 * 86400_000, CHAPTERS_PER_TICK).all<EpisodeRow>();
   let found = 0;
   for (const e of due.results) if ((await ensureEpisodeChapters(env, e)).length) found++;
   return due.results.length ? [`chapters: ${due.results.length} checked, ${found} with chapters`] : [];
