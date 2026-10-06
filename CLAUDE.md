@@ -274,7 +274,7 @@ A **podcast library** (`libraries.media_type = 'podcast'`, made from /admin's "N
 
 ## Watching rclone's pCloud token (2026-10-06)
 
-`ops/pcloud-health/` (README there). One rclone pCloud token is shared by wharf-syd-1 (eastsidefm) and stereo-au (Audible), listed in `ops/pcloud-health/nodes.conf`. Each runs an hourly systemd timer (`pcloud-health.timer`, not a wharf project) that runs `rclone about pcloud:` and posts the result to `POST /api/node-health`, authenticated by the `NODE_HEALTH_KEY` secret. `src/lib/node-health.ts` classifies the output and sends the Pushover: a revoked token at once, other failures after 3 in a row, a node silent for 3 h (checked on the cron), and "OK again" on recovery. The nodes hold no Pushover keys; the Worker does. The fix it points at is `ops/pcloud-health/pcloud-reauth.sh`, which re-authorises in the browser and installs the token on every node without printing it.
+`ops/pcloud-health/` (README there). One rclone pCloud token is shared by wharf-syd-1 (eastsidefm) and stereo-au (Audible), listed in `ops/pcloud-health/nodes.conf`. Each runs an hourly systemd timer (`pcloud-health.timer`, not a wharf project) that runs `rclone about pcloud:` and posts the result to `POST /api/node-health`, authenticated by the `NODE_HEALTH_KEY` secret. `src/lib/node-health.ts` classifies the output and sends the Pushover: a revoked token at once, other failures after 3 in a row, a node silent for 3 h (checked on the cron), and "OK again" on recovery. The nodes hold no Pushover keys; the Worker does. The fix it points at is `ops/pcloud-health/pcloud-reauth.sh`, which re-authorises in the browser and installs the token on every node, and in the Mac's own rclone config, without printing it.
 
 ## Playlists (2026-10-06)
 

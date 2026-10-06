@@ -16,7 +16,7 @@ One rclone pCloud token is shared by every box in `nodes.conf`: wharf-syd-1 (eas
 
 ```sh
 ops/pcloud-health/pcloud-reauth.sh            # every node in nodes.conf
-ops/pcloud-health/pcloud-reauth.sh stereo-au  # just one
+ops/pcloud-health/pcloud-reauth.sh stereo-au  # just one ("mac" = this Mac's own rclone)
 ```
 
 This opens pCloud's sign-in in the browser (`rclone authorize pcloud`). On each node it then:
@@ -25,7 +25,7 @@ This opens pCloud's sign-in in the browser (`rclone authorize pcloud`). On each 
 - checks the token with `rclone about pcloud:`;
 - runs the health check, so the shim sends "OK again".
 
-The token travels on ssh's stdin and is never printed. This Mac's own `[pcloud]` remote is not touched.
+This Mac's own `[pcloud]` remote gets the same token, with the same edit and check. The token travels on ssh's stdin and is never printed.
 
 ## Installing or changing it
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 # One command to re-authorise rclone's pCloud remote on every node that uses it.
 #
-#   ops/pcloud-health/pcloud-reauth.sh [node ...]
+#   ops/pcloud-health/pcloud-reauth.sh [node ...]     (node names from nodes.conf, or "mac")
 #
 # Use it when pCloud answers 2095 "Revoked 'access_token' provided" (the
 # token never expires on its own; 2095 means the authorization was withdrawn).
@@ -12,9 +12,10 @@
 #     (the old file is kept as rclone.conf.bak-reauth);
 #   - checks the new token with `rclone about pcloud:` as the config's owner;
 #   - runs the node's pcloud-health check, so the shim marks it OK again.
-# The token reaches the nodes on ssh's stdin. It is never printed, never in
-# argv, and the local copy is deleted on exit. This Mac's own rclone config
-# is not touched.
+# This Mac's own rclone config gets the same token (same in-place edit and
+# check) when it has a [pcloud] remote. The token reaches the nodes on ssh's
+# stdin. It is never printed, never in argv, and the temporary copy is
+# deleted on exit.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 want=("$@")
@@ -72,8 +73,9 @@ with open(conf, "r+") as f:
     f.seek(0)
     f.write("\n".join(lines))
     f.truncate()
-user = pwd.getpwuid(st.st_uid).pw_name
-p = subprocess.run(["runuser", "-u", user, "--", rclone, "--config", conf, "about", "pcloud:"],
+# As the config's owner: a node's is wharf, the Mac's is already us.
+as_owner = [] if os.geteuid() == st.st_uid else ["runuser", "-u", pwd.getpwuid(st.st_uid).pw_name, "--"]
+p = subprocess.run([*as_owner, rclone, "--config", conf, "about", "pcloud:"],
                    capture_output=True, text=True, timeout=120)
 if p.returncode != 0:
     tail = (p.stderr or p.stdout).strip().splitlines()
@@ -100,6 +102,18 @@ while read -r name target rclone conf _uses; do
     failed+=("$name")
   fi
 done < "$here/nodes.conf"
+
+if ! ((${#want[@]})) || [[ " ${want[*]} " == *" mac "* ]]; then
+  local_conf=$(rclone config file | tail -1)
+  if grep -qx '\[pcloud\]' "$local_conf" 2>/dev/null; then
+    echo "== mac"
+    if python3 -c "import base64; exec(base64.b64decode('$remote_py'))" "$local_conf" rclone < "$tmp/token.json"; then
+      ok+=("mac")
+    else
+      failed+=("mac")
+    fi
+  fi
+fi
 
 echo
 echo "Updated: ${ok[*]:-none}"
