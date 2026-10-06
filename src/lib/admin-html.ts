@@ -1591,7 +1591,14 @@ async function podDirectorySearch(term, country) {
       const r = await fetch('https://itunes.apple.com/search?' + q, { credentials: 'omit' });
       if (r.ok) {
         const d = await r.json();
-        return (d.results || []).filter((x) => x.feedUrl).map((x) => ({
+        // One result per feed: Apple can list a feed twice under two ids.
+        const seen = new Set();
+        return (d.results || []).filter((x) => {
+          const k = x.feedUrl && x.feedUrl.toLowerCase().replace(/^https?:\/\/(www\.)?/, '').replace(/\/+$/, '');
+          if (!k || seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        }).map((x) => ({
           id: x.collectionId, artistId: x.artistId || null, title: x.collectionName, artistName: x.artistName,
           genres: x.genres || [], cover: x.artworkUrl600 || x.artworkUrl100 || '', trackCount: x.trackCount,
           feedUrl: x.feedUrl, pageUrl: x.collectionViewUrl,

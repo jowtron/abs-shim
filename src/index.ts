@@ -20,6 +20,7 @@ import { abbRoutes } from './routes/abb';
 import { passkeyRoutes } from './routes/passkeys';
 import { audibleRoutes } from './routes/audible';
 import { podcastRoutes, podcastSearchRoutes } from './routes/podcasts';
+import { playlistRoutes } from './routes/playlists';
 import { runPodcastTick } from './lib/podcasts';
 import { runCatalogTick } from './lib/abb-catalog';
 import { signupRoutes } from './routes/signup';
@@ -482,6 +483,7 @@ app.get('/api/me/listening-sessions', requireAuth, async (c) => {
 app.route('/api/libraries', libraryRoutes);
 app.route('/api/items', itemRoutes);
 app.route('/api/podcasts', podcastRoutes);
+app.route('/api/playlists', playlistRoutes);
 app.route('/api/search', podcastSearchRoutes);
 app.route('/api/authors', authorRoutes);
 app.route('/api/auth/passkey', passkeyRoutes);
@@ -629,13 +631,6 @@ app.post('/api/session/local-all', requireAuth, async (c) => {
   return c.json({ success: true, applied, ignored: sessions.length - applied });
 });
 
-// Plappa fetches /api/playlists during bootstrap. We don't model playlists.
-app.get('/api/playlists', requireAuth, (c) => c.json({
-  playlists: [] as unknown[],
-  total: 0,
-  limit: Number(c.req.query('limit') ?? 0),
-  page: 0,
-}));
 
 // ─── Misc shapes clients fetch on bootstrap ──────────────────────────────────
 

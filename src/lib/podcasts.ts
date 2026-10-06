@@ -190,12 +190,25 @@ async function fyydSearch(term: string, limit = 25): Promise<ItunesPodcast[]> {
   }));
 }
 
+// Apple's directory sometimes lists one feed twice under two ids ("Linux
+// Matters" is 1682797246 and 976672924, both linuxmatters.sh's feed), which
+// reads as two shows. One result per feed, in Apple's order.
+export function onePerFeed<T extends { feedUrl: string }>(results: T[]): T[] {
+  const seen = new Set<string>();
+  return results.filter((r) => {
+    const k = feedKey(r.feedUrl);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 export async function searchPodcasts(term: string, country = 'us'): Promise<ItunesPodcast[]> {
   try {
-    return await itunesSearch(term, country);
+    return onePerFeed(await itunesSearch(term, country));
   } catch (e) {
     console.warn(`[podcasts] iTunes search failed (${(e as Error).message}); trying fyyd`);
-    return fyydSearch(term);
+    return onePerFeed(await fyydSearch(term));
   }
 }
 

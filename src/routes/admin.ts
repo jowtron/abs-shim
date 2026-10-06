@@ -1415,6 +1415,7 @@ adminRoutes.delete('/items/:itemId', requireTenantOwner, async (c) => {
     c.env.DB.prepare('DELETE FROM media_progress WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM bookmarks WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM listening_sessions WHERE library_item_id = ?').bind(itemId),
+    c.env.DB.prepare('DELETE FROM playlist_items WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM podcast_episodes WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM podcasts WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM library_items WHERE id = ?').bind(itemId),

@@ -11,6 +11,7 @@ import { getEpisodeCounts, getPodcasts, type EpisodeRow, type PodcastRow } from 
 import { buildEpisodeExpanded, buildPodcastItemMinified, buildPodcastOld } from '../lib/podcast-shapes';
 import { buildOpml } from '../lib/rss';
 import { downloadJson } from './podcasts';
+import { libraryPlaylists } from './playlists';
 import {
   buildFilterData, buildItemMinified, buildLibrary, buildPersonalizedShelves,
 } from '../lib/abs-shapes';
@@ -397,6 +398,12 @@ libraryRoutes.get('/:id/series', async (c) => {
   });
 });
 
+libraryRoutes.get('/:id/playlists', async (c) => {
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), c.get('tenantId'));
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  return libraryPlaylists(c, scope.library.id);
+});
+
 libraryRoutes.get('/:id/collections', async (c) => {
   const tenantId = c.get('tenantId');
   if (!(await resolveLibraryScope(c.env, c.req.param('id'), tenantId))) return c.json({ error: 'Library not found' }, 404);
@@ -606,10 +613,12 @@ libraryRoutes.get('/:id/podcast-titles', async (c) => {
   if (!scope) return c.json({ error: 'Library not found' }, 404);
   const view = scope.filter('li.');
   const r = await c.env.DB.prepare(
-    `SELECT p.title, p.itunes_id, li.id, li.library_id FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
+    `SELECT p.title, p.itunes_id, p.feed_url, li.id, li.library_id FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
       WHERE li.library_id = ? AND p.tenant_id = ?${view.sql}`,
-  ).bind(scope.library.id, tenantId, ...view.binds).all<{ title: string; itunes_id: string | null; id: string; library_id: string }>();
-  return c.json({ podcasts: r.results.map((p) => ({ title: p.title, itunesId: p.itunes_id, libraryItemId: p.id, libraryId: p.library_id })) });
+  ).bind(scope.library.id, tenantId, ...view.binds).all<{ title: string; itunes_id: string | null; feed_url: string; id: string; library_id: string }>();
+  // feedUrl isn't in ABS's answer: Pholia marks search results already
+  // subscribed by it, since Apple can list one feed under two ids.
+  return c.json({ podcasts: r.results.map((p) => ({ title: p.title, itunesId: p.itunes_id, feedUrl: p.feed_url, libraryItemId: p.id, libraryId: p.library_id })) });
 });
 
 // The archive queue across the library, in ABS's episode-download shape.
