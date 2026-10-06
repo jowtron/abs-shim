@@ -26,6 +26,7 @@ export type PodcastRow = {
   max_new_episodes_to_download: number;
   archive: number;
   parse_version: number;           // migration 0018
+  finish_remaining_seconds: number | null; // migration 0019; NULL = the library's setting
   feed_etag: string | null;
   feed_last_modified: string | null;
   last_episode_check: number | null;
@@ -82,6 +83,32 @@ async function inChunks<T>(env: Env, ids: string[], sql: (marks: string) => stri
     out.push(...r.results);
   }
   return out;
+}
+
+// ABS's default for markAsFinishedTimeRemaining.
+export const DEFAULT_FINISH_REMAINING = 10;
+
+// The library setting, from libraries.settings (ABS's name for it).
+export function libraryFinishRemaining(settingsJson: string | null | undefined): number {
+  try {
+    const v = (JSON.parse(settingsJson || '{}') as Record<string, unknown>)['markAsFinishedTimeRemaining'];
+    return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : DEFAULT_FINISH_REMAINING;
+  } catch { return DEFAULT_FINISH_REMAINING; }
+}
+
+// How close to its end an episode of this show counts as played: the show's
+// own setting, else its library's. One indexed read, run on every episode
+// session sync (every 30 s per listener).
+export async function episodeFinishRemaining(env: Env, itemId: string): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT p.finish_remaining_seconds AS own, l.settings AS settings
+       FROM podcasts p
+       JOIN library_items li ON li.id = p.library_item_id
+       JOIN libraries l ON l.id = li.library_id
+      WHERE p.library_item_id = ?`,
+  ).bind(itemId).first<{ own: number | null; settings: string | null }>();
+  if (row?.own != null) return row.own;
+  return libraryFinishRemaining(row?.settings);
 }
 
 export async function getPodcast(env: Env, itemId: string, tenantId: string): Promise<PodcastRow | null> {

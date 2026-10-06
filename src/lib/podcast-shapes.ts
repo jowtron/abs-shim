@@ -42,6 +42,9 @@ function titleIgnorePrefix(title: string | null): string | null {
 function shimFields(p: PodcastRow, folder?: LibraryFolderRow) {
   return {
     archive: p.archive === 1,
+    // Seconds left at which an episode counts as played; null = the
+    // library's markAsFinishedTimeRemaining (migration 0019).
+    markAsFinishedTimeRemaining: p.finish_remaining_seconds ?? null,
     // Whether archiving can work at all: only a pCloud library can take
     // copies (src/lib/podcasts.ts). Known only where the folder is loaded.
     ...(folder ? { canArchive: folder.provider === 'pcloud_oauth' } : {}),

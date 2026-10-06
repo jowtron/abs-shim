@@ -26,6 +26,7 @@ import { runCatalogTick } from './lib/abb-catalog';
 import { signupRoutes } from './routes/signup';
 import { renderSignupHtml } from './lib/signup-html';
 import { listProgressByUser, getProgress, upsertProgress, progressToAbs } from './db/progress';
+import { episodeFinishRemaining } from './db/podcasts';
 import { listSessionsByUser } from './db/sessions';
 import { userListeningStats, userYearStats } from './db/stats';
 import { streamAudio } from './storage/resolve';
@@ -298,16 +299,25 @@ const patchProgress = async (c: Context<{ Bindings: Env; Variables: AuthVars }>)
   if (typeof body['currentTime'] === 'number') patch.currentTime = body['currentTime'];
   if (typeof body['isFinished'] === 'boolean') patch.isFinished = body['isFinished'];
   if (typeof body['hideFromContinueListening'] === 'boolean') patch.hideFromContinueListening = body['hideFromContinueListening'];
-  const row = await upsertProgress(c.env, {
-    userId: userRow.id,
-    itemId: c.req.param('itemId')!,
-    episodeId: c.req.param('episodeId') ?? null,
-    patch,
-  });
+  const itemId = c.req.param('itemId')!;
+  const episodeId = c.req.param('episodeId') ?? null;
+  await applyEpisodeFinish(c.env, itemId, episodeId, patch);
+  const row = await upsertProgress(c.env, { userId: userRow.id, itemId, episodeId, patch });
   return c.json(await progressToAbs(c.env, row));
 };
 app.patch('/api/me/progress/:itemId', requireAuth, patchProgress);
 app.patch('/api/me/progress/:itemId/:episodeId', requireAuth, patchProgress);
+
+// A progress write for an episode that lands within the show's "played"
+// threshold marks it played, whatever the client said, as ABS applies its
+// markAsFinishedTimeRemaining to every update. Pholia's sessionless sync (a
+// downloaded episode) sends isFinished:false every 30 s, which would
+// otherwise undo it. "Mark unplayed" sends currentTime 0, so it still works.
+async function applyEpisodeFinish(env: Env, itemId: string, episodeId: string | null,
+  patch: Parameters<typeof upsertProgress>[1]['patch']): Promise<void> {
+  if (!episodeId || patch.isFinished === true || patch.currentTime == null || !(patch.duration && patch.duration > 0)) return;
+  if (patch.currentTime >= patch.duration - await episodeFinishRemaining(env, itemId)) patch.isFinished = true;
+}
 
 const readProgress = async (c: Context<{ Bindings: Env; Variables: AuthVars }>) => {
   const userRow = c.get('user');
@@ -336,6 +346,7 @@ app.patch('/api/me/progress/batch/update', requireAuth, async (c) => {
     if (typeof entry['isFinished'] === 'boolean') patch.isFinished = entry['isFinished'];
     if (typeof entry['hideFromContinueListening'] === 'boolean') patch.hideFromContinueListening = entry['hideFromContinueListening'];
     const episodeId = typeof entry['episodeId'] === 'string' && entry['episodeId'] ? entry['episodeId'] : null;
+    await applyEpisodeFinish(c.env, itemId, episodeId, patch);
     await upsertProgress(c.env, { userId: userRow.id, itemId, episodeId, patch });
   }
   return c.body(null, 200);
@@ -380,8 +391,10 @@ app.post('/api/session/:id/sync', requireAuth, async (c) => {
     // ABS marks media finished within markAsFinishedTimeRemaining (10 s) of
     // the end. Done here for episodes only: an episode left "99%" sits in
     // Continue Listening for good, and books have their own long-settled
-    // behaviour that this isn't the place to change.
-    const finished = !!session.episode_id && currentTime >= duration - 10;
+    // behaviour that this isn't the place to change. The threshold is the
+    // show's own, else its library's (migration 0019).
+    const finished = !!session.episode_id
+      && currentTime >= duration - await episodeFinishRemaining(c.env, session.library_item_id);
     await upsertProgress(c.env, {
       userId: userRow.id,
       itemId: session.library_item_id,

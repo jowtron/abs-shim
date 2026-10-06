@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../types';
-import { requireAuth, type AuthVars } from '../auth/middleware';
+import { requireAuth, requireTenantOwner, type AuthVars } from '../auth/middleware';
 import {
   countItemsByLibrary, getAudioFiles, getBookMetadata, getChapters,
   getFolderById, getItem, getLibrary, listAllBookMetadata, listFolders,
@@ -56,6 +56,29 @@ libraryRoutes.get('/:id', async (c) => {
     return c.json({ ...fd, library: buildLibrary(shown, folders) });
   }
   return c.json(buildLibrary(shown, folders));
+});
+
+// PATCH /api/libraries/:id — ABS's library settings update, for the one
+// setting the shim acts on: settings.markAsFinishedTimeRemaining, the
+// seconds left at which an episode counts as played (a show can override it,
+// PATCH /api/items/:id/media). Other fields are ignored. A view's settings
+// are its library's.
+libraryRoutes.patch('/:id', requireTenantOwner, async (c) => {
+  const tenantId = c.get('tenantId');
+  const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
+  if (!scope) return c.json({ error: 'Library not found' }, 404);
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  const incoming = (body['settings'] && typeof body['settings'] === 'object' ? body['settings'] : {}) as Record<string, unknown>;
+  const fin = incoming['markAsFinishedTimeRemaining'];
+  if (typeof fin === 'number' && Number.isFinite(fin) && fin >= 0 && fin <= 3600) {
+    let settings: Record<string, unknown> = {};
+    try { settings = JSON.parse(scope.library.settings || '{}') as Record<string, unknown>; } catch {}
+    settings['markAsFinishedTimeRemaining'] = Math.round(fin);
+    await c.env.DB.prepare('UPDATE libraries SET settings = ?, updated_at = ? WHERE id = ? AND tenant_id = ?')
+      .bind(JSON.stringify(settings), Date.now(), scope.library.id, tenantId).run();
+  }
+  const fresh = (await getLibrary(c.env, scope.library.id, tenantId))!;
+  return c.json(buildLibrary(fresh, await listFolders(c.env, fresh.id, tenantId)));
 });
 
 libraryRoutes.get('/:id/personalized', async (c) => {

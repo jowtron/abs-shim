@@ -514,7 +514,9 @@ itemRoutes.post('/:id/play/:episodeId', async (c) => {
 
 // PATCH /api/items/:id/media — how ABS clients change a podcast's settings
 // (autoDownloadEpisodes, maxEpisodesToKeep, maxNewEpisodesToDownload,
-// autoDownloadSchedule, tags). Shim extra: `archive`. Books aren't editable
+// autoDownloadSchedule, tags). Shim extras: `archive`, and
+// `markAsFinishedTimeRemaining` (seconds left at which an episode counts as
+// played; null goes back to the library's setting). Books aren't editable
 // here (their metadata comes from the files); that answers 400.
 itemRoutes.patch('/:id/media', requireCanAdd, async (c) => {
   const tenantId = c.get('tenantId');
@@ -532,6 +534,10 @@ itemRoutes.patch('/:id/media', requireCanAdd, async (c) => {
   bool('archive', 'archive');
   int('maxEpisodesToKeep', 'max_episodes_to_keep');
   int('maxNewEpisodesToDownload', 'max_new_episodes_to_download');
+  const fin = body['markAsFinishedTimeRemaining'];
+  if (fin === null || (typeof fin === 'number' && Number.isFinite(fin) && fin >= 0 && fin <= 3600)) {
+    sets.push('finish_remaining_seconds = ?'); binds.push(fin === null ? null : Math.round(fin));
+  }
   if (typeof body['autoDownloadSchedule'] === 'string') { sets.push('auto_download_schedule = ?'); binds.push(body['autoDownloadSchedule']); }
   if (Array.isArray(body['tags'])) { sets.push('tags = ?'); binds.push(JSON.stringify((body['tags'] as unknown[]).filter((t) => typeof t === 'string'))); }
   const md = body['metadata'] as Record<string, unknown> | undefined;
