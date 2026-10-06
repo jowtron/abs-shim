@@ -5,7 +5,7 @@ import { getFolderById, getItem, type LibraryFolderRow, type LibraryItemRow } fr
 import { getEpisode, getPodcast, listShowEpisodes, type EpisodeRow, type PodcastRow } from '../db/podcasts';
 import { buildEpisode, buildEpisodeExpanded, buildPodcastItemExpanded } from '../lib/podcast-shapes';
 import {
-  canArchive, createPodcast, fetchAndParse, PodcastError, refreshPodcast, searchPodcasts, validFeedUrl,
+  archivePump, canArchive, createPodcast, fetchAndParse, PodcastError, refreshPodcast, searchPodcasts, validFeedUrl,
 } from '../lib/podcasts';
 import { parseOpml } from '../lib/rss';
 
@@ -370,6 +370,9 @@ podcastRoutes.post('/:id/archive', requireCanAdd, async (c) => {
     ).bind(Date.now(), show.item.id).run();
     n = r.meta.changes ?? 0;
   }
+  // Start the copies now rather than at the next cron tick (up to 2 min);
+  // the cron still notices when pCloud has finished.
+  if (n) c.executionCtx.waitUntil(archivePump(c.env).then(() => undefined, () => undefined));
   return c.json({ queued: n });
 });
 

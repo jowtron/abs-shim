@@ -157,6 +157,10 @@ export async function buildEpisode(e: EpisodeRow, item: LibraryItemRow) {
     publishedAt: e.published_at,
     addedAt: e.created_at,
     updatedAt: e.updated_at,
+    // Not ABS: archive progress (queued / fetching / done / error), so a
+    // client can follow one episode with GET /api/podcasts/:id/episode/:id.
+    archiveState: e.archive_state,
+    archiveError: e.archive_error,
   };
 }
 
@@ -166,10 +170,9 @@ export async function buildEpisodeExpanded(e: EpisodeRow, item: LibraryItemRow, 
   return {
     ...json,
     audioFile,
-    // Not ABS: whether the episode's bytes are in the library's storage yet,
-    // and if not why. Pholia shows it per episode.
-    archiveState: e.archive_state,
-    archiveError: e.archive_error,
+    // Not ABS: whether this episode can be archived at all (its library is
+    // on pCloud) — every list carries the episode, not always the show.
+    canArchive: folder.provider === 'pcloud_oauth',
     audioTrack: {
       ...audioFile,
       startOffset: 0,
