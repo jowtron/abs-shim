@@ -4,8 +4,11 @@ description: "Download selected Audible titles (or all), decrypt/remux to m4b wi
 mode_allowed: [async]
 idempotent: true
 
-# Sequential per title; a big pile of long books can take hours.
-timeout_ms: 21600000
+# Sequential per title, about 13 minutes each (download, decrypt, R2
+# stage, pCloud pull). 48 h, not 6: the 6 h limit killed liz's 114-title
+# "all" sync at title 29 (2026-10-04). A re-run skips titles already in
+# data/synced/<account>.json, so a timeout costs time, not work.
+timeout_ms: 172800000
 # 4 GB, not 1: the 2026-09-02 first run was OOM-killed (cgroup limit) 12 min
 # into a ~29 h title — the download's dirty page cache is charged to the
 # job's cgroup on top of the python process. The box has 7 GB.
