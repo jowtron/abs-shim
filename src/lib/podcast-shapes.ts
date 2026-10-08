@@ -37,6 +37,29 @@ function titleIgnorePrefix(title: string | null): string | null {
   return m ? `${m[2]}, ${m[1]}` : title;
 }
 
+// A show's intro/outro skipping (migration 0020), applied by the player.
+// Each end is skipped by whole chapters or by seconds, never both; chapters
+// win when both are sent. Anything else is dropped, and nothing left = null.
+export type PodcastSkip = { startChapters?: number; startSeconds?: number; endChapters?: number; endSeconds?: number };
+export function normalizeSkip(v: unknown): PodcastSkip | null {
+  if (!v || typeof v !== 'object') return null;
+  const o = v as Record<string, unknown>;
+  const int = (k: string, max: number) => {
+    const n = o[k];
+    return typeof n === 'number' && Number.isFinite(n) && n >= 1 && n <= max ? Math.round(n) : undefined;
+  };
+  const out: PodcastSkip = {};
+  const sc = int('startChapters', 10), ss = int('startSeconds', 1800);
+  const ec = int('endChapters', 10), es = int('endSeconds', 1800);
+  if (sc) out.startChapters = sc; else if (ss) out.startSeconds = ss;
+  if (ec) out.endChapters = ec; else if (es) out.endSeconds = es;
+  return Object.keys(out).length ? out : null;
+}
+function parseSkip(json: string | null): PodcastSkip | null {
+  if (!json) return null;
+  try { return normalizeSkip(JSON.parse(json)); } catch { return null; }
+}
+
 // Not ABS fields: Pholia and /admin show and change them. Strict clients
 // ignore unknown keys.
 function shimFields(p: PodcastRow, folder?: LibraryFolderRow) {
@@ -45,6 +68,8 @@ function shimFields(p: PodcastRow, folder?: LibraryFolderRow) {
     // Seconds left at which an episode counts as played; null = the
     // library's markAsFinishedTimeRemaining (migration 0019).
     markAsFinishedTimeRemaining: p.finish_remaining_seconds ?? null,
+    // Intro/outro skipping, done by the player (migration 0020).
+    skip: parseSkip(p.skip_json),
     // Whether archiving can work at all: only a pCloud library can take
     // copies (src/lib/podcasts.ts). Known only where the folder is loaded.
     ...(folder ? { canArchive: folder.provider === 'pcloud_oauth' } : {}),

@@ -14,7 +14,7 @@ import { getProgress, progressToAbs } from '../db/progress';
 import { audioContentType, resolveProbeUrl, resolveStreamUrl, streamAudio, streamRemoteAudio } from '../storage/resolve';
 import { getEpisode, getPodcast, listShowEpisodes } from '../db/podcasts';
 import { ensureEpisodeChapters } from '../lib/podcasts';
-import { buildEpisodeExpanded, buildPodcastItemExpanded, podcastMetadata } from '../lib/podcast-shapes';
+import { buildEpisodeExpanded, buildPodcastItemExpanded, normalizeSkip, podcastMetadata } from '../lib/podcast-shapes';
 import { getBookMetadata, getFolderById, getItem, getStreamingTarget, type AudioFileRow } from '../db/library';
 import { tryServeMoovRange, warmMoovCache } from '../storage/moov-cache';
 import { tryServeByteRange, warmByteChunk, estimateByteOffsetForTime, CHUNK_SIZE } from '../storage/byte-cache';
@@ -514,9 +514,10 @@ itemRoutes.post('/:id/play/:episodeId', async (c) => {
 
 // PATCH /api/items/:id/media — how ABS clients change a podcast's settings
 // (autoDownloadEpisodes, maxEpisodesToKeep, maxNewEpisodesToDownload,
-// autoDownloadSchedule, tags). Shim extras: `archive`, and
+// autoDownloadSchedule, tags). Shim extras: `archive`,
 // `markAsFinishedTimeRemaining` (seconds left at which an episode counts as
-// played; null goes back to the library's setting). Books aren't editable
+// played; null goes back to the library's setting), and `skip` (intro/outro
+// skipping for the player, normalizeSkip; null turns it off). Books aren't editable
 // here (their metadata comes from the files); that answers 400.
 itemRoutes.patch('/:id/media', requireCanAdd, async (c) => {
   const tenantId = c.get('tenantId');
@@ -537,6 +538,10 @@ itemRoutes.patch('/:id/media', requireCanAdd, async (c) => {
   const fin = body['markAsFinishedTimeRemaining'];
   if (fin === null || (typeof fin === 'number' && Number.isFinite(fin) && fin >= 0 && fin <= 3600)) {
     sets.push('finish_remaining_seconds = ?'); binds.push(fin === null ? null : Math.round(fin));
+  }
+  if ('skip' in body) {
+    const skip = normalizeSkip(body['skip']);
+    sets.push('skip_json = ?'); binds.push(skip ? JSON.stringify(skip) : null);
   }
   if (typeof body['autoDownloadSchedule'] === 'string') { sets.push('auto_download_schedule = ?'); binds.push(body['autoDownloadSchedule']); }
   if (Array.isArray(body['tags'])) { sets.push('tags = ?'); binds.push(JSON.stringify((body['tags'] as unknown[]).filter((t) => typeof t === 'string'))); }
