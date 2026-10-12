@@ -5,9 +5,9 @@ import { getFolderById, getItem, type LibraryFolderRow, type LibraryItemRow } fr
 import { getEpisode, getPodcast, listShowEpisodes, type EpisodeRow, type PodcastRow } from '../db/podcasts';
 import { buildEpisode, buildEpisodeExpanded, buildPodcastItemExpanded } from '../lib/podcast-shapes';
 import {
-  archivePump, canArchive, createPodcast, fetchAndParse, PodcastError, refreshPodcast, searchPodcasts, validFeedUrl,
+  archivePump, canArchive, createPodcast, episodeTranscript, fetchAndParse, PodcastError, refreshPodcast, searchPodcasts, validFeedUrl,
 } from '../lib/podcasts';
-import { parseOpml } from '../lib/rss';
+import { parseOpml, type TranscriptLink } from '../lib/rss';
 
 // ABS's podcast routes (server/routers/ApiRouter.js "Podcast Routes"), plus a
 // few shim-only ones marked as such. ABS gates writes on admin; here they
@@ -206,6 +206,7 @@ function feedEpisodeJson(e: EpisodeRow) {
     chaptersUrl: null,
     chaptersType: null,
     chapters: JSON.parse(e.chapters || '[]') as unknown[],
+    transcripts: JSON.parse(e.transcripts || '[]') as TranscriptLink[],
   };
 }
 
@@ -251,6 +252,21 @@ podcastRoutes.get('/:id/episode/:episodeId', async (c) => {
   const e = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), c.get('tenantId'));
   if (!e) return c.json({ error: 'Episode not found' }, 404);
   return c.json(await buildEpisode(e, show.item));
+});
+
+// GET /api/podcasts/:id/episode/:episodeId/transcript — shim-only. The
+// episode's transcript as {format:'cues', cues:[{start,end,speaker,text}]}
+// (timed, joined into paragraphs) or {format:'text', paragraphs:[...]},
+// whatever the publisher's file format. 404 when the feed lists none, 502
+// when none of the listed files could be read.
+podcastRoutes.get('/:id/episode/:episodeId/transcript', async (c) => {
+  const show = await loadShow(c);
+  if (!show) return c.json({ error: 'Podcast not found' }, 404);
+  const e = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), c.get('tenantId'));
+  if (!e) return c.json({ error: 'Episode not found' }, 404);
+  try {
+    return c.json(await episodeTranscript(e), 200, { 'Cache-Control': 'private, max-age=3600' });
+  } catch (err) { return fail(c, err); }
 });
 
 podcastRoutes.patch('/:id/episode/:episodeId', requireCanAdd, async (c) => {

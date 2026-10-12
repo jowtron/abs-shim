@@ -14,8 +14,9 @@
 import type { Env } from '../types';
 import type { LibraryFolderRow } from '../db/library';
 import type { EpisodeRow, PodcastRow } from '../db/podcasts';
-import { decodeFeedBytes, episodeKey, parseFeed, type FeedEpisode, type ParsedFeed } from './rss';
+import { decodeFeedBytes, episodeKey, parseFeed, type FeedEpisode, type ParsedFeed, type TranscriptLink } from './rss';
 import { episodeExt } from './podcast-shapes';
+import { parseTranscript, rankTranscripts, type Transcript } from './transcript';
 import {
   pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudStat, type PcloudProfile,
 } from '../storage/pcloud';
@@ -40,8 +41,9 @@ const ARCHIVE_STARTS_PER_TICK = 3;
 const ARCHIVE_POLLS_PER_TICK = 10;
 const ARCHIVE_GIVE_UP_MS = 6 * 60 * 60 * 1000;
 // Raise when the parser starts storing a field older rows lack: each show's
-// next poll then re-reads its whole feed once (migration 0018: chapters_url).
-const PARSE_VERSION = 1;
+// next poll then re-reads its whole feed once (migration 0018: chapters_url;
+// 2 = migration 0021: transcripts).
+const PARSE_VERSION = 2;
 const CHAPTERS_PER_TICK = 15;
 const CHAPTERS_RECHECK_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -354,7 +356,7 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<string> {
 
 const EP_COLS = `id, library_item_id, tenant_id, ino, guid, idx, season, episode, episode_type, title, subtitle,
   description, pub_date, published_at, enclosure_url, enclosure_type, enclosure_length, duration_seconds,
-  chapters, chapters_url, in_library, removed, created_at, updated_at`;
+  chapters, chapters_url, transcripts, in_library, removed, created_at, updated_at`;
 
 function lengthOf(s: string | null): number | null {
   const n = Number(s);
@@ -371,7 +373,7 @@ async function upsertEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], start
   const ordered = [...eps].sort((x, y) => (x.publishedAt ?? 0) - (y.publishedAt ?? 0));
   const stmts = ordered.map((e, i) => env.DB.prepare(
     `INSERT INTO podcast_episodes (${EP_COLS})
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
      ON CONFLICT(library_item_id, guid) DO UPDATE SET
        enclosure_url = excluded.enclosure_url, enclosure_type = excluded.enclosure_type,
        enclosure_length = excluded.enclosure_length, title = excluded.title, subtitle = excluded.subtitle,
@@ -379,19 +381,21 @@ async function upsertEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], start
        duration_seconds = CASE WHEN excluded.duration_seconds > 0 THEN excluded.duration_seconds ELSE podcast_episodes.duration_seconds END,
        chapters_url = excluded.chapters_url,
        chapters_checked_at = CASE WHEN podcast_episodes.chapters_url IS NOT excluded.chapters_url THEN NULL ELSE podcast_episodes.chapters_checked_at END,
+       transcripts = excluded.transcripts,
        updated_at = excluded.updated_at
      WHERE podcast_episodes.enclosure_url IS NOT excluded.enclosure_url
         OR podcast_episodes.title IS NOT excluded.title
         OR podcast_episodes.description IS NOT excluded.description
         OR (excluded.duration_seconds > 0 AND podcast_episodes.duration_seconds IS NOT excluded.duration_seconds)
         OR podcast_episodes.chapters_url IS NOT excluded.chapters_url
+        OR podcast_episodes.transcripts IS NOT excluded.transcripts
      RETURNING id, published_at, created_at`,
   ).bind(
     crypto.randomUUID(), p.library_item_id, p.tenant_id, String(Math.floor(Math.random() * 0xffffffff)),
     episodeKey(e), startIdx + i + 1, e.season || null, e.episode || null, e.episodeType || null,
     e.title || null, e.subtitle || null, e.description || null, e.pubDate || null, e.publishedAt,
     e.enclosure.url, e.enclosure.type, lengthOf(e.enclosure.length), e.durationSeconds ?? 0,
-    JSON.stringify(e.chapters), e.chaptersUrl, now, now,
+    JSON.stringify(e.chapters), e.chaptersUrl, e.transcripts.length ? JSON.stringify(e.transcripts) : null, now, now,
   ));
   for (let i = 0; i < stmts.length; i += 100) {
     const res = await env.DB.batch<{ id: string; published_at: number | null; created_at: number }>(stmts.slice(i, i + 100));
@@ -588,6 +592,40 @@ async function chaptersFromAudio(e: EpisodeRow): Promise<{ chapters: Chapter[]; 
     };
   }
   return { chapters: [], duration: null };
+}
+
+// An episode's transcript, parsed (src/lib/transcript.ts), trying the
+// feed's links best format first until one parses. Kept at the edge for a
+// week under the publisher's URL: a transcript doesn't change once out, and
+// the next client to open it shouldn't wait on the publisher again. The
+// episode's length goes into the key because the hour-offset fix uses it.
+export async function episodeTranscript(e: EpisodeRow): Promise<Transcript> {
+  const links = rankTranscripts(JSON.parse(e.transcripts || '[]') as TranscriptLink[]);
+  if (!links.length) throw new PodcastError(404, 'This episode has no transcript');
+  const cache = caches.default;
+  let lastError = 'no transcript could be read';
+  for (const l of links) {
+    const key = new Request(`https://transcripts.abs-shim.internal/v1/${e.duration_seconds || 0}/${encodeURIComponent(l.url)}`);
+    const hit = await cache.match(key);
+    if (hit) return await hit.json() as Transcript;
+    try {
+      const res = await fetch(l.url, { headers: { 'User-Agent': FEED_UA }, signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) { lastError = `the publisher answered HTTP ${res.status}`; continue; }
+      const len = Number(res.headers.get('content-length') ?? '');
+      if (Number.isFinite(len) && len > 8_000_000) { lastError = 'the transcript file is too large'; continue; }
+      const body = await res.text();
+      if (body.length > 8_000_000) { lastError = 'the transcript file is too large'; continue; }
+      const t = parseTranscript(l.kind, body, e.duration_seconds);
+      if (!t) { lastError = `the ${l.kind} file had nothing in it to show`; continue; }
+      await cache.put(key, new Response(JSON.stringify(t), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' },
+      }));
+      return t;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  throw new PodcastError(502, `Transcript unavailable: ${lastError}`);
 }
 
 // Look one episode's chapters up and store them. Chapters already in the

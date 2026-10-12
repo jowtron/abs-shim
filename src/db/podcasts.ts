@@ -69,6 +69,7 @@ export type EpisodeRow = {
   removed: number;
   chapters_url: string | null;     // migration 0018: <podcast:chapters url>
   chapters_checked_at: number | null;
+  transcripts: string | null;      // migration 0021: JSON TranscriptLink[] from <podcast:transcript>
   created_at: number;
   updated_at: number;
 };

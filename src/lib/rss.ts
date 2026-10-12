@@ -30,7 +30,12 @@ export type FeedEpisode = {
   chaptersUrl: string | null;
   chaptersType: string | null;
   chapters: Array<{ id: number; title: string; start: number; end: number }>;
+  // <podcast:transcript> links (Podcasting 2.0), as listed; the shim picks
+  // and parses one when a client asks (src/lib/transcript.ts).
+  transcripts: TranscriptLink[];
 };
+
+export type TranscriptLink = { url: string; type: string | null; language: string | null; rel: string | null };
 
 export type FeedMetadata = {
   image: string | null;
@@ -299,6 +304,14 @@ function parseItem(s: string): FeedEpisode | null {
     chaptersType = attr(pc.attrs, 'type') || 'application/json';
   }
 
+  const transcripts: TranscriptLink[] = [];
+  for (const el of allElements(s, 'podcast:transcript')) {
+    const url = attr(el.attrs, 'url')?.trim();
+    if (url && /^https?:\/\//i.test(url)) {
+      transcripts.push({ url, type: attr(el.attrs, 'type'), language: attr(el.attrs, 'language'), rel: attr(el.attrs, 'rel') });
+    }
+  }
+
   let chapters: FeedEpisode['chapters'] = [];
   const psc = element(s, 'psc:chapters');
   if (psc?.inner && durationSeconds) {
@@ -333,6 +346,7 @@ function parseItem(s: string): FeedEpisode | null {
     chaptersUrl,
     chaptersType,
     chapters,
+    transcripts,
   };
 }
 

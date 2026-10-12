@@ -189,6 +189,10 @@ export async function buildEpisode(e: EpisodeRow, item: LibraryItemRow) {
     // client can follow one episode with GET /api/podcasts/:id/episode/:id.
     archiveState: e.archive_state,
     archiveError: e.archive_error,
+    // Not ABS: the feed's <podcast:transcript> links. A client reads the
+    // parsed text from GET /api/podcasts/:id/episode/:id/transcript.
+    transcripts: (JSON.parse(e.transcripts || '[]') as Array<{ url: string; type: string | null; language: string | null }>)
+      .map((t) => ({ url: t.url, type: t.type, language: t.language })),
   };
 }
 
