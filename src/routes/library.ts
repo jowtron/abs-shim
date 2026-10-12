@@ -551,10 +551,11 @@ async function recentEpisodeEntries(env: Env, eps: EpisodeWithShow[], tenantId: 
     const folder = item ? folders.get(item.folder_id) : undefined;
     if (!item || !p || !folder) continue;
     out.push({
-      ...await buildEpisodeExpanded(e, item, folder),
+      // `mediaProgress` on every entry (null when none), as on every list
+      // of episodes, so a client can trust it over /api/me.
+      ...await buildEpisodeExpanded(e, item, folder, { progress: progress ?? new Map() }),
       podcast: await buildPodcastOld(item, p),
       libraryId: item.library_id,
-      ...(progress?.has(e.id) ? { mediaProgress: progress.get(e.id) } : {}),
     });
   }
   return out;
@@ -574,7 +575,9 @@ async function episodeShelfEntities(env: Env, eps: EpisodeWithShow[], tenantId: 
     const show = await buildPodcastItemMinified(item, p, counts.get(item.id));
     out.push({
       ...show,
-      recentEpisode: await buildEpisodeExpanded(e, item, folder),
+      // The episode carries it too, as on every list of episodes: a client
+      // opening the episode from a shelf or a search hit has it there.
+      recentEpisode: await buildEpisodeExpanded(e, item, folder, { progress }),
       ...(progress.has(e.id) ? { mediaProgress: progress.get(e.id) } : {}),
     });
   }

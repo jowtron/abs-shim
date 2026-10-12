@@ -11,7 +11,7 @@ import { probeMp3 } from '../prober/mp3';
 import { resolveItemIdFromUuid } from '../lib/ids';
 import { findCatalogCover } from '../lib/cover-from-catalog';
 import { insertListeningSession } from '../db/sessions';
-import { getProgress, progressToAbs } from '../db/progress';
+import { getProgress, progressForShows, progressToAbs } from '../db/progress';
 import { audioContentType, resolveProbeUrl, resolveStreamUrl, streamAudio, streamRemoteAudio } from '../storage/resolve';
 import { getEpisode, getPodcast, listShowEpisodes } from '../db/podcasts';
 import { ensureEpisodeChapters } from '../lib/podcasts';
@@ -180,7 +180,15 @@ itemRoutes.use('*', requireAuth);
 itemRoutes.get('/:id', async (c) => {
   const userRow = c.get('user');
   const show = await loadPodcastItem(c.env, c.req.param('id'), c.get('tenantId'));
-  if (show) return c.json(await buildPodcastItemExpanded(show.item, show.folder, show.podcast, await listShowEpisodes(c.env, show.item.id, c.get('tenantId'))));
+  if (show) {
+    // Each episode carries the caller's progress (`mediaProgress`) and a
+    // snippet of its notes (podcast-shapes, notesForList).
+    const [episodes, progress] = await Promise.all([
+      listShowEpisodes(c.env, show.item.id, c.get('tenantId')),
+      progressForShows(c.env, userRow.id, [show.item.id]),
+    ]);
+    return c.json(await buildPodcastItemExpanded(show.item, show.folder, show.podcast, episodes, { progress }));
+  }
   const bundle = await buildItemBundle(c.env, c.req.param('id'), c.get('tenantId'));
   if (!bundle) return c.json({ error: 'Item not found' }, 404);
   // Stock ABS gates `userMediaProgress` on ?include=progress, but Plappa and
@@ -514,7 +522,7 @@ itemRoutes.post('/:id/play/:episodeId', async (c) => {
     startedAt: now,
     updatedAt: now,
     audioTracks: [episode.audioTrack],
-    libraryItem: await buildPodcastItemExpanded(show.item, show.folder, show.podcast, [ep]),
+    libraryItem: await buildPodcastItemExpanded(show.item, show.folder, show.podcast, [ep], { fullNotes: true }),
   });
 });
 

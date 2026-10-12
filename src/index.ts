@@ -25,7 +25,7 @@ import { runPodcastTick } from './lib/podcasts';
 import { runCatalogTick } from './lib/abb-catalog';
 import { signupRoutes } from './routes/signup';
 import { renderSignupHtml } from './lib/signup-html';
-import { listProgressByUser, getProgress, upsertProgress, progressToAbs } from './db/progress';
+import { listProgressForMe, getProgress, upsertProgress, progressToAbs, type EpisodeRules } from './db/progress';
 import { episodeFinishRemaining } from './db/podcasts';
 import { listSessionsByUser } from './db/sessions';
 import { userListeningStats, userYearStats } from './db/stats';
@@ -228,7 +228,7 @@ app.post('/login', async (c) => {
   // requests that don't set the Authorization header (e.g. <img>, <audio>).
   c.header('Set-Cookie', sessionCookie(access.token, c.req.url), { append: true });
 
-  const progressRows = await listProgressByUser(c.env, row.id);
+  const progressRows = await listProgressForMe(c.env, row.id);
   const mediaProgress = await Promise.all(progressRows.map((p) => progressToAbs(c.env, p)));
 
   return c.json({
@@ -264,7 +264,7 @@ app.post('/api/authorize', requireAuth, async (c) => {
   const row = c.get('user');
   const access = await issueAccessToken(c.env, { id: row.id, username: row.username });
   c.header('Set-Cookie', sessionCookie(access.token, c.req.url), { append: true });
-  const progressRows = await listProgressByUser(c.env, row.id);
+  const progressRows = await listProgressForMe(c.env, row.id);
   const mediaProgress = await Promise.all(progressRows.map((p) => progressToAbs(c.env, p)));
   return c.json({
     user: {
@@ -282,7 +282,7 @@ app.post('/api/authorize', requireAuth, async (c) => {
 
 app.get('/api/me', requireAuth, async (c) => {
   const row = c.get('user');
-  const progressRows = await listProgressByUser(c.env, row.id);
+  const progressRows = await listProgressForMe(c.env, row.id);
   const mediaProgress = await Promise.all(progressRows.map((p) => progressToAbs(c.env, p)));
   return c.json(toAbsUser(row, mediaProgress));
 });
@@ -301,22 +301,20 @@ const patchProgress = async (c: Context<{ Bindings: Env; Variables: AuthVars }>)
   if (typeof body['hideFromContinueListening'] === 'boolean') patch.hideFromContinueListening = body['hideFromContinueListening'];
   const itemId = c.req.param('itemId')!;
   const episodeId = c.req.param('episodeId') ?? null;
-  await applyEpisodeFinish(c.env, itemId, episodeId, patch);
-  const row = await upsertProgress(c.env, { userId: userRow.id, itemId, episodeId, patch });
+  const row = await upsertProgress(c.env, { userId: userRow.id, itemId, episodeId, patch, ...episodeRules(c.env, itemId, episodeId) });
   return c.json(await progressToAbs(c.env, row));
 };
 app.patch('/api/me/progress/:itemId', requireAuth, patchProgress);
 app.patch('/api/me/progress/:itemId/:episodeId', requireAuth, patchProgress);
 
-// A progress write for an episode that lands within the show's "played"
-// threshold marks it played, whatever the client said, as ABS applies its
-// markAsFinishedTimeRemaining to every update. Pholia's sessionless sync (a
-// downloaded episode) sends isFinished:false every 30 s, which would
-// otherwise undo it. "Mark unplayed" sends currentTime 0, so it still works.
-async function applyEpisodeFinish(env: Env, itemId: string, episodeId: string | null,
-  patch: Parameters<typeof upsertProgress>[1]['patch']): Promise<void> {
-  if (!episodeId || patch.isFinished === true || patch.currentTime == null || !(patch.duration && patch.duration > 0)) return;
-  if (patch.currentTime >= patch.duration - await episodeFinishRemaining(env, itemId)) patch.isFinished = true;
+// An episode's played mark follows the rules in src/db/progress.ts ("Played,
+// and played again"): a position inside the show's "played" window marks it
+// played whatever the client said, as ABS applies its
+// markAsFinishedTimeRemaining to every update, and a replay un-marks it.
+// `playStartedAt` is a session sync's own session start.
+function episodeRules(env: Env, itemId: string, episodeId: string | null, playStartedAt?: number): { episode?: EpisodeRules } {
+  if (!episodeId) return {};
+  return { episode: { finishRemaining: () => episodeFinishRemaining(env, itemId), playStartedAt: playStartedAt ?? null } };
 }
 
 const readProgress = async (c: Context<{ Bindings: Env; Variables: AuthVars }>) => {
@@ -346,8 +344,7 @@ app.patch('/api/me/progress/batch/update', requireAuth, async (c) => {
     if (typeof entry['isFinished'] === 'boolean') patch.isFinished = entry['isFinished'];
     if (typeof entry['hideFromContinueListening'] === 'boolean') patch.hideFromContinueListening = entry['hideFromContinueListening'];
     const episodeId = typeof entry['episodeId'] === 'string' && entry['episodeId'] ? entry['episodeId'] : null;
-    await applyEpisodeFinish(c.env, itemId, episodeId, patch);
-    await upsertProgress(c.env, { userId: userRow.id, itemId, episodeId, patch });
+    await upsertProgress(c.env, { userId: userRow.id, itemId, episodeId, patch, ...episodeRules(c.env, itemId, episodeId) });
   }
   return c.body(null, 200);
 });
@@ -368,7 +365,7 @@ app.post('/api/session/:id/sync', requireAuth, async (c) => {
   const sid = c.req.param('id');
   const session = await c.env.DB.prepare(
     'SELECT * FROM listening_sessions WHERE id = ? AND user_id = ?',
-  ).bind(sid, userRow.id).first<{ library_item_id: string | null; episode_id: string | null; duration_seconds: number }>();
+  ).bind(sid, userRow.id).first<{ library_item_id: string | null; episode_id: string | null; duration_seconds: number; date_started: number }>();
   if (!session) return c.json({ error: 'Session not found' }, 404);
 
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
@@ -383,18 +380,22 @@ app.post('/api/session/:id/sync', requireAuth, async (c) => {
   ).bind(currentTime, timeListened, now, sid).run();
 
   // Mirror into media_progress so the next /login or /api/me reflects position.
-  // An episode whose feed gave no duration has 0 here; the client's own
-  // `duration` (the player knows it) fills in.
-  const duration = session.duration_seconds > 0 ? session.duration_seconds
-    : typeof body['duration'] === 'number' && body['duration'] > 0 ? body['duration'] : 0;
+  // An episode's length is the client's when it sends one, as in ABS
+  // (`syncData.duration || session.duration`): the player knows the file it
+  // is playing, and an ad-inserting host serves every listener a different
+  // length (CLAUDE.md "Dynamic ad insertion"), so the "played" window must
+  // be measured against that file, not the one this Worker probed. A book
+  // keeps the session's (the track sum), as it always has.
+  const clientDuration = typeof body['duration'] === 'number' && body['duration'] > 0 ? body['duration'] : 0;
+  const duration = session.episode_id
+    ? clientDuration || session.duration_seconds
+    : session.duration_seconds > 0 ? session.duration_seconds : clientDuration;
   if (session.library_item_id && duration > 0) {
-    // ABS marks media finished within markAsFinishedTimeRemaining (10 s) of
-    // the end. Done here for episodes only: an episode left "99%" sits in
-    // Continue Listening for good, and books have their own long-settled
-    // behaviour that this isn't the place to change. The threshold is the
-    // show's own, else its library's (migration 0019).
-    const finished = !!session.episode_id
-      && currentTime >= duration - await episodeFinishRemaining(c.env, session.library_item_id);
+    // An episode is marked played inside the show's "played" window and
+    // un-marked by a replay (src/db/progress.ts, "Played, and played
+    // again"); this session's start tells a replay from a listen that was
+    // marked played while it was still going. Books have their own
+    // long-settled behaviour that this isn't the place to change.
     await upsertProgress(c.env, {
       userId: userRow.id,
       itemId: session.library_item_id,
@@ -403,8 +404,8 @@ app.post('/api/session/:id/sync', requireAuth, async (c) => {
         currentTime,
         duration,
         progress: Math.min(currentTime / duration, 1),
-        ...(finished ? { isFinished: true } : {}),
       },
+      ...episodeRules(c.env, session.library_item_id, session.episode_id, session.date_started),
     });
   }
   return c.body(null, 200);

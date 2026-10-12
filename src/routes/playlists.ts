@@ -5,6 +5,7 @@ import { loadItemBundles, type LibraryFolderRow, type LibraryItemRow } from '../
 import { getEpisodeCounts, getEpisodesByIds, getPodcasts, type EpisodeRow } from '../db/podcasts';
 import { resolveLibraryScope } from '../db/library-views';
 import { buildItemDetail } from '../lib/abs-shapes';
+import { progressForShows } from '../db/progress';
 import { buildEpisodeExpanded, buildPodcastItemMinified } from '../lib/podcast-shapes';
 
 // ABS playlists (server/controllers/PlaylistController.js): per user, per
@@ -95,11 +96,14 @@ export async function expandPlaylist(env: Env, pl: PlaylistRow, userId: string) 
     (m) => `SELECT * FROM library_items WHERE id IN (${m}) AND tenant_id = ?`, [tenantId])).map((i) => [i.id, i]));
   const showIds = [...items.values()].filter((i) => i.media_type === 'podcast').map((i) => i.id);
   const bookItems = [...items.values()].filter((i) => i.media_type !== 'podcast');
-  const [pods, counts, episodes, bundles] = await Promise.all([
+  const [pods, counts, episodes, bundles, progress] = await Promise.all([
     getPodcasts(env, showIds, tenantId),
     getEpisodeCounts(env, showIds, tenantId),
     getEpisodesByIds(env, refs.map((r) => r.episode_id).filter((x): x is string => !!x), tenantId),
     loadItemBundles(env, bookItems, tenantId),
+    // The caller's progress on each episode, carried on the episode so a
+    // playlist marks what's played without /api/me.
+    progressForShows(env, userId, showIds),
   ]);
   const epById = new Map(episodes.map((e) => [e.id, e]));
   const bundleById = new Map(bundles.map((b) => [b.item.id, b]));
@@ -118,7 +122,7 @@ export async function expandPlaylist(env: Env, pl: PlaylistRow, userId: string) 
       if (!ep || !pod || !folder) continue;
       out.push({
         episodeId: ep.id,
-        episode: await buildEpisodeExpanded(ep, item, folder),
+        episode: await buildEpisodeExpanded(ep, item, folder, { progress }),
         libraryItemId: item.id,
         libraryItem: await buildPodcastItemMinified(item, pod, counts.get(item.id)),
       });

@@ -3,6 +3,7 @@ import type { Env } from '../types';
 import { requireAuth, requireCanAdd, type AuthVars } from '../auth/middleware';
 import { getFolderById, getItem, type LibraryFolderRow, type LibraryItemRow } from '../db/library';
 import { getEpisode, getPodcast, listShowEpisodes, type EpisodeRow, type PodcastRow } from '../db/podcasts';
+import { progressForShows } from '../db/progress';
 import { buildEpisode, buildEpisodeExpanded, buildPodcastItemExpanded } from '../lib/podcast-shapes';
 import {
   archivePump, canArchive, createPodcast, episodeTranscript, fetchAndParse, PodcastError, refreshPodcast, searchPodcasts, validFeedUrl,
@@ -252,7 +253,9 @@ podcastRoutes.get('/:id/episode/:episodeId', async (c) => {
   if (!show) return c.json({ error: 'Podcast not found' }, 404);
   const e = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), c.get('tenantId'));
   if (!e) return c.json({ error: 'Episode not found' }, 404);
-  return c.json(await buildEpisode(e, show.item));
+  // The whole notes: lists carry a snippet (notesForList), and Pholia's
+  // episode page asks here for the rest.
+  return c.json(await buildEpisode(e, show.item, { fullNotes: true }));
 });
 
 // GET /api/podcasts/:id/episode/:episodeId/transcript — shim-only. The
@@ -348,8 +351,9 @@ podcastRoutes.get('/:id/all-episodes', async (c) => {
       .bind(...binds, limit, offset).all<EpisodeRow>(),
     c.env.DB.prepare(`SELECT COUNT(*) AS n FROM podcast_episodes WHERE ${where}`).bind(...binds).first<{ n: number }>(),
   ]);
+  const progress = await progressForShows(c.env, c.get('userId'), [show.item.id]);
   const episodes = await Promise.all(rows.results.map(async (e) => ({
-    ...await buildEpisodeExpanded(e, show.item, show.folder),
+    ...await buildEpisodeExpanded(e, show.item, show.folder, { progress }),
     inLibrary: e.in_library === 1,
     removed: e.removed === 1,
   })));

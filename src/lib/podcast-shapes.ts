@@ -6,6 +6,7 @@
 import type { LibraryFolderRow, LibraryItemRow } from '../db/library';
 import type { EpisodeCounts, EpisodeRow, PodcastRow } from '../db/podcasts';
 import { derivedId } from './ids';
+import { stripAllTags } from './rss';
 import { storageLabel } from './storage-label';
 
 export function podcastMetadata(p: PodcastRow) {
@@ -158,13 +159,41 @@ function hostOf(url: string): string {
   try { return new URL(url).host; } catch { return ''; }
 }
 
-export async function buildEpisode(e: EpisodeRow, item: LibraryItemRow) {
+// Show notes in a LIST of episodes are a short plain-text snippet. A show's
+// item carried every on-show episode's full notes: 101 episodes of Linux &
+// Open Source News were 1.1 MB, 668 KB of it notes, fetched on every show
+// page and playlist. Notes up to NOTES_WHOLE characters still go out whole,
+// markup and links included; longer ones become a snippet (HTML-escaped,
+// since the bundled web UI renders `description` as HTML) with the shim
+// extra `descriptionTrimmed: true`. The full notes come from GET
+// /api/podcasts/:id/episode/:episodeId, which Pholia's episode page asks
+// for when it opens. The key and its type never change, for strict clients.
+const NOTES_WHOLE = 400;
+const NOTES_SNIPPET = 280;
+
+export function notesForList(html: string): { description: string; trimmed: boolean } {
+  if (html.length <= NOTES_WHOLE) return { description: html, trimmed: false };
+  const chars = [...stripAllTags(html).replace(/\s+/g, ' ').trim()];   // code points: never half an emoji
+  let text = chars.join('');
+  if (chars.length > NOTES_SNIPPET) {
+    text = chars.slice(0, NOTES_SNIPPET).join('');
+    const space = text.lastIndexOf(' ');
+    if (space > NOTES_SNIPPET * 0.6) text = text.slice(0, space);
+    text = text.replace(/[\s,;:.!?-]+$/, '') + '…';
+  }
+  return { description: text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'), trimmed: true };
+}
+
+// `fullNotes`: the episode on its own (GET /api/podcasts/:id/episode/:id, a
+// play session's item), which carries the whole notes.
+export async function buildEpisode(e: EpisodeRow, item: LibraryItemRow, opts: { fullNotes?: boolean } = {}) {
   const podcastId = await derivedId(item.id, 'media');
   const enclosure = {
     url: e.enclosure_url,
     type: e.enclosure_type,
     length: e.enclosure_length != null ? String(e.enclosure_length) : null,
   };
+  const notes = opts.fullNotes ? { description: e.description ?? '', trimmed: false } : notesForList(e.description ?? '');
   return {
     libraryItemId: item.id,
     podcastId,
@@ -176,7 +205,9 @@ export async function buildEpisode(e: EpisodeRow, item: LibraryItemRow) {
     episodeType: e.episode_type ?? '',
     title: e.title ?? '',
     subtitle: e.subtitle ?? '',
-    description: e.description ?? '',
+    description: notes.description,
+    // Not ABS: `description` is a snippet; the episode's own route has it all.
+    descriptionTrimmed: notes.trimmed,
     enclosure,
     guid: e.guid,
     pubDate: e.pub_date ?? '',
@@ -219,11 +250,18 @@ export function hasDynamicAds(url: string | null | undefined): boolean {
   return DYNAMIC_AD_HOSTS.some((h) => u.includes(h));
 }
 
-export async function buildEpisodeExpanded(e: EpisodeRow, item: LibraryItemRow, folder: LibraryFolderRow) {
-  const json = await buildEpisode(e, item);
+// `progress`: the caller's progress by episode id (progressForShows). When
+// given, every episode carries the shim extra `mediaProgress` (its ABS
+// progress object, or null), so a list says what is played without the
+// client fetching /api/me, which no longer carries every row.
+export type EpisodeListOpts = { fullNotes?: boolean; progress?: Map<string, unknown> };
+
+export async function buildEpisodeExpanded(e: EpisodeRow, item: LibraryItemRow, folder: LibraryFolderRow, opts: EpisodeListOpts = {}) {
+  const json = await buildEpisode(e, item, opts.fullNotes ? { fullNotes: true } : {});
   const audioFile = episodeAudioFile(e, folder, item);
   return {
     ...json,
+    ...(opts.progress ? { mediaProgress: opts.progress.get(e.id) ?? null } : {}),
     audioFile,
     // Not ABS: whether this episode can be archived at all (its library is
     // on pCloud) — every list carries the episode, not always the show.
@@ -292,10 +330,14 @@ export async function buildPodcastItemMinified(item: LibraryItemRow, p: PodcastR
 
 export async function buildPodcastItemExpanded(
   item: LibraryItemRow, folder: LibraryFolderRow, p: PodcastRow, episodes: EpisodeRow[],
-  opts?: { userMediaProgress?: unknown | null },
+  opts?: { userMediaProgress?: unknown | null } & EpisodeListOpts,
 ) {
   const size = episodes.reduce((s, e) => s + episodeSize(e), 0);
-  const eps = await Promise.all(episodes.map((e) => buildEpisodeExpanded(e, item, folder)));
+  const listOpts: EpisodeListOpts = {
+    ...(opts?.fullNotes ? { fullNotes: true } : {}),
+    ...(opts?.progress ? { progress: opts.progress } : {}),
+  };
+  const eps = await Promise.all(episodes.map((e) => buildEpisodeExpanded(e, item, folder, listOpts)));
   return {
     ...itemWrapper(item, size, episodes.length),
     lastScan: item.updated_at,

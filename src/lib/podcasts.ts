@@ -369,6 +369,7 @@ function lengthOf(s: string | null): number | null {
 // prefixes and signed URLs, and a stale URL is an episode that won't play).
 // Returns the ids of the rows that are new.
 async function upsertEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], startIdx: number, now: number): Promise<Array<{ id: string; published_at: number | null }>> {
+  await rekeyMovedEpisodes(env, p, eps, now);
   const added: Array<{ id: string; published_at: number | null }> = [];
   // Oldest first, so idx increases with publication.
   const ordered = [...eps].sort((x, y) => (x.publishedAt ?? 0) - (y.publishedAt ?? 0));
@@ -403,6 +404,122 @@ async function upsertEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], start
     for (const r of res) for (const row of r.results ?? []) if (row.created_at === now) added.push(row);
   }
   return added;
+}
+
+// ── Episodes whose guid changed ──────────────────────────────────────────
+//
+// Episodes are keyed by guid (idx_episodes_item_guid), so a feed that
+// changes its guids (a move to another host, a CMS that regenerates them)
+// would add its whole back catalogue a second time, and the listener's
+// progress, archived copies and playlist entries would stay on the old,
+// orphaned rows. Before the upsert, an incoming episode with an unknown guid
+// is matched to a stored one, whose guid is then rewritten in place (id,
+// ino, progress and archive state untouched; the upsert then refreshes the
+// rest of the row):
+//   1. by enclosure URL (enclosureKey: no scheme, query or tracking
+//      prefix), when exactly one stored episode and one incoming one have
+//      it and their dates are within a week (a rerun of an old episode with
+//      the same file is a new episode, months later); else
+//   2. by title (case, spacing and punctuation ignored) and publication
+//      time within 36 hours (a host move can shift the time zone), again
+//      only when that pair is unique on both sides.
+// Only stored episodes whose guid this parse does NOT list are candidates:
+// one the feed still lists is a different episode.
+const REKEY_ENCLOSURE_WINDOW_MS = 7 * 86400_000;
+const REKEY_TITLE_WINDOW_MS = 36 * 3600_000;
+
+// An enclosure URL without what changes when nothing about the audio does:
+// the scheme, the query (signed and tracking parameters) and any tracking
+// prefix, found as the last path segment that looks like a host name
+// ("op3.dev/e,pg=…/podcast.thelinuxexp.com/audio/x.mp3",
+// "dts.podtrac.com/redirect.mp3/traffic.libsyn.com/show/x.mp3").
+export function enclosureKey(url: string): string {
+  const bare = (url.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[?#]/)[0] ?? '').toLowerCase();
+  const parts = bare.split('/');
+  let start = 0;
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}(:\d+)?$/.test(parts[i]!)) start = i;
+  }
+  return parts.slice(start).join('/');
+}
+
+function titleKey(t: string | null | undefined): string {
+  return (t ?? '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+function within(a: number | null | undefined, b: number | null | undefined, ms: number): boolean {
+  return a != null && b != null && Math.abs(a - b) <= ms;
+}
+
+type StoredKey = { id: string; guid: string; title: string | null; published_at: number | null; enclosure_url: string };
+
+async function rekeyMovedEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], now: number): Promise<number> {
+  // The incoming episodes, once per guid (a feed can repeat one).
+  const incoming = new Map<string, FeedEpisode>();
+  for (const e of eps) if (!incoming.has(episodeKey(e))) incoming.set(episodeKey(e), e);
+  if (!incoming.size) return 0;
+
+  // Which incoming guids are stored already: indexed lookups for an
+  // ordinary poll (a handful of items), one scan of the show's guids for a
+  // whole-feed parse.
+  const keys = [...incoming.keys()];
+  const known = new Set<string>();
+  if (keys.length <= 180) {
+    for (let i = 0; i < keys.length; i += 90) {
+      const part = keys.slice(i, i + 90);
+      const r = await env.DB.prepare(
+        `SELECT guid FROM podcast_episodes WHERE library_item_id = ? AND guid IN (${part.map(() => '?').join(',')})`,
+      ).bind(p.library_item_id, ...part).all<{ guid: string }>();
+      for (const row of r.results) known.add(row.guid);
+    }
+  } else {
+    const r = await env.DB.prepare('SELECT guid FROM podcast_episodes WHERE library_item_id = ?')
+      .bind(p.library_item_id).all<{ guid: string }>();
+    for (const row of r.results) if (incoming.has(row.guid)) known.add(row.guid);
+  }
+  const fresh = [...incoming.entries()].filter(([k]) => !known.has(k));
+  if (!fresh.length) return 0;
+
+  const stored = (await env.DB.prepare(
+    'SELECT id, guid, title, published_at, enclosure_url FROM podcast_episodes WHERE library_item_id = ?',
+  ).bind(p.library_item_id).all<StoredKey>()).results.filter((r) => !incoming.has(r.guid));
+  if (!stored.length) return 0;
+
+  const group = <T>(rows: T[], key: (r: T) => string) => {
+    const m = new Map<string, T[]>();
+    for (const r of rows) { const k = key(r); if (k) m.set(k, [...(m.get(k) ?? []), r]); }
+    return m;
+  };
+  const storedByEnc = group(stored, (r) => enclosureKey(r.enclosure_url));
+  const storedByTitle = group(stored, (r) => titleKey(r.title));
+  const incomingByEnc = group([...incoming.values()], (e) => enclosureKey(e.enclosure.url));
+  const freshByTitle = group(fresh.map(([, e]) => e), (e) => titleKey(e.title));
+
+  const used = new Set<string>();
+  const rekeys: Array<{ id: string; guid: string; from: string }> = [];
+  for (const [guid, e] of fresh) {
+    let match: StoredKey | undefined;
+    const ek = enclosureKey(e.enclosure.url);
+    const byEnc = storedByEnc.get(ek);
+    if (byEnc?.length === 1 && incomingByEnc.get(ek)?.length === 1 && !used.has(byEnc[0]!.id)
+      && (byEnc[0]!.published_at == null || e.publishedAt == null || within(byEnc[0]!.published_at, e.publishedAt, REKEY_ENCLOSURE_WINDOW_MS))) {
+      match = byEnc[0];
+    }
+    if (!match) {
+      const tk = titleKey(e.title);
+      const near = (storedByTitle.get(tk) ?? []).filter((r) => !used.has(r.id) && within(r.published_at, e.publishedAt, REKEY_TITLE_WINDOW_MS));
+      const twins = (freshByTitle.get(tk) ?? []).filter((f) => within(f.publishedAt, e.publishedAt, REKEY_TITLE_WINDOW_MS));
+      if (tk && near.length === 1 && twins.length === 1) match = near[0];
+    }
+    if (match) { used.add(match.id); rekeys.push({ id: match.id, guid, from: match.guid }); }
+  }
+  if (!rekeys.length) return 0;
+  const stmts = rekeys.map((r) => env.DB.prepare(
+    'UPDATE podcast_episodes SET guid = ?, updated_at = ? WHERE id = ? AND library_item_id = ?',
+  ).bind(r.guid, now, r.id, p.library_item_id));
+  for (let i = 0; i < stmts.length; i += 100) await env.DB.batch(stmts.slice(i, i + 100));
+  console.log(`podcast ${p.library_item_id}: ${rekeys.length} episode(s) changed guid, kept in place (first: ${rekeys[0]!.from} -> ${rekeys[0]!.guid})`);
+  return rekeys.length;
 }
 
 async function storeEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], opts: { initial: boolean }): Promise<string[]> {
