@@ -230,7 +230,8 @@ adminRoutes.post('/libraries', requireTenantOwner, async (c) => {
 // ─── Podcasts (owner/member overview for /admin) ────────────────────────────
 
 // Every show in a podcast library with what /admin's Podcasts panel shows:
-// episode counts, archive progress, the last check and its error.
+// episode counts, archive progress, the last check and its error, and the
+// episode analysis setting with its counts and latest problem.
 adminRoutes.get('/libraries/:libId/podcasts', async (c) => {
   const tenantId = c.get('tenantId');
   const r = await c.env.DB.prepare(
@@ -240,7 +241,13 @@ adminRoutes.get('/libraries/:libId/podcasts', async (c) => {
             (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id) AS in_feed,
             (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.archive_state = 'done') AS archived,
             (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.archive_state IN ('queued', 'fetching')) AS archiving,
-            (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.archive_state = 'error') AS archive_errors
+            (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.archive_state = 'error') AS archive_errors,
+            p.analyse,
+            (SELECT COUNT(*) FROM episode_analysis a WHERE a.library_item_id = p.library_item_id AND a.state = 'done') AS analysed,
+            (SELECT COUNT(*) FROM episode_analysis a WHERE a.library_item_id = p.library_item_id AND a.state IN ('queued', 'running')) AS analysing,
+            (SELECT COUNT(*) FROM episode_analysis a WHERE a.library_item_id = p.library_item_id AND a.state = 'error') AS analysis_errors,
+            (SELECT a.error FROM episode_analysis a WHERE a.library_item_id = p.library_item_id AND a.error IS NOT NULL
+              ORDER BY a.updated_at DESC LIMIT 1) AS analysis_last_error
        FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
       WHERE li.library_id = ? AND p.tenant_id = ?
       ORDER BY p.title COLLATE NOCASE`,

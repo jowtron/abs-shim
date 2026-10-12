@@ -1705,8 +1705,16 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
       + (p.archive ? ' · archived ' + p.archived + (p.archiving ? ', ' + p.archiving + ' in progress' : '')
         + (p.archive_errors ? ', <span class="warn">' + p.archive_errors + ' failed</span>' : '') : '')
       + ' · checked ' + abbAgo(p.last_episode_check)
-      + (p.last_error ? '<br><span class="warn">' + escapeHtml(p.last_error) + '</span>' : '') + '</span></div>';
+      + (p.last_error ? '<br><span class="warn">' + escapeHtml(p.last_error) + '</span>' : '')
+      + '<br>Analysis ' + (p.analyse === 'on' ? 'on' : p.analyse === 'off' ? 'off' : 'auto')
+      + ': ' + p.analysed + ' done' + (p.analysing ? ', ' + p.analysing + ' waiting or running' : '')
+      + (p.analysis_errors ? ', <span class="warn">' + p.analysis_errors + ' failed</span>' : '')
+      + (p.analysis_last_error ? '<br><span class="warn">' + escapeHtml(p.analysis_last_error) + '</span>' : '') + '</span></div>';
     if (canAdd) {
+      h += '<select data-pod-analyse="' + id + '" title="Transcribe new episodes on the Mac: align chapters and transcripts, find inserted ads">'
+        + [['', 'Analysis: auto'], ['on', 'Analysis: on'], ['off', 'Analysis: off']]
+          .map((o) => '<option value="' + o[0] + '"' + ((p.analyse || '') === o[0] ? ' selected' : '') + '>' + o[1] + '</option>').join('')
+        + '</select>';
       h += '<button class="secondary" data-pod-check="' + id + '">Check now</button>';
       if (hasPcloud) {
         h += '<label class="muted" style="font-size:0.85rem" title="Copy each new episode into pCloud as it comes out"><input type="checkbox" data-pod-arch="' + id + '"' + (p.archive ? ' checked' : '') + '> Archive</label>';
@@ -1728,6 +1736,17 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
     } catch (e) {
       b.disabled = false; b.textContent = 'Check now';
       showError('Check failed: ' + e.message);
+    }
+  }));
+  panel.querySelectorAll('[data-pod-analyse]').forEach((sel) => sel.addEventListener('change', async () => {
+    try {
+      await api('/api/items/' + sel.dataset.podAnalyse + '/media', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ analyse: sel.value || null }),
+      });
+      reload();
+    } catch (e) {
+      showError('Change failed: ' + e.message);
+      reload();
     }
   }));
   panel.querySelectorAll('[data-pod-arch]').forEach((box) => box.addEventListener('change', async () => {

@@ -41,7 +41,12 @@ function titleIgnorePrefix(title: string | null): string | null {
 // A show's intro/outro skipping (migration 0020), applied by the player.
 // Each end is skipped by whole chapters or by seconds, never both; chapters
 // win when both are sent. Anything else is dropped, and nothing left = null.
-export type PodcastSkip = { startChapters?: number; startSeconds?: number; endChapters?: number; endSeconds?: number };
+// `ads` (2026-10-13): which of an episode's analysed ad ranges the player
+// skips by itself — 'inserted' (the default, so never stored: inserted ads
+// found with confidence >= 0.8), 'all', or 'off'. Ads it doesn't skip get a
+// "Skip ad" button while playing.
+export type AdSkip = 'inserted' | 'all' | 'off';
+export type PodcastSkip = { startChapters?: number; startSeconds?: number; endChapters?: number; endSeconds?: number; ads?: AdSkip };
 export function normalizeSkip(v: unknown): PodcastSkip | null {
   if (!v || typeof v !== 'object') return null;
   const o = v as Record<string, unknown>;
@@ -54,6 +59,7 @@ export function normalizeSkip(v: unknown): PodcastSkip | null {
   const ec = int('endChapters', 10), es = int('endSeconds', 1800);
   if (sc) out.startChapters = sc; else if (ss) out.startSeconds = ss;
   if (ec) out.endChapters = ec; else if (es) out.endSeconds = es;
+  if (o['ads'] === 'all' || o['ads'] === 'off') out.ads = o['ads'];
   return Object.keys(out).length ? out : null;
 }
 function parseSkip(json: string | null): PodcastSkip | null {
@@ -71,6 +77,8 @@ function shimFields(p: PodcastRow, folder?: LibraryFolderRow) {
     markAsFinishedTimeRemaining: p.finish_remaining_seconds ?? null,
     // Intro/outro skipping, done by the player (migration 0020).
     skip: parseSkip(p.skip_json),
+    // Episode analysis on wharf (migration 0025): null = auto, 'on', 'off'.
+    analyse: p.analyse ?? null,
     // Whether archiving can work at all: only a pCloud library can take
     // copies (src/lib/podcasts.ts). Known only where the folder is loaded.
     ...(folder ? { canArchive: folder.provider === 'pcloud_oauth' } : {}),
@@ -194,6 +202,8 @@ export async function buildEpisode(e: EpisodeRow, item: LibraryItemRow, opts: { 
     length: e.enclosure_length != null ? String(e.enclosure_length) : null,
   };
   const notes = opts.fullNotes ? { description: e.description ?? '', trimmed: false } : notesForList(e.description ?? '');
+  const analysis = currentAnalysis(e);
+  const served = servedChapters(e, analysis);
   return {
     libraryItemId: item.id,
     podcastId,
@@ -211,7 +221,9 @@ export async function buildEpisode(e: EpisodeRow, item: LibraryItemRow, opts: { 
     enclosure,
     guid: e.guid,
     pubDate: e.pub_date ?? '',
-    chapters: JSON.parse(e.chapters || '[]') as unknown[],
+    // In the served file's time when the episode has been analysed (the
+    // publisher's shifted through its offsets, or generated ones).
+    chapters: served.chapters as unknown[],
     audioFile: null as unknown,
     publishedAt: e.published_at,
     addedAt: e.created_at,
@@ -228,6 +240,10 @@ export async function buildEpisode(e: EpisodeRow, item: LibraryItemRow, opts: { 
     // so the feed's chapter and transcript times (made from the master)
     // run early by the ads played before them, differently per listener.
     dynamicAds: hasDynamicAds(e.enclosure_url),
+    // Not ABS: the analysis of the file served now (size, ad ranges, where
+    // the chapters and transcript come from), or null when there's none
+    // for this size (src/lib/episode-analysis.ts).
+    analysis: analysisField(e, analysis, served.source),
   };
 }
 
@@ -248,6 +264,119 @@ export const EPISODE_AUDIO_UA = 'audiobookshelf (+https://audiobookshelf.org; li
 export function hasDynamicAds(url: string | null | undefined): boolean {
   const u = (url || '').toLowerCase();
   return DYNAMIC_AD_HOSTS.some((h) => u.includes(h));
+}
+
+// ─── Episode analysis (migration 0025, src/lib/episode-analysis.ts) ─────────
+//
+// The node transcribes the file this shim serves and aligns the publisher's
+// transcript (made from the master) against it. Its answer is a piecewise
+// map from master time to served time: `offsets` (each master range has its
+// own shift, served = master + shift) and `cuts` (master audio the served
+// file doesn't have: art19 replaces the master's own sponsor read). Every
+// client gets corrected times from here, so chapter lists, the transcript
+// follow and chapter-based intro skips need nothing new.
+
+export type AnalysisOffset = { from: number; to: number; shift: number };
+export type AnalysisCut = { from: number; to: number };
+export type AnalysisAd = { start: number; end: number; kind: string; confidence: number; source: string; label: string | null };
+// podcast_episodes.analysis: the episode's newest finished analysis.
+export type AnalysisSummary = {
+  size: number;
+  duration: number | null;
+  offsets: AnalysisOffset[];
+  cuts: AnalysisCut[];
+  ads: AnalysisAd[];
+  chapters: Array<{ start: number; title: string }> | null;   // generated (LLM) chapters only
+  transcript: 'publisher' | 'whisper' | null;
+  at: number;
+};
+
+// Ported from align.py's master_to_served: a time inside a cut lands where
+// the cut ends (the served file goes on from there); a time exactly at an
+// insertion point lands AFTER the ad; outside every range, the nearest
+// end's shift applies.
+export function masterToServed(m: number, offsets: AnalysisOffset[], cuts: AnalysisCut[]): number {
+  for (const c of cuts) {
+    if (c.from <= m && m < c.to) { m = c.to; break; }
+  }
+  for (const o of offsets) {
+    if (o.from <= m && m < o.to) return m + o.shift;
+  }
+  if (offsets.length) {
+    const o = m < offsets[0]!.from ? offsets[0]! : offsets[offsets.length - 1]!;
+    return m + o.shift;
+  }
+  return m;
+}
+
+// align.py's shift_cues: a cue said only in the master (wholly inside a cut)
+// is dropped; the rest move by the shift of where they start and end.
+export function cuesToServed<T extends { start: number; end: number }>(cues: T[], offsets: AnalysisOffset[], cuts: AnalysisCut[]): T[] {
+  const out: T[] = [];
+  for (const c of cues) {
+    if (cuts.some((k) => k.from <= c.start && c.end <= k.to)) continue;
+    const s = masterToServed(c.start, offsets, cuts);
+    const e = masterToServed(Math.max(c.start, c.end - 0.001), offsets, cuts);
+    out.push({ ...c, start: Math.round(s * 1000) / 1000, end: Math.round(Math.max(s, e) * 1000) / 1000 });
+  }
+  return out;
+}
+
+// The summary when it describes the file being served now, else null: a
+// restitched file (another size) has other ads in other places, and is
+// served as before the analysis until the pump catches up.
+export function currentAnalysis(e: EpisodeRow): AnalysisSummary | null {
+  if (!e.analysis || !(e.size_bytes > 0)) return null;
+  try {
+    const a = JSON.parse(e.analysis) as AnalysisSummary;
+    return a && a.size === e.size_bytes ? a : null;
+  } catch { return null; }
+}
+
+type StoredChapter = { id?: number; start: number; end: number; title: string };
+
+// Publisher chapters are in master time: shifted through the analysis when
+// there is one. Without publisher chapters, the analysis's generated ones.
+export function servedChapters(e: EpisodeRow, a: AnalysisSummary | null): { chapters: StoredChapter[]; source: 'publisher' | 'generated' | null } {
+  const pub = JSON.parse(e.chapters || '[]') as StoredChapter[];
+  const total = a?.duration || e.duration_seconds || 0;
+  const r3 = (n: number) => Math.round(n * 1000) / 1000;
+  if (pub.length) {
+    if (!a || !a.offsets.length) return { chapters: pub, source: 'publisher' };
+    const starts = pub.map((c) => (c.start <= 0.5 ? 0 : masterToServed(c.start, a.offsets, a.cuts)));
+    return {
+      chapters: pub.map((c, i) => ({
+        id: c.id ?? i,
+        start: r3(starts[i]!),
+        end: r3(i + 1 < starts.length ? Math.max(starts[i]!, starts[i + 1]!) : Math.max(starts[i]!, total)),
+        title: c.title,
+      })),
+      source: 'publisher',
+    };
+  }
+  if (a?.chapters?.length) {
+    const gen = a.chapters;
+    return {
+      chapters: gen.map((c, i) => ({ id: i, start: r3(c.start), end: r3(i + 1 < gen.length ? gen[i + 1]!.start : Math.max(c.start, total)), title: c.title })),
+      source: 'generated',
+    };
+  }
+  return { chapters: pub, source: null };
+}
+
+// The shim extra `analysis` on an episode. `aligned`: every time this
+// episode serves is the file's own — the publisher's were mapped, or there
+// were none to map (generated chapters, a speech-recognition transcript).
+export function analysisField(e: EpisodeRow, a: AnalysisSummary | null, chaptersSource: 'publisher' | 'generated' | null) {
+  if (!a) return null;
+  const mapped = a.offsets.length > 0;
+  return {
+    size: a.size,
+    aligned: mapped || (chaptersSource !== 'publisher' && a.transcript !== 'publisher'),
+    ads: a.ads,
+    chaptersSource,
+    transcriptSource: a.transcript,
+  };
 }
 
 // `progress`: the caller's progress by episode id (progressForShows). When

@@ -28,6 +28,7 @@ export type PodcastRow = {
   parse_version: number;           // migration 0018
   finish_remaining_seconds: number | null; // migration 0019; NULL = the library's setting
   skip_json: string | null;        // migration 0020: intro/outro skipping, see normalizeSkip
+  analyse: string | null;          // migration 0025: episode analysis, NULL = auto, 'on', 'off'
   feed_etag: string | null;
   feed_last_modified: string | null;
   last_episode_check: number | null;
@@ -70,6 +71,8 @@ export type EpisodeRow = {
   chapters_url: string | null;     // migration 0018: <podcast:chapters url>
   chapters_checked_at: number | null;
   transcripts: string | null;      // migration 0021: JSON TranscriptLink[] from <podcast:transcript>
+  analysis: string | null;         // migration 0025: JSON AnalysisSummary of the newest finished analysis
+  duration_measured: number;       // migration 0025: 1 = duration_seconds was measured, the feed's can't replace it
   created_at: number;
   updated_at: number;
 };

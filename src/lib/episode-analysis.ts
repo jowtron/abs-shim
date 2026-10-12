@@ -1,0 +1,596 @@
+// Episode analysis (2026-10-13): a wharf job transcribes an episode exactly
+// as this shim serves it (whisper.cpp on Joseph's Mac), aligns the
+// publisher's transcript and chapters to that file, marks inserted ads, and
+// writes a transcript and chapters for shows that publish none (an LLM pass
+// on the node). Node side: wharf-project/podcast-transcribe/README.md.
+//
+// Why: hosts that stitch ads in per download (art19, Audioboom, …) serve a
+// file whose times differ from the master the feed's chapters and transcript
+// were made from, piecewise and differently per stitch (CLAUDE.md "Dynamic
+// ad insertion"). Results are keyed by (episode, byte size): a size is one
+// stitch.
+//
+// The contract with the node (fixed; the handler is built to it):
+//   submit  project `podcast-transcribe`, handler `analyse_episode`, async,
+//           args {episodeId, libraryItemId, sizeBytes, audioUrl, token,
+//           transcripts, chapters, title, showNotes, wantLlm, resultUrl}.
+//           audioUrl is this shim's own stream route, so the node gets the
+//           stitch listeners get (the Worker's fetch, EPISODE_AUDIO_UA);
+//           token is a 2-hour access token for the tenant owner.
+//   result  POSTed to resultUrl with the same bearer, and printed as the
+//           job result, so the pump can take it from the job when the POST
+//           never came. Stored under the size the node MEASURED.
+//
+// The pump runs on the 2-minute podcast cron with one job in flight at a
+// time (one Mac). The Mac sleeps: a submit answered island_unreachable
+// leaves the row queued with the reason (shown in /admin) and is tried again
+// next tick; a job caught by sleep freezes until wake, so one unfinished
+// after 45 minutes is treated as lost and submitted again (3 tries).
+
+import type { Env } from '../types';
+import type { EpisodeRow } from '../db/podcasts';
+import { issueAccessToken } from '../auth/tokens';
+import { getActiveMembership } from '../db/tenants';
+import { cancelJob, getJob, getJobLog, runAsync, TERMINAL, wharfConfigured, WharfError, type WharfJob } from './wharf';
+import {
+  analysisField, currentAnalysis, hasDynamicAds, servedChapters,
+  type AnalysisAd, type AnalysisCut, type AnalysisOffset, type AnalysisSummary,
+} from './podcast-shapes';
+import { rankTranscripts, whisperTranscript, type Transcript } from './transcript';
+import { stripAllTags, type TranscriptLink } from './rss';
+
+export const ANALYSIS_PROJECT = 'podcast-transcribe';
+export const ANALYSIS_HANDLER = 'analyse_episode';
+
+const RECENT_MS = 14 * 86400_000;          // new episodes analysed ahead of the first listen
+const PLAYING_MS = 2 * 3600_000;           // "being played": progress written this recently
+const LOST_AFTER_MS = 45 * 60_000;         // a job unfinished this long is resubmitted
+const UNSUBMITTED_AFTER_MS = 5 * 60_000;   // a claim whose submit never finished
+const MAX_ATTEMPTS = 3;
+const TOKEN_TTL_SECONDS = 2 * 3600;
+const KEEP_ROWS = 2;
+// "Right box, wrong moment" (and "no box routed yet"): the row stays queued
+// and costs no attempt.
+const QUIET_CODES = new Set(['island_unreachable', 'island_unconfigured', 'node_busy', 'busy', 'project_not_routed', 'capabilities_initialising']);
+
+export class AnalysisInputError extends Error {}
+
+export type AnalysisRow = {
+  episode_id: string;
+  size_bytes: number;
+  tenant_id: string;
+  library_item_id: string;
+  state: 'queued' | 'running' | 'done' | 'error';
+  job_id: string | null;
+  attempts: number;
+  error: string | null;
+  duration: number | null;
+  model: string | null;
+  llm_model: string | null;
+  offsets: string | null;
+  cuts: string | null;
+  ads: string | null;
+  chapters: string | null;
+  transcript_source: string | null;
+  transcript_key: string | null;
+  timings: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export const transcriptKeyFor = (episodeId: string, size: number) => `transcripts/${episodeId}/${size}.json`;
+
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 300);
+
+// The origin the node is given for audioUrl and resultUrl. It must be one the
+// Mac can reach, so a request's own origin only when it is a public https
+// one (not wrangler dev, not a Tailscale name).
+export function analysisOrigin(env: Env, reqUrl?: string): string {
+  if (reqUrl) {
+    try {
+      const u = new URL(reqUrl);
+      if (u.protocol === 'https:' && !/^(localhost|127\.|\[::1\])/.test(u.hostname) && !u.hostname.endsWith('.ts.net')) return u.origin;
+    } catch { /* fall through */ }
+  }
+  return (env.PUBLIC_ORIGIN ?? 'https://abs-shim.jderrick.app').replace(/\/+$/, '');
+}
+
+function publisherChapters(e: EpisodeRow): Array<{ start: number; title: string }> {
+  try { return (JSON.parse(e.chapters || '[]') as Array<{ start: number; title: string }>); } catch { return []; }
+}
+
+function transcriptLinks(e: EpisodeRow) {
+  let links: TranscriptLink[] = [];
+  try { links = JSON.parse(e.transcripts || '[]') as TranscriptLink[]; } catch { /* none */ }
+  return rankTranscripts(links).map((l) => ({ url: l.url, type: l.type, language: l.language }));
+}
+
+// A show's `analyse`: 'off' never, 'on' always, auto (NULL) when there is
+// something to fix or fill: a host that inserts ads, or no chapters, or no
+// transcript.
+export function wantsAnalysis(e: EpisodeRow, analyse: string | null): boolean {
+  if (analyse === 'off') return false;
+  if (analyse === 'on') return true;
+  return hasDynamicAds(e.enclosure_url) || !publisherChapters(e).length || !transcriptLinks(e).length;
+}
+
+// ─── Submitting ──────────────────────────────────────────────────────────────
+
+async function buildArgs(env: Env, e: EpisodeRow, origin: string) {
+  const owner = await env.DB.prepare(
+    'SELECT u.id, u.username FROM tenants t JOIN users u ON u.id = t.owner_user_id WHERE t.id = ?',
+  ).bind(e.tenant_id).first<{ id: string; username: string }>();
+  if (!owner) throw new Error('the library has no owner to act as');
+  // Never logged: it is a full access token for two hours.
+  const { token } = await issueAccessToken(env, owner, TOKEN_TTL_SECONDS);
+  // The token acts in the owner's default tenant; name this one when it isn't.
+  const m = await getActiveMembership(env, owner.id);
+  const q = m?.tenantId === e.tenant_id ? '' : `?tenant=${encodeURIComponent(e.tenant_id)}`;
+  const chapters = publisherChapters(e);
+  const transcripts = transcriptLinks(e);
+  return {
+    episodeId: e.id,
+    libraryItemId: e.library_item_id,
+    sizeBytes: e.size_bytes || 0,
+    audioUrl: `${origin}/api/items/${e.library_item_id}/file/${e.ino}${q}`,
+    token,
+    transcripts,
+    chapters: chapters.length ? chapters.map((c) => ({ start: c.start, title: c.title })) : null,
+    title: e.title ?? '',
+    showNotes: stripAllTags(e.description ?? '').replace(/\s+/g, ' ').trim().slice(0, 20_000),
+    // The LLM labels ads and cuts chapters; without a publisher transcript
+    // it also is the only ad finder (align.py needs one), and without
+    // publisher chapters it writes them.
+    wantLlm: !chapters.length || !transcripts.length,
+    resultUrl: `${origin}/api/podcasts/${e.library_item_id}/episode/${e.id}/analysis${q}`,
+  };
+}
+
+function isQuiet(err: unknown): boolean {
+  if (err instanceof WharfError) return QUIET_CODES.has(err.code);
+  // Not an answer from the router at all (the binding's fetch threw).
+  return true;
+}
+
+// A failed try: queued again while tries are left, else error. Only a row
+// still running: a result POST that landed meanwhile has settled it.
+async function failRow(env: Env, episodeId: string, size: number, msg: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE episode_analysis SET state = CASE WHEN attempts >= ? THEN 'error' ELSE 'queued' END, job_id = NULL, error = ?, updated_at = ?
+      WHERE episode_id = ? AND size_bytes = ? AND state = 'running'`,
+  ).bind(MAX_ATTEMPTS, msg.slice(0, 300), Date.now(), episodeId, size).run();
+}
+
+async function submit(env: Env, e: EpisodeRow, queuedSize: number | null, origin: string): Promise<string> {
+  const now = Date.now();
+  const size = e.size_bytes || 0;
+  // A row queued for a stitch the episode no longer has gives way to one
+  // for the size it has now.
+  if (queuedSize != null && queuedSize !== size) {
+    await env.DB.prepare("DELETE FROM episode_analysis WHERE episode_id = ? AND size_bytes = ? AND state = 'queued'")
+      .bind(e.id, queuedSize).run();
+  }
+  // The claim is one statement, so two pumps (the cron and a route's
+  // waitUntil) can't both start a job: it only inserts while no row is
+  // running.
+  const claim = await env.DB.prepare(
+    `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, attempts, created_at, updated_at)
+     SELECT ?, ?, ?, ?, 'running', 1, ?, ? WHERE NOT EXISTS (SELECT 1 FROM episode_analysis WHERE state = 'running')
+     ON CONFLICT (episode_id, size_bytes) DO UPDATE SET state = 'running', job_id = NULL,
+       attempts = episode_analysis.attempts + 1, updated_at = excluded.updated_at
+     WHERE episode_analysis.state != 'running'`,
+  ).bind(e.id, size, e.tenant_id, e.library_item_id, now, now).run();
+  if (!claim.meta.changes) return `analysis: ${e.id} not started (a job is in flight)`;
+  try {
+    const args = await buildArgs(env, e, origin);
+    const jobId = await runAsync(env, ANALYSIS_PROJECT, ANALYSIS_HANDLER, args);
+    await env.DB.prepare('UPDATE episode_analysis SET job_id = ?, error = NULL, updated_at = ? WHERE episode_id = ? AND size_bytes = ?')
+      .bind(jobId, Date.now(), e.id, size).run();
+    return `analysis: submitted "${e.title ?? e.id}" as ${jobId}`;
+  } catch (err) {
+    const msg = errMsg(err);
+    if (isQuiet(err)) {
+      // The Mac asleep (or not routed yet): no attempt spent, the reason kept
+      // for /admin, tried again next tick.
+      await env.DB.prepare(
+        "UPDATE episode_analysis SET state = 'queued', job_id = NULL, attempts = MAX(attempts - 1, 0), error = ?, updated_at = ? WHERE episode_id = ? AND size_bytes = ? AND state = 'running'",
+      ).bind(msg, Date.now(), e.id, size).run();
+      return `analysis: ${msg} (left queued)`;
+    }
+    await failRow(env, e.id, size, `submit failed: ${msg}`);
+    return `analysis: submit failed: ${msg}`;
+  }
+}
+
+// ─── Following the job in flight ─────────────────────────────────────────────
+
+async function jobFailure(env: Env, job: WharfJob): Promise<string> {
+  let detail = job.error ?? job.state;
+  try {
+    const log = await getJobLog(env, job.id, { tail: 800 });
+    const last = log.content.trim().split('\n').filter((l) => l.startsWith('ERR:') || /error/i.test(l)).pop();
+    if (last) detail = last.replace(/^ERR:\s*/, '');
+  } catch { /* keep job.error */ }
+  return `job ${job.state}: ${detail}`;
+}
+
+// 'busy' while the job is still going, 'freed' once its row is settled.
+async function checkRunning(env: Env, r: AnalysisRow, now: number): Promise<{ busy: boolean; log: string }> {
+  const age = now - r.updated_at;
+  if (!r.job_id) {
+    if (age < UNSUBMITTED_AFTER_MS) return { busy: true, log: '' };
+    await failRow(env, r.episode_id, r.size_bytes, 'the submit never finished');
+    return { busy: false, log: `analysis: ${r.episode_id} claim abandoned` };
+  }
+  let job: WharfJob;
+  try {
+    job = await getJob(env, r.job_id);
+  } catch (err) {
+    // Asleep mid-job: the job freezes with the Mac and /jobs/:id reads only
+    // reach its own island. Wait, then give it up as lost.
+    if (age > LOST_AFTER_MS) {
+      await failRow(env, r.episode_id, r.size_bytes, `no result after 45 min (${errMsg(err)})`);
+      return { busy: false, log: `analysis: ${r.job_id} lost` };
+    }
+    await env.DB.prepare('UPDATE episode_analysis SET error = ? WHERE episode_id = ? AND size_bytes = ? AND state = ?')
+      .bind(errMsg(err), r.episode_id, r.size_bytes, 'running').run();
+    return { busy: true, log: '' };
+  }
+  if (job.state === 'succeeded') {
+    // The result POST normally lands first and settles the row; this is
+    // the fallback for when it never came.
+    const e = await env.DB.prepare('SELECT * FROM podcast_episodes WHERE id = ?').bind(r.episode_id).first<EpisodeRow>();
+    try {
+      if (!e) throw new AnalysisInputError('the episode is gone');
+      await storeResult(env, e, job.result, { jobId: r.job_id });
+      return { busy: false, log: `analysis: ${r.job_id} done (from the job)` };
+    } catch (err) {
+      if (!e) {
+        await env.DB.prepare('DELETE FROM episode_analysis WHERE episode_id = ?').bind(r.episode_id).run();
+      } else {
+        await failRow(env, r.episode_id, r.size_bytes, `the job's result was unusable: ${errMsg(err)}`);
+      }
+      return { busy: false, log: `analysis: ${r.job_id} result unusable` };
+    }
+  }
+  if (TERMINAL.has(job.state)) {
+    await failRow(env, r.episode_id, r.size_bytes, await jobFailure(env, job));
+    return { busy: false, log: `analysis: ${r.job_id} ${job.state}` };
+  }
+  if (age > LOST_AFTER_MS) {
+    await cancelJob(env, r.job_id).catch(() => undefined);
+    await failRow(env, r.episode_id, r.size_bytes, `no result after 45 min (job still ${job.state})`);
+    return { busy: false, log: `analysis: ${r.job_id} given up after 45 min` };
+  }
+  return { busy: true, log: '' };
+}
+
+// ─── Choosing the next episode ───────────────────────────────────────────────
+
+type Candidate = EpisodeRow & { show_analyse: string | null; queued_size?: number };
+
+async function nextCandidate(env: Env, now: number): Promise<Candidate | null> {
+  // 1. Asked for (the "Analyse now" route), or an automatic pick that found
+  //    the Mac asleep: oldest first. A restitched episode waits for the
+  //    chapter pump's re-probe (chapters_checked_at) like any other.
+  const queued = await env.DB.prepare(
+    `SELECT e.*, p.analyse AS show_analyse, a.size_bytes AS queued_size
+       FROM episode_analysis a
+       JOIN podcast_episodes e ON e.id = a.episode_id
+       JOIN podcasts p ON p.library_item_id = e.library_item_id
+      WHERE a.state = 'queued' AND e.chapters_checked_at IS NOT NULL
+      ORDER BY a.updated_at ASC LIMIT 1`,
+  ).first<Candidate>();
+  if (queued) return queued;
+
+  // 2. Being played, with nothing for the stitch being streamed: results
+  //    are a couple of minutes away, so the rest of this listen is right.
+  //    CROSS JOIN pins the loop order (SQLite never reorders one), so
+  //    idx_progress_user (user_id, last_update) is used per user instead of
+  //    a scan of every progress row, every two minutes.
+  const played = await env.DB.prepare(
+    `SELECT e.*, p.analyse AS show_analyse
+       FROM users u
+       CROSS JOIN media_progress mp ON mp.user_id = u.id AND mp.last_update > ?
+       JOIN podcast_episodes e ON e.id = mp.episode_id
+       JOIN podcasts p ON p.library_item_id = e.library_item_id
+      WHERE mp.is_finished = 0 AND e.size_bytes > 0 AND e.chapters_checked_at IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM episode_analysis a WHERE a.episode_id = e.id AND a.size_bytes = e.size_bytes)
+      ORDER BY mp.last_update DESC LIMIT 10`,
+  ).bind(now - PLAYING_MS).all<Candidate>();
+  const p = played.results.find((e) => wantsAnalysis(e, e.show_analyse));
+  if (p) return p;
+
+  // 3. New episodes on a show, newest first, ready before the first listen.
+  //    Shows outer (CROSS JOIN) so idx_episodes_item_published reads only
+  //    each show's recent episodes.
+  const recent = await env.DB.prepare(
+    `SELECT e.*, p.analyse AS show_analyse
+       FROM podcasts p
+       CROSS JOIN podcast_episodes e ON e.library_item_id = p.library_item_id AND e.in_library = 1 AND e.published_at > ?
+      WHERE (p.analyse IS NULL OR p.analyse != 'off') AND e.chapters_checked_at IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM episode_analysis a WHERE a.episode_id = e.id AND a.size_bytes = e.size_bytes)
+      ORDER BY e.published_at DESC LIMIT 25`,
+  ).bind(now - RECENT_MS).all<Candidate>();
+  return recent.results.find((e) => wantsAnalysis(e, e.show_analyse)) ?? null;
+}
+
+// Cron (runPodcastTick) and the routes' waitUntil. Without the router
+// binding there is nothing to do; the run route answers 503 in that case.
+export async function analysisPump(env: Env, opts: { origin?: string } = {}): Promise<string[]> {
+  if (!wharfConfigured(env)) return [];
+  const log: string[] = [];
+  const now = Date.now();
+  const running = await env.DB.prepare("SELECT * FROM episode_analysis WHERE state = 'running' ORDER BY updated_at ASC")
+    .all<AnalysisRow>();
+  let busy = false;
+  for (const r of running.results) {
+    const res = await checkRunning(env, r, now);
+    if (res.log) log.push(res.log);
+    busy ||= res.busy;
+  }
+  if (busy) return log;
+  const next = await nextCandidate(env, now);
+  if (next) log.push(await submit(env, next, next.queued_size ?? null, opts.origin ?? analysisOrigin(env)));
+  return log;
+}
+
+// "Analyse now": the episode's current stitch, queued (again, if it was
+// done or failed). A job in flight for it is left alone.
+export async function queueAnalysis(env: Env, e: EpisodeRow): Promise<void> {
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, attempts, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'queued', 0, ?, ?)
+     ON CONFLICT (episode_id, size_bytes) DO UPDATE SET state = 'queued', attempts = 0, error = NULL, job_id = NULL,
+       updated_at = excluded.updated_at
+     WHERE episode_analysis.state != 'running'`,
+  ).bind(e.id, e.size_bytes || 0, e.tenant_id, e.library_item_id, now, now).run();
+}
+
+// ─── Storing a result ────────────────────────────────────────────────────────
+
+const num = (v: unknown): number | null => {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : null;
+};
+const r3 = (n: number) => Math.round(n * 1000) / 1000;
+const text = (v: unknown, max: number): string | null => {
+  if (typeof v !== 'string') return null;
+  const t = v.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
+  return t || null;
+};
+
+type ParsedResult = {
+  size: number;
+  duration: number | null;
+  offsets: AnalysisOffset[];
+  cuts: AnalysisCut[];
+  ads: AnalysisAd[];
+  generatedChapters: Array<{ start: number; title: string }> | null;
+  transcriptSource: 'publisher' | 'whisper' | null;
+  whisper: Transcript | null;
+  model: string | null;
+  llmModel: string | null;
+  timings: string | null;
+};
+
+// The node's JSON, checked and trimmed: it reaches every client.
+export function parseResult(body: unknown, submittedSize: number): ParsedResult {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new AnalysisInputError('the result must be a JSON object');
+  const o = body as Record<string, unknown>;
+  if (o['ok'] === false) throw new AnalysisInputError(text(o['error'], 300) ?? 'the node reported a failure');
+  const sizeRaw = num(o['sizeBytes']) ?? num(o['size']);
+  const size = sizeRaw && sizeRaw > 0 ? Math.round(sizeRaw) : submittedSize > 0 ? submittedSize : 0;
+  if (!size) throw new AnalysisInputError('sizeBytes (the measured size of the file analysed) is missing');
+  const durRaw = num(o['duration']);
+  const duration = durRaw && durRaw > 0 ? r3(durRaw) : null;
+  const arr = (k: string) => (Array.isArray(o[k]) ? (o[k] as unknown[]) : []);
+
+  const offsets: AnalysisOffset[] = [];
+  for (const x of arr('offsets').slice(0, 500)) {
+    const r = x as Record<string, unknown>;
+    const from = num(r?.['from']), to = num(r?.['to']), shift = num(r?.['shift']);
+    if (from != null && to != null && shift != null && to > from) offsets.push({ from: r3(from), to: r3(to), shift: r3(shift) });
+  }
+  offsets.sort((a, b) => a.from - b.from);
+  const cuts: AnalysisCut[] = [];
+  for (const x of arr('cuts').slice(0, 500)) {
+    const r = x as Record<string, unknown>;
+    const from = num(r?.['from']), to = num(r?.['to']);
+    if (from != null && to != null && to > from) cuts.push({ from: r3(from), to: r3(to) });
+  }
+  const ads: AnalysisAd[] = [];
+  for (const x of arr('ads').slice(0, 200)) {
+    const r = x as Record<string, unknown>;
+    const start = num(r?.['start']), end = num(r?.['end']);
+    if (start == null || end == null || end <= start || start < 0) continue;
+    const kindRaw = typeof r['kind'] === 'string' ? r['kind'].toLowerCase() : '';
+    const kind = ['inserted', 'host-read', 'promo'].includes(kindRaw) ? kindRaw : 'other';
+    const conf = num(r['confidence']);
+    ads.push({
+      start: r3(start), end: r3(duration ? Math.min(end, duration) : end), kind,
+      confidence: conf == null ? 0.5 : Math.min(1, Math.max(0, Math.round(conf * 100) / 100)),
+      source: text(r['source'], 20) ?? 'node',
+      label: text(r['label'], 120) ?? text(r['advertiser'], 120) ?? text(r['where'], 40),
+    });
+  }
+  ads.sort((a, b) => a.start - b.start);
+
+  // Chapters in the result are either the publisher's, shifted (served from
+  // D1 and mapped here instead, so they follow the next analysis), or
+  // generated ones, kept.
+  const chs = arr('chapters').slice(0, 200).map((x) => x as Record<string, unknown>);
+  const generated = chs.length && chs.every((c) => c?.['source'] !== 'publisher')
+    ? chs.map((c) => ({ start: num(c?.['start']), title: text(c?.['title'], 200) }))
+      .filter((c): c is { start: number; title: string } => c.start != null && c.start >= 0 && !!c.title)
+      .map((c) => ({ start: r3(c.start), title: c.title }))
+      .sort((a, b) => a.start - b.start)
+    : [];
+
+  const t = o['transcript'] as Record<string, unknown> | null | undefined;
+  const src = typeof t?.['source'] === 'string' ? t['source'].toLowerCase() : '';
+  let transcriptSource: ParsedResult['transcriptSource'] = null;
+  let whisper: Transcript | null = null;
+  if (src.startsWith('publisher')) transcriptSource = 'publisher';
+  else if (src === 'whisper' && Array.isArray(t?.['cues'])) {
+    whisper = whisperTranscript(t['cues'] as unknown[]);
+    if (whisper) transcriptSource = 'whisper';
+  }
+
+  const llm = o['llm'];
+  const llmModel = text(o['llmModel'], 80) ?? text(o['llm_model'], 80)
+    ?? (llm && typeof llm === 'object' ? text((llm as Record<string, unknown>)['model'], 80) : text(llm, 80));
+  let timings: string | null = null;
+  if (o['timings'] && typeof o['timings'] === 'object') {
+    const j = JSON.stringify(o['timings']);
+    if (j.length <= 4000) timings = j;
+  }
+  return {
+    size, duration, offsets, cuts, ads,
+    generatedChapters: generated.length ? generated : null,
+    transcriptSource, whisper,
+    model: text(o['model'], 80), llmModel, timings,
+  };
+}
+
+export function summaryFromRow(r: AnalysisRow): AnalysisSummary {
+  const j = <T>(s: string | null, d: T): T => { try { return s ? JSON.parse(s) as T : d; } catch { return d; } };
+  return {
+    size: r.size_bytes,
+    duration: r.duration,
+    offsets: j<AnalysisOffset[]>(r.offsets, []),
+    cuts: j<AnalysisCut[]>(r.cuts, []),
+    ads: j<AnalysisAd[]>(r.ads, []),
+    chapters: j<Array<{ start: number; title: string }> | null>(r.chapters, null),
+    transcript: r.transcript_source === 'publisher' || r.transcript_source === 'whisper' ? r.transcript_source : null,
+    at: r.updated_at,
+  };
+}
+
+// Store one result: the row under the measured size, a speech-recognition
+// transcript in R2, and (when it describes the file served now) the
+// episode's summary and length. Idempotent: a late duplicate of a job that
+// was given up on just stores the same thing again.
+export async function storeResult(env: Env, e: EpisodeRow, body: unknown, opts: { jobId?: string | null } = {}): Promise<{ size: number; current: boolean }> {
+  const r = parseResult(body, e.size_bytes);
+  const now = Date.now();
+  let transcriptKey: string | null = null;
+  if (r.whisper) {
+    transcriptKey = transcriptKeyFor(e.id, r.size);
+    await env.COVERS.put(transcriptKey, JSON.stringify(r.whisper), { httpMetadata: { contentType: 'application/json' } });
+  }
+  const json = (v: unknown) => JSON.stringify(v);
+  await env.DB.batch([
+    // The job this answers: its row may be keyed by the size known when it
+    // was submitted (0 for a file never streamed yet).
+    env.DB.prepare("DELETE FROM episode_analysis WHERE episode_id = ? AND size_bytes != ? AND state = 'running'").bind(e.id, r.size),
+    env.DB.prepare(
+      `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, job_id, attempts, error, duration, model, llm_model,
+         offsets, cuts, ads, chapters, transcript_source, transcript_key, timings, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'done', ?, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (episode_id, size_bytes) DO UPDATE SET state = 'done', job_id = COALESCE(excluded.job_id, episode_analysis.job_id),
+         error = NULL, duration = excluded.duration, model = excluded.model, llm_model = excluded.llm_model,
+         offsets = excluded.offsets, cuts = excluded.cuts, ads = excluded.ads, chapters = excluded.chapters,
+         transcript_source = excluded.transcript_source, transcript_key = excluded.transcript_key, timings = excluded.timings,
+         updated_at = excluded.updated_at`,
+    ).bind(
+      e.id, r.size, e.tenant_id, e.library_item_id, opts.jobId ?? null, r.duration, r.model, r.llmModel,
+      json(r.offsets), json(r.cuts), json(r.ads), r.generatedChapters ? json(r.generatedChapters) : null,
+      r.transcriptSource, transcriptKey, r.timings, now, now,
+    ),
+  ]);
+
+  // The episode as it is now (the stream route may have recorded a new
+  // size while the job ran).
+  const cur = await env.DB.prepare('SELECT size_bytes, analysis, duration_seconds FROM podcast_episodes WHERE id = ?')
+    .bind(e.id).first<{ size_bytes: number; analysis: string | null; duration_seconds: number }>();
+  const curSize = cur?.size_bytes || 0;
+  const current = !curSize || curSize === r.size;
+  await pruneRows(env, e.id, curSize || r.size);
+
+  const summary: AnalysisSummary = {
+    size: r.size, duration: r.duration, offsets: r.offsets, cuts: r.cuts, ads: r.ads,
+    chapters: r.generatedChapters, transcript: r.transcriptSource, at: now,
+  };
+  let existing: AnalysisSummary | null = null;
+  try { existing = cur?.analysis ? JSON.parse(cur.analysis) as AnalysisSummary : null; } catch { existing = null; }
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  // The summary column holds the analysis of the file served now when there
+  // is one; a result for another stitch replaces it only when it doesn't.
+  if (current || !existing || existing.size !== curSize) { sets.push('analysis = ?'); binds.push(json(summary)); }
+  // A file never streamed: the node's download went through the stream
+  // route, so this is the size it serves.
+  if (!curSize) { sets.push('size_bytes = ?'); binds.push(r.size); }
+  // The measured length wins over the feed's (and an estimate's).
+  if (current && r.duration) {
+    sets.push('duration_measured = 1');
+    if (Math.abs(r.duration - (cur?.duration_seconds || 0)) > 2) { sets.push('duration_seconds = ?'); binds.push(r.duration); }
+  }
+  if (sets.length) await env.DB.prepare(`UPDATE podcast_episodes SET ${sets.join(', ')} WHERE id = ?`).bind(...binds, e.id).run();
+  return { size: r.size, current };
+}
+
+// The newest two rows per episode, plus the one for the size served now.
+async function pruneRows(env: Env, episodeId: string, keepSize: number): Promise<void> {
+  const rows = (await env.DB.prepare(
+    'SELECT size_bytes, state, transcript_key FROM episode_analysis WHERE episode_id = ? ORDER BY updated_at DESC',
+  ).bind(episodeId).all<{ size_bytes: number; state: string; transcript_key: string | null }>()).results;
+  const drop = rows.slice(KEEP_ROWS).filter((r) => r.size_bytes !== keepSize && r.state !== 'running');
+  if (!drop.length) return;
+  await env.DB.batch(drop.map((r) => env.DB.prepare('DELETE FROM episode_analysis WHERE episode_id = ? AND size_bytes = ?').bind(episodeId, r.size_bytes)));
+  const kept = new Set(rows.filter((r) => !drop.includes(r)).map((r) => r.transcript_key));
+  const keys = drop.map((r) => r.transcript_key).filter((k): k is string => !!k && !kept.has(k));
+  if (keys.length) await env.COVERS.delete(keys).catch(() => undefined);
+}
+
+// The stream route saw the publisher serve another size: if that stitch was
+// analysed before (a listener flipping between two), its analysis becomes
+// the episode's again.
+export async function adoptAnalysisForSize(env: Env, episodeId: string, size: number): Promise<void> {
+  const row = await env.DB.prepare("SELECT * FROM episode_analysis WHERE episode_id = ? AND size_bytes = ? AND state = 'done'")
+    .bind(episodeId, size).first<AnalysisRow>();
+  if (!row) return;
+  const sets = ['analysis = ?'];
+  const binds: unknown[] = [JSON.stringify(summaryFromRow(row))];
+  if (row.duration && row.duration > 0) { sets.push('duration_seconds = ?', 'duration_measured = 1'); binds.push(row.duration); }
+  await env.DB.prepare(`UPDATE podcast_episodes SET ${sets.join(', ')} WHERE id = ? AND size_bytes = ?`).bind(...binds, episodeId, size).run();
+}
+
+// ─── Reading ─────────────────────────────────────────────────────────────────
+
+function rowJson(r: AnalysisRow) {
+  return {
+    size: r.size_bytes, state: r.state, attempts: r.attempts, error: r.error, jobId: r.job_id,
+    duration: r.duration, model: r.model, llmModel: r.llm_model, transcriptSource: r.transcript_source,
+    createdAt: r.created_at, updatedAt: r.updated_at,
+  };
+}
+
+// GET …/analysis: where the episode's analysis stands. `state` is the row
+// for the size served now, else one waiting or running for it.
+export async function analysisStatus(env: Env, e: EpisodeRow) {
+  const rows = (await env.DB.prepare('SELECT * FROM episode_analysis WHERE episode_id = ? ORDER BY updated_at DESC')
+    .bind(e.id).all<AnalysisRow>()).results;
+  const current = rows.find((r) => r.size_bytes === e.size_bytes)
+    ?? rows.find((r) => r.state === 'running' || r.state === 'queued') ?? null;
+  const a = currentAnalysis(e);
+  return {
+    configured: wharfConfigured(env),
+    currentSize: e.size_bytes,
+    state: current?.state ?? null,
+    current: current ? rowJson(current) : null,
+    rows: rows.map(rowJson),
+    analysis: analysisField(e, a, servedChapters(e, a).source),
+  };
+}
+
+// The whisper transcript of the file served now, when its analysis made one.
+export async function whisperTranscriptFor(env: Env, e: EpisodeRow): Promise<Transcript | null> {
+  const a = currentAnalysis(e);
+  if (a?.transcript !== 'whisper') return null;
+  const obj = await env.COVERS.get(transcriptKeyFor(e.id, a.size));
+  if (!obj) return null;
+  try { return await obj.json() as Transcript; } catch { return null; }
+}

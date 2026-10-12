@@ -15,8 +15,9 @@ import type { Env } from '../types';
 import type { LibraryFolderRow } from '../db/library';
 import type { EpisodeRow, PodcastRow } from '../db/podcasts';
 import { decodeFeedBytes, episodeKey, parseFeed, type FeedEpisode, type ParsedFeed, type TranscriptLink } from './rss';
-import { episodeExt, EPISODE_AUDIO_UA } from './podcast-shapes';
-import { parseTranscript, rankTranscripts, type Transcript } from './transcript';
+import { cuesToServed, currentAnalysis, episodeExt, EPISODE_AUDIO_UA } from './podcast-shapes';
+import { parseTranscript, rankTranscripts, type Transcript, type TranscriptCue } from './transcript';
+import { analysisPump, whisperTranscriptFor } from './episode-analysis';
 import {
   pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudStat, type PcloudProfile,
 } from '../storage/pcloud';
@@ -368,6 +369,13 @@ function lengthOf(s: string | null): number | null {
 // enclosure URL or text changed is updated (publishers rotate tracking
 // prefixes and signed URLs, and a stale URL is an episode that won't play).
 // Returns the ids of the rows that are new.
+//
+// The feed's itunes:duration only fills a length nobody has measured
+// (duration_measured, migration 0025). Until 2026-10-13 every poll that
+// listed an episode wrote it back over the probed length: LINUX Unplugged
+// 688 went from a probed 4440.555 s back to the feed's 4833 s on the next
+// poll, and the transcript cache key, "played with N left" and Pholia's
+// time left all followed the wrong number.
 async function upsertEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], startIdx: number, now: number): Promise<Array<{ id: string; published_at: number | null }>> {
   await rekeyMovedEpisodes(env, p, eps, now);
   const added: Array<{ id: string; published_at: number | null }> = [];
@@ -380,7 +388,8 @@ async function upsertEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], start
        enclosure_url = excluded.enclosure_url, enclosure_type = excluded.enclosure_type,
        enclosure_length = excluded.enclosure_length, title = excluded.title, subtitle = excluded.subtitle,
        description = excluded.description,
-       duration_seconds = CASE WHEN excluded.duration_seconds > 0 THEN excluded.duration_seconds ELSE podcast_episodes.duration_seconds END,
+       duration_seconds = CASE WHEN excluded.duration_seconds > 0 AND podcast_episodes.duration_measured = 0
+         THEN excluded.duration_seconds ELSE podcast_episodes.duration_seconds END,
        chapters_url = excluded.chapters_url,
        chapters_checked_at = CASE WHEN podcast_episodes.chapters_url IS NOT excluded.chapters_url THEN NULL ELSE podcast_episodes.chapters_checked_at END,
        transcripts = excluded.transcripts,
@@ -388,7 +397,7 @@ async function upsertEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], start
      WHERE podcast_episodes.enclosure_url IS NOT excluded.enclosure_url
         OR podcast_episodes.title IS NOT excluded.title
         OR podcast_episodes.description IS NOT excluded.description
-        OR (excluded.duration_seconds > 0 AND podcast_episodes.duration_seconds IS NOT excluded.duration_seconds)
+        OR (excluded.duration_seconds > 0 AND podcast_episodes.duration_measured = 0 AND podcast_episodes.duration_seconds IS NOT excluded.duration_seconds)
         OR podcast_episodes.chapters_url IS NOT excluded.chapters_url
         OR podcast_episodes.transcripts IS NOT excluded.transcripts
      RETURNING id, published_at, created_at`,
@@ -656,6 +665,13 @@ export async function runPodcastTick(env: Env): Promise<string[]> {
   }
   log.push(...await archivePump(env));
   log.push(...await chapterPump(env));
+  // After the chapter pump: an episode is analysed only once its chapters
+  // have been looked up (the analysis needs to know whether there are any).
+  try {
+    log.push(...await analysisPump(env));
+  } catch (e) {
+    log.push(`analysis pump: ${(e as Error).message}`);
+  }
   return log;
 }
 
@@ -721,13 +737,26 @@ async function chaptersFromAudio(e: EpisodeRow): Promise<{ chapters: Chapter[]; 
 // week under the publisher's URL: a transcript doesn't change once out, and
 // the next client to open it shouldn't wait on the publisher again. The
 // episode's length goes into the key because the hour-offset fix uses it.
-export async function episodeTranscript(e: EpisodeRow): Promise<Transcript> {
+//
+// With an analysis of the file served now (src/lib/episode-analysis.ts):
+// the publisher's cues are shifted onto that file (and the key names the
+// analysis, whose offsets they followed), or, for a show that publishes no
+// transcript, the speech-recognition one the analysis made comes from R2.
+export async function episodeTranscript(env: Env, e: EpisodeRow): Promise<Transcript> {
+  const analysis = currentAnalysis(e);
+  if (analysis?.transcript === 'whisper') {
+    const t = await whisperTranscriptFor(env, e);
+    if (t) return t;
+  }
   const links = rankTranscripts(JSON.parse(e.transcripts || '[]') as TranscriptLink[]);
   if (!links.length) throw new PodcastError(404, 'This episode has no transcript');
+  const mapped = analysis && analysis.offsets.length ? analysis : null;
+  const toServed = mapped ? (cues: TranscriptCue[]) => cuesToServed(cues, mapped.offsets, mapped.cuts) : undefined;
+  const mapKey = mapped ? `a${mapped.size}-${shortHash(JSON.stringify([mapped.offsets, mapped.cuts]))}/` : '';
   const cache = caches.default;
   let lastError = 'no transcript could be read';
   for (const l of links) {
-    const key = new Request(`https://transcripts.abs-shim.internal/v1/${e.duration_seconds || 0}/${encodeURIComponent(l.url)}`);
+    const key = new Request(`https://transcripts.abs-shim.internal/v1/${e.duration_seconds || 0}/${mapKey}${encodeURIComponent(l.url)}`);
     const hit = await cache.match(key);
     if (hit) return await hit.json() as Transcript;
     try {
@@ -737,7 +766,7 @@ export async function episodeTranscript(e: EpisodeRow): Promise<Transcript> {
       if (Number.isFinite(len) && len > 8_000_000) { lastError = 'the transcript file is too large'; continue; }
       const body = await res.text();
       if (body.length > 8_000_000) { lastError = 'the transcript file is too large'; continue; }
-      const t = parseTranscript(l.kind, body, e.duration_seconds);
+      const t = parseTranscript(l.kind, body, e.duration_seconds, toServed);
       if (!t) { lastError = `the ${l.kind} file had nothing in it to show`; continue; }
       await cache.put(key, new Response(JSON.stringify(t), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=604800' },
@@ -748,6 +777,13 @@ export async function episodeTranscript(e: EpisodeRow): Promise<Transcript> {
     }
   }
   throw new PodcastError(502, `Transcript unavailable: ${lastError}`);
+}
+
+// FNV-1a, for cache keys.
+function shortHash(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(36);
 }
 
 // Look one episode's chapters up and store them. Chapters already in the
@@ -776,12 +812,16 @@ export async function ensureEpisodeChapters(env: Env, e: EpisodeRow): Promise<Ch
     const fromAudio = await chaptersFromAudio(e).catch(() => ({ chapters: [] as Chapter[], duration: null }));
     if (!chapters.length) chapters = fromAudio.chapters;
     const probed = fromAudio.duration;
+    let measured = false;
     if (probed && probed > 0) {
       const feed = e.duration_seconds || 0;
-      if (!feed || (Math.abs(probed - feed) > 2 && Math.abs(probed - feed) < feed / 4)) duration = probed;
+      measured = !feed || Math.abs(probed - feed) < feed / 4;
+      if (measured && (!feed || Math.abs(probed - feed) > 2)) duration = probed;
     }
+    // A believed probe marks the length measured, so the next poll's feed
+    // duration can't put the feed's number back (see upsertEpisodes).
     await env.DB.prepare(
-      `UPDATE podcast_episodes SET chapters = ?, chapters_checked_at = ?${duration ? ', duration_seconds = ?' : ''} WHERE id = ?`,
+      `UPDATE podcast_episodes SET chapters = ?, chapters_checked_at = ?${duration ? ', duration_seconds = ?' : ''}${measured ? ', duration_measured = 1' : ''} WHERE id = ?`,
     ).bind(JSON.stringify(chapters), now, ...(duration ? [Math.round(duration * 1000) / 1000] : []), e.id).run();
     return chapters;
   } catch (err) {

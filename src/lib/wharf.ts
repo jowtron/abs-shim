@@ -37,13 +37,22 @@ async function call(env: Env, path: string, init: RequestInit = {}): Promise<Res
   });
 }
 
+// A failed router/wharf call. `code` is the envelope's error code (the
+// router puts it in `error` and `error_code`, wharf in `error_code`), so a
+// caller can tell "the island is asleep" (island_unreachable) from a real
+// failure without parsing the message.
+export class WharfError extends Error {
+  constructor(message: string, public status: number, public code: string) { super(message); }
+}
+
 async function json<T>(res: Response): Promise<T> {
   const text = await res.text();
   let body: unknown = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = null; }
   if (!res.ok) {
-    const b = body as { message?: string; error?: string } | null;
-    throw new Error(`wharf ${res.status}: ${b?.message ?? b?.error ?? text.slice(0, 200)}`);
+    const b = body as { message?: string; error?: string; error_code?: string } | null;
+    const msg = b?.message ?? b?.error ?? text.slice(0, 200);
+    throw new WharfError(`wharf ${res.status}: ${msg}`, res.status, String(b?.error_code ?? (b?.message ? b?.error : '') ?? ''));
   }
   return body as T;
 }

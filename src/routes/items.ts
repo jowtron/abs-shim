@@ -16,6 +16,7 @@ import { audioContentType, resolveProbeUrl, resolveStreamUrl, streamAudio, strea
 import { getEpisode, getPodcast, listShowEpisodes } from '../db/podcasts';
 import { ensureEpisodeChapters } from '../lib/podcasts';
 import { buildEpisodeExpanded, buildPodcastItemExpanded, normalizeSkip, podcastMetadata } from '../lib/podcast-shapes';
+import { adoptAnalysisForSize } from '../lib/episode-analysis';
 import { getBookMetadata, getFolderById, getItem, getStreamingTarget, type AudioFileRow } from '../db/library';
 import { tryServeMoovRange, warmMoovCache } from '../storage/moov-cache';
 import { tryServeByteRange, warmByteChunk, estimateByteOffsetForTime, CHUNK_SIZE } from '../storage/byte-cache';
@@ -247,11 +248,15 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
       return finish(await streamRemoteAudio(target.audio, c.req.raw, (size) => {
         // A size that CHANGES means the publisher now serves a different
         // file (ad-inserting hosts restitch it as campaigns change), so
-        // its length and embedded chapters are looked up again.
+        // its length and embedded chapters are looked up again, and an
+        // analysis of that stitch, if one was made before, applies again
+        // (none: it's served unanalysed until the pump re-runs it).
         c.executionCtx.waitUntil(c.env.DB.prepare(
           `UPDATE podcast_episodes SET chapters_checked_at = CASE WHEN size_bytes > 0 THEN NULL ELSE chapters_checked_at END,
              size_bytes = ? WHERE id = ?`,
-        ).bind(size, episodeId).run().then(() => undefined, () => undefined));
+        ).bind(size, episodeId).run()
+          .then(() => adoptAnalysisForSize(c.env, episodeId, size))
+          .then(() => undefined, () => undefined));
       }));
     }
     return finish(await streamAudio(c.env, target.folder, target.audio, c.req.raw));
@@ -530,8 +535,9 @@ itemRoutes.post('/:id/play/:episodeId', async (c) => {
 // (autoDownloadEpisodes, maxEpisodesToKeep, maxNewEpisodesToDownload,
 // autoDownloadSchedule, tags). Shim extras: `archive`,
 // `markAsFinishedTimeRemaining` (seconds left at which an episode counts as
-// played; null goes back to the library's setting), and `skip` (intro/outro
-// skipping for the player, normalizeSkip; null turns it off). Books aren't editable
+// played; null goes back to the library's setting), `skip` (intro/outro and
+// ad skipping for the player, normalizeSkip; null turns it off) and
+// `analyse` (episode analysis: null = auto, 'on', 'off'). Books aren't editable
 // here (their metadata comes from the files); that answers 400.
 itemRoutes.patch('/:id/media', requireCanAdd, async (c) => {
   const tenantId = c.get('tenantId');
@@ -557,6 +563,11 @@ itemRoutes.patch('/:id/media', requireCanAdd, async (c) => {
     const skip = normalizeSkip(body['skip']);
     sets.push('skip_json = ?'); binds.push(skip ? JSON.stringify(skip) : null);
   }
+  // Episode analysis (src/lib/episode-analysis.ts): null = auto, 'on', 'off'.
+  const analyse = body['analyse'];
+  if (analyse === null || analyse === 'on' || analyse === 'off' || analyse === 'auto') {
+    sets.push('analyse = ?'); binds.push(analyse === 'auto' ? null : analyse);
+  }
   if (typeof body['autoDownloadSchedule'] === 'string') { sets.push('auto_download_schedule = ?'); binds.push(body['autoDownloadSchedule']); }
   if (Array.isArray(body['tags'])) { sets.push('tags = ?'); binds.push(JSON.stringify((body['tags'] as unknown[]).filter((t) => typeof t === 'string'))); }
   const md = body['metadata'] as Record<string, unknown> | undefined;
@@ -573,6 +584,10 @@ itemRoutes.patch('/:id/media', requireCanAdd, async (c) => {
   if (sets.length) {
     await c.env.DB.prepare(`UPDATE podcasts SET ${sets.join(', ')}, updated_at = ? WHERE library_item_id = ?`)
       .bind(...binds, Date.now(), show.item.id).run();
+  }
+  // Off means off: what was waiting for the Mac is dropped too.
+  if (analyse === 'off') {
+    await c.env.DB.prepare("DELETE FROM episode_analysis WHERE library_item_id = ? AND state = 'queued'").bind(show.item.id).run();
   }
   const fresh = (await loadPodcastItem(c.env, show.item.id, tenantId))!;
   const libraryItem = await buildPodcastItemExpanded(fresh.item, fresh.folder, fresh.podcast, await listShowEpisodes(c.env, show.item.id, tenantId));

@@ -45,16 +45,20 @@ export function rankTranscripts(links: TranscriptLink[]): Array<TranscriptLink &
     .sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind));
 }
 
-export function parseTranscript(kind: Kind, body: string, duration: number): Transcript | null {
+// `toServed`: the episode's analysis maps the publisher's times (made from
+// the master) onto the file being served (cuesToServed in podcast-shapes);
+// applied to the raw cues, before they're joined into paragraphs.
+export function parseTranscript(kind: Kind, body: string, duration: number, toServed?: (cues: TranscriptCue[]) => TranscriptCue[]): Transcript | null {
   const source = kind;
+  const map = toServed ?? ((c: TranscriptCue[]) => c);
   if (kind === 'vtt' || kind === 'srt') {
-    const cues = joinCues(fixOffset(parseCaptions(body), duration));
+    const cues = joinCues(map(fixOffset(parseCaptions(body), duration)));
     return cues.length ? { format: 'cues', source, cues } : null;
   }
   if (kind === 'json') {
     let raw: unknown;
     try { raw = JSON.parse(body); } catch { return null; }
-    const cues = joinCues(fixOffset(parseJsonSegments(raw), duration));
+    const cues = joinCues(map(fixOffset(parseJsonSegments(raw), duration)));
     return cues.length ? { format: 'cues', source, cues } : null;
   }
   const paragraphs = kind === 'html' ? htmlParagraphs(body) : textParagraphs(body);
@@ -131,6 +135,24 @@ const SENTENCE_END = /[.?!…]["'”’)\]]?$/;
 // A paragraph ends at the first sentence end after this many characters.
 const PARA_MIN = 200;
 const SENTENCE_INSIDE = /[.?!…]["'”’)\]]?\s+(?=\S)/;
+
+// A speech-recognition transcript from an episode analysis (whisper's
+// segments, ~5-10 s each, no speakers), joined into reading paragraphs the
+// same way as a publisher's captions.
+export function whisperTranscript(raw: unknown[]): Transcript | null {
+  const cues: TranscriptCue[] = [];
+  for (const r of raw.slice(0, 50_000)) {
+    const c = r as Record<string, unknown> | null;
+    const start = Number(c?.['start']), end = Number(c?.['end']);
+    const text = typeof c?.['text'] === 'string' ? cleanText(c['text']) : '';
+    if (!Number.isFinite(start) || start < 0 || !text) continue;
+    const speaker = typeof c?.['speaker'] === 'string' && c['speaker'].trim() ? cleanText(c['speaker']).slice(0, 80) : null;
+    cues.push({ start, end: Number.isFinite(end) ? Math.max(end, start) : start, speaker, text: text.slice(0, 4000) });
+  }
+  cues.sort((x, y) => x.start - y.start);
+  const joined = joinCues(cues);
+  return joined.length ? { format: 'cues', source: 'whisper', cues: joined } : null;
+}
 
 function joinCues(cues: TranscriptCue[]): TranscriptCue[] {
   const out: TranscriptCue[] = [];

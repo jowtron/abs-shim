@@ -6,8 +6,10 @@ import { getEpisode, getPodcast, listShowEpisodes, type EpisodeRow, type Podcast
 import { progressForShows } from '../db/progress';
 import { buildEpisode, buildEpisodeExpanded, buildPodcastItemExpanded } from '../lib/podcast-shapes';
 import {
-  archivePump, canArchive, createPodcast, episodeTranscript, fetchAndParse, PodcastError, refreshPodcast, searchPodcasts, validFeedUrl,
+  archivePump, canArchive, createPodcast, ensureEpisodeChapters, episodeTranscript, fetchAndParse, PodcastError, refreshPodcast, searchPodcasts, validFeedUrl,
 } from '../lib/podcasts';
+import { AnalysisInputError, analysisOrigin, analysisPump, analysisStatus, queueAnalysis, storeResult } from '../lib/episode-analysis';
+import { wharfConfigured } from '../lib/wharf';
 import { parseOpml, sanitizeHtml, type TranscriptLink } from '../lib/rss';
 
 // ABS's podcast routes (server/routers/ApiRouter.js "Podcast Routes"), plus a
@@ -269,8 +271,62 @@ podcastRoutes.get('/:id/episode/:episodeId/transcript', async (c) => {
   const e = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), c.get('tenantId'));
   if (!e) return c.json({ error: 'Episode not found' }, 404);
   try {
-    return c.json(await episodeTranscript(e), 200, { 'Cache-Control': 'private, max-age=3600' });
+    return c.json(await episodeTranscript(c.env, e), 200, { 'Cache-Control': 'private, max-age=3600' });
   } catch (err) { return fail(c, err); }
+});
+
+// ─── Episode analysis (src/lib/episode-analysis.ts) ──────────────────────────
+
+// GET …/analysis — shim-only. Where the episode's analysis stands: `state`
+// (queued | running | done | error, or null) for the file served now, the
+// rows kept (newest two stitches), and the `analysis` field episodes carry.
+podcastRoutes.get('/:id/episode/:episodeId/analysis', async (c) => {
+  const show = await loadShow(c);
+  if (!show) return c.json({ error: 'Podcast not found' }, 404);
+  const e = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), c.get('tenantId'));
+  if (!e) return c.json({ error: 'Episode not found' }, 404);
+  return c.json(await analysisStatus(c.env, e));
+});
+
+// POST …/analysis — the node's result (the job's own output, pushed with the
+// 2-hour owner token the job was given). Stored under the size the node
+// measured. canAdd, not merely a member: it decides what every listener
+// skips.
+podcastRoutes.post('/:id/episode/:episodeId/analysis', requireCanAdd, async (c) => {
+  const show = await loadShow(c);
+  if (!show) return c.json({ error: 'Podcast not found' }, 404);
+  const e = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), c.get('tenantId'));
+  if (!e) return c.json({ error: 'Episode not found' }, 404);
+  const body = await c.req.json().catch(() => null);
+  try {
+    const r = await storeResult(c.env, e, body);
+    // The Mac is free: start the next one now rather than at the next tick.
+    c.executionCtx.waitUntil(analysisPump(c.env, { origin: analysisOrigin(c.env, c.req.url) }).then(() => undefined, () => undefined));
+    return c.json({ ok: true, size: r.size, current: r.current, state: 'done' });
+  } catch (err) {
+    if (err instanceof AnalysisInputError) return c.json({ error: err.message }, 400);
+    throw err;
+  }
+});
+
+// POST …/analysis/run — shim-only "Analyse now": queue the stitch served now
+// (again, if done or failed) and start it at once if the Mac is free.
+podcastRoutes.post('/:id/episode/:episodeId/analysis/run', requireCanAdd, async (c) => {
+  if (!wharfConfigured(c.env)) return c.json({ error: 'Episode analysis is not configured on this shim (needs the wharf-router binding and ROUTER_TOKEN)' }, 503);
+  const show = await loadShow(c);
+  if (!show) return c.json({ error: 'Podcast not found' }, 404);
+  const tenantId = c.get('tenantId');
+  let e = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), tenantId);
+  if (!e) return c.json({ error: 'Episode not found' }, 404);
+  // The job is told whether the publisher has chapters; look them up first
+  // if the chapter pump hasn't yet.
+  if (e.chapters_checked_at == null) {
+    await ensureEpisodeChapters(c.env, e);
+    e = (await getEpisode(c.env, show.item.id, e.id, tenantId)) ?? e;
+  }
+  await queueAnalysis(c.env, e);
+  c.executionCtx.waitUntil(analysisPump(c.env, { origin: analysisOrigin(c.env, c.req.url) }).then(() => undefined, () => undefined));
+  return c.json(await analysisStatus(c.env, e));
 });
 
 podcastRoutes.patch('/:id/episode/:episodeId', requireCanAdd, async (c) => {

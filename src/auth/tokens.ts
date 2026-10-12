@@ -27,12 +27,15 @@ function jwtSecret(env: Env): string {
   throw new Error('JWT_SECRET is not configured (wrangler secret put JWT_SECRET, or .dev.vars for local dev)');
 }
 
+// `ttlSeconds`: a shorter life for a token handed to a machine (the episode
+// analysis job gets two hours, src/lib/episode-analysis.ts).
 export async function issueAccessToken(
   env: Env,
   user: { id: string; username: string },
+  ttlSeconds: number = ACCESS_TTL_SECONDS,
 ): Promise<{ token: string; expiresAt: number }> {
   const now = Math.floor(Date.now() / 1000);
-  const exp = now + ACCESS_TTL_SECONDS;
+  const exp = now + ttlSeconds;
   const claims: AccessClaims = {
     userId: user.id,
     username: user.username,
