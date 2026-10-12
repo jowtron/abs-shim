@@ -154,10 +154,12 @@ export async function getEpisode(env: Env, itemId: string, episodeId: string, te
 
 // The streaming route's lookup: ABS clients address an episode's audio by
 // its ino (`/api/items/:id/file/:ino`). Accept the episode id as well.
+// Two lookups, not `(ino = ? OR id = ?)`: the OR made SQLite walk every
+// stored episode of the show (3,000 for The Daily) on EVERY Range request.
 export async function getEpisodeForFile(env: Env, itemId: string, fileId: string, tenantId: string): Promise<EpisodeRow | null> {
-  return env.DB.prepare(
-    `SELECT * FROM podcast_episodes WHERE library_item_id = ? AND tenant_id = ? AND (ino = ? OR id = ?) LIMIT 1`,
-  ).bind(itemId, tenantId, fileId, fileId).first<EpisodeRow>();
+  const byIno = await env.DB.prepare('SELECT * FROM podcast_episodes WHERE library_item_id = ? AND ino = ? AND tenant_id = ? LIMIT 1')
+    .bind(itemId, fileId, tenantId).first<EpisodeRow>();
+  return byIno ?? getEpisode(env, itemId, fileId, tenantId);
 }
 
 export async function getEpisodesByIds(env: Env, ids: string[], tenantId: string): Promise<EpisodeRow[]> {

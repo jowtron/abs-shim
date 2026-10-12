@@ -28,7 +28,8 @@ export class PodcastError extends Error {
 // ABS's user agent: some hosts (CBC among them) refuse unknown ones, and
 // publishers already allow it because ABS polls them.
 const FEED_UA = 'audiobookshelf (+https://audiobookshelf.org; like iTMS)';
-const FEED_MAX_BYTES = 60 * 1024 * 1024;
+// Decoded to a string (twice the bytes) inside a 128 MB isolate.
+const FEED_MAX_BYTES = 32 * 1024 * 1024;
 const POLL_EVERY_MS = 60 * 60 * 1000;
 const MAX_BACKOFF_MS = 24 * 60 * 60 * 1000;
 // What lands on a new show: an episodic feed's newest 100, a serial feed's
@@ -84,7 +85,7 @@ export async function fetchFeed(url: string, cond?: { etag?: string | null; last
     await res.body?.cancel().catch(() => undefined);
     throw new PodcastError(502, `The feed is ${Math.round(len / 1e6)} MB, over the ${FEED_MAX_BYTES / 1e6} MB limit`);
   }
-  const bytes = await res.arrayBuffer();
+  const bytes = await readCapped(res, FEED_MAX_BYTES);
   return {
     notModified: false,
     xml: decodeFeedBytes(bytes, res.headers.get('content-type')),
@@ -338,7 +339,7 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<string> {
       feed?.metadata.language || str('language'),
       feed?.metadata.type || str('type'),
       a.autoDownload === false ? 0 : 1,
-      3,
+      0,   // max_new_episodes_to_download: 0 = every new episode lands on the show (migration 0023)
       a.archive ? 1 : 0,
       a.deferFetch ? now : now + POLL_EVERY_MS,
       now, now,
@@ -485,13 +486,12 @@ export async function refreshPodcast(env: Env, p: PodcastRow, opts: { force?: bo
          image_url = COALESCE(?, image_url), cover_url = CASE WHEN cover_url IS NULL OR cover_url = image_url THEN COALESCE(?, cover_url) ELSE cover_url END,
          language = COALESCE(?, language), podcast_type = COALESCE(?, podcast_type),
          genres = CASE WHEN ? = '[]' THEN genres ELSE ? END, feed_url = COALESCE(?, feed_url),
-         feed_etag = ?, feed_last_modified = ?, last_episode_check = ?, next_check_at = ?,
-         check_failures = 0, last_error = NULL, parse_version = ?, updated_at = ?
+         last_episode_check = ?, next_check_at = ?, check_failures = 0, last_error = NULL, updated_at = ?
        WHERE library_item_id = ?`,
     ).bind(
       md.title, md.author, md.description, md.image, md.image, md.language, md.type,
       JSON.stringify(md.categories), JSON.stringify(md.categories), moved,
-      got.etag, got.lastModified, now, now + POLL_EVERY_MS, PARSE_VERSION, now, p.library_item_id,
+      now, now + POLL_EVERY_MS, now, p.library_item_id,
     ).run();
     // OPML imports skip the iTunes match at creation; do it on the first fill.
     if (firstFill && !p.itunes_id && md.title) {
@@ -506,6 +506,11 @@ export async function refreshPodcast(env: Env, p: PodcastRow, opts: { force?: bo
     }
     const fresh = await env.DB.prepare('SELECT * FROM podcasts WHERE library_item_id = ?').bind(p.library_item_id).first<PodcastRow>();
     const added = await storeEpisodes(env, fresh ?? p, feed.episodes, { initial: firstFill });
+    // Only now is this feed version "seen": written earlier, a failure in
+    // storeEpisodes would leave the next poll getting 304 for episodes
+    // that were never stored (and a reparse marked done that wasn't).
+    await env.DB.prepare('UPDATE podcasts SET feed_etag = ?, feed_last_modified = ?, parse_version = ? WHERE library_item_id = ?')
+      .bind(got.etag, got.lastModified, PARSE_VERSION, p.library_item_id).run();
     if (added.length) {
       await env.DB.prepare('UPDATE library_items SET updated_at = ? WHERE id = ?').bind(now, p.library_item_id).run();
     }
@@ -734,6 +739,29 @@ async function probeEnclosure(url: string): Promise<{ url: string; size: number 
   }
 }
 
+// A chunked response has no Content-Length to check against the cap, so
+// the body is counted as it arrives.
+async function readCapped(res: Response, cap: number): Promise<ArrayBuffer> {
+  const reader = res.body?.getReader();
+  if (!reader) return new ArrayBuffer(0);
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > cap) {
+      await reader.cancel().catch(() => undefined);
+      throw new PodcastError(502, `The feed is over the ${cap / 1e6} MB limit`);
+    }
+    parts.push(value);
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const part of parts) { out.set(part, off); off += part.byteLength; }
+  return out.buffer as ArrayBuffer;
+}
+
 type ArchiveRow = EpisodeRow & { folder_id: string; show_path: string };
 
 export async function archivePump(env: Env): Promise<string[]> {
@@ -755,6 +783,12 @@ export async function archivePump(env: Env): Promise<string[]> {
       WHERE e.archive_state = 'queued' ORDER BY e.updated_at ASC LIMIT ?`,
   ).bind(ARCHIVE_STARTS_PER_TICK).all<ArchiveRow>();
   for (const e of queued.results) {
+    // Two pumps can run at once (the archive route's waitUntil and the
+    // cron): the row's updated_at is the claim, and only the UPDATE that
+    // still matches it wins, so one pCloud pull per episode.
+    const claim = await env.DB.prepare('UPDATE podcast_episodes SET updated_at = ? WHERE id = ? AND archive_state = ? AND updated_at = ?')
+      .bind(Math.max(now, (e.updated_at ?? 0) + 1), e.id, 'queued', e.updated_at).run();
+    if (!claim.meta.changes) continue;
     const folder = await folderOf(e.folder_id);
     const target = folder ? await pcloudFor(env, folder) : null;
     if (!target) { await fail(e, 'Archiving needs the library to be on pCloud'); continue; }
@@ -811,7 +845,10 @@ export async function archivePump(env: Env): Promise<string[]> {
         await env.DB.prepare('UPDATE podcast_episodes SET archive_seen_size = ? WHERE id = ?').bind(size, e.id).run();
       }
     } catch (err) {
-      log.push(`archive poll ${e.id}: ${(err as Error).message}`);
+      // A stat that keeps failing (a revoked token) must not hold its row
+      // in 'fetching' for ever, ahead of everything queued after it.
+      if (now - (e.archive_started_at ?? now) > ARCHIVE_GIVE_UP_MS) await fail(e, `Couldn't check pCloud: ${(err as Error).message}`);
+      else log.push(`archive poll ${e.id}: ${(err as Error).message}`);
     }
   }
   return log;

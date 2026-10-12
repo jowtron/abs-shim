@@ -7,7 +7,7 @@ import { buildEpisode, buildEpisodeExpanded, buildPodcastItemExpanded } from '..
 import {
   archivePump, canArchive, createPodcast, episodeTranscript, fetchAndParse, PodcastError, refreshPodcast, searchPodcasts, validFeedUrl,
 } from '../lib/podcasts';
-import { parseOpml, type TranscriptLink } from '../lib/rss';
+import { parseOpml, sanitizeHtml, type TranscriptLink } from '../lib/rss';
 
 // ABS's podcast routes (server/routers/ApiRouter.js "Podcast Routes"), plus a
 // few shim-only ones marked as such. ABS gates writes on admin; here they
@@ -50,7 +50,8 @@ podcastRoutes.post('/', requireCanAdd, async (c) => {
 
 // POST /api/podcasts/feed {rssFeed} → {podcast: {metadata, episodes}}, the
 // parsed feed as ABS's podcastUtils returns it.
-podcastRoutes.post('/feed', async (c) => {
+// canAdd: it makes the Worker fetch any URL a member names.
+podcastRoutes.post('/feed', requireCanAdd, async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const url = validFeedUrl(body['rssFeed']);
   if (!url) return c.json({ error: '"rssFeed" must be a valid URL' }, 400);
@@ -282,7 +283,11 @@ podcastRoutes.patch('/:id/episode/:episodeId', requireCanAdd, async (c) => {
   const sets: string[] = [];
   const binds: unknown[] = [];
   for (const [k, col] of Object.entries(cols)) {
-    if (typeof body[k] === 'string') { sets.push(`${col} = ?`); binds.push(body[k]); }
+    if (typeof body[k] !== 'string') continue;
+    // The bundled ABS web UI renders these as HTML on this origin, where
+    // /admin's cookie lives, so a member's edit is cleaned like a feed's.
+    const v = k === 'description' || k === 'subtitle' ? sanitizeHtml(body[k]) : body[k].replace(/<[^>]*>/g, '');
+    sets.push(`${col} = ?`); binds.push(v);
   }
   if (typeof body['publishedAt'] === 'number') { sets.push('published_at = ?'); binds.push(body['publishedAt']); }
   if (sets.length) {
@@ -316,7 +321,9 @@ podcastRoutes.delete('/:id/episode/:episodeId', requireCanAdd, async (c) => {
     c.env.DB.prepare(
       `UPDATE podcast_episodes SET in_library = 0, removed = 1, updated_at = ?${archiveDeleted ? ", archive_state = NULL, archive_rel_path = NULL, size_bytes = 0" : ''} WHERE id = ?`,
     ).bind(Date.now(), e.id),
-    c.env.DB.prepare('DELETE FROM media_progress WHERE library_item_id = ? AND episode_id = ?').bind(show.item.id, e.id),
+    // Only the caller's progress: hiding is per show (tenant-wide), but
+    // another member's half-listened episode isn't ours to wipe.
+    c.env.DB.prepare('DELETE FROM media_progress WHERE user_id = ? AND library_item_id = ? AND episode_id = ?').bind(c.get('userId'), show.item.id, e.id),
   ]);
   return c.json(await expandedItem(c, show.item.id));
 });

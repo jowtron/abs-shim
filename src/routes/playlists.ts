@@ -43,7 +43,7 @@ function parseRules(raw: string | null): Rules | null {
 function cleanRules(input: unknown): Rules | null {
   if (!input || typeof input !== 'object') return null;
   const r = input as Record<string, unknown>;
-  const ids = Array.isArray(r['podcastIds']) ? (r['podcastIds'] as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 200) : [];
+  const ids = Array.isArray(r['podcastIds']) ? (r['podcastIds'] as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 90) : [];   // one IN list (D1: 100 parameters)
   const include = r['include'] === 'inProgress' || r['include'] === 'all' ? r['include'] : 'unplayed';
   const sort = r['sort'] === 'oldest' ? 'oldest' : 'newest';
   const limit = Math.min(Math.max(Number(r['limit']) || 100, 1), 500);

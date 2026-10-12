@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { sanitizeHtml } from '../lib/rss';
 import type { Env } from '../types';
 import { requireAuth, requireCanAdd, type AuthVars } from '../auth/middleware';
 import { buildItemDetail } from '../lib/abs-shapes';
@@ -553,7 +554,9 @@ itemRoutes.patch('/:id/media', requireCanAdd, async (c) => {
   const md = body['metadata'] as Record<string, unknown> | undefined;
   if (md && typeof md === 'object') {
     for (const [k, col] of [['title', 'title'], ['author', 'author'], ['description', 'description'], ['language', 'language']] as const) {
-      if (typeof md[k] === 'string') { sets.push(`${col} = ?`); binds.push(md[k]); }
+      if (typeof md[k] !== 'string') continue;
+      // Rendered as HTML by the bundled web UI on this origin: cleaned like a feed's.
+      sets.push(`${col} = ?`); binds.push(k === 'description' ? sanitizeHtml(md[k]) : md[k].replace(/<[^>]*>/g, ''));
     }
     if (typeof md['feedUrl'] === 'string' && /^https?:\/\//i.test(md['feedUrl'])) {
       sets.push('feed_url = ?, feed_etag = NULL, feed_last_modified = NULL'); binds.push(md['feedUrl']);
