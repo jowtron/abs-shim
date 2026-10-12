@@ -15,7 +15,7 @@ import type { Env } from '../types';
 import type { LibraryFolderRow } from '../db/library';
 import type { EpisodeRow, PodcastRow } from '../db/podcasts';
 import { decodeFeedBytes, episodeKey, parseFeed, type FeedEpisode, type ParsedFeed, type TranscriptLink } from './rss';
-import { episodeExt } from './podcast-shapes';
+import { episodeExt, EPISODE_AUDIO_UA } from './podcast-shapes';
 import { parseTranscript, rankTranscripts, type Transcript } from './transcript';
 import {
   pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudStat, type PcloudProfile,
@@ -579,12 +579,12 @@ async function chaptersFromAudio(e: EpisodeRow): Promise<{ chapters: Chapter[]; 
   const ext = episodeExt(e);
   if (ext === 'mp3') {
     const { probeMp3 } = await import('../prober/mp3');
-    const p = await probeMp3(e.enclosure_url, e.size_bytes || undefined);
+    const p = await probeMp3(e.enclosure_url, e.size_bytes || undefined, { 'User-Agent': EPISODE_AUDIO_UA });
     return { chapters: p.chapters.map((c, i) => ({ id: i, start: c.start, end: c.end, title: c.title || `Chapter ${i + 1}` })), duration: p.durationSeconds };
   }
   if (ext === 'm4a' || ext === 'mp4' || ext === 'm4b' || ext === 'aac') {
     const { probeM4b } = await import('../prober/m4b');
-    const p = await probeM4b(e.enclosure_url);
+    const p = await probeM4b(e.enclosure_url, { 'User-Agent': EPISODE_AUDIO_UA });
     const dur = p.durationSeconds ?? e.duration_seconds;
     return {
       chapters: p.chapters.map((c, i, all) => ({ id: i, start: c.start, end: all[i + 1]?.start ?? dur, title: c.title || `Chapter ${i + 1}` })),
@@ -641,10 +641,22 @@ export async function ensureEpisodeChapters(env: Env, e: EpisodeRow): Promise<Ch
   let duration: number | null = null;
   try {
     if (!have.length && e.chapters_url) chapters = await chaptersFromJson(e.chapters_url, e.duration_seconds);
-    if (!chapters.length || !e.duration_seconds) {
-      const fromAudio = await chaptersFromAudio(e).catch(() => ({ chapters: [] as Chapter[], duration: null }));
-      if (!chapters.length) chapters = fromAudio.chapters;
-      if (!e.duration_seconds && fromAudio.duration) duration = fromAudio.duration;
+    // The audio is always probed (one small Range read): besides embedded
+    // chapters it gives the file's real length, and feeds get that wrong.
+    // LINUX Unplugged says 1:20:33 for a file that is 1:14:00, and hosts
+    // that stitch ads in at download time (art19, Audioboom, Megaphone)
+    // serve a different length to every listener, so the number that
+    // matters is the one this Worker is handed, which is what it streams.
+    // The "played with N left" rule and Pholia's time-left both come from
+    // it. A probe that only estimates (CBR size/bitrate) can be wrong for
+    // an odd VBR file, so a disagreement of more than a quarter is not
+    // believed.
+    const fromAudio = await chaptersFromAudio(e).catch(() => ({ chapters: [] as Chapter[], duration: null }));
+    if (!chapters.length) chapters = fromAudio.chapters;
+    const probed = fromAudio.duration;
+    if (probed && probed > 0) {
+      const feed = e.duration_seconds || 0;
+      if (!feed || (Math.abs(probed - feed) > 2 && Math.abs(probed - feed) < feed / 4)) duration = probed;
     }
     await env.DB.prepare(
       `UPDATE podcast_episodes SET chapters = ?, chapters_checked_at = ?${duration ? ', duration_seconds = ?' : ''} WHERE id = ?`,

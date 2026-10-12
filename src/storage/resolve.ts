@@ -1,4 +1,5 @@
 import type { Env } from '../types';
+import { EPISODE_AUDIO_UA } from '../lib/podcast-shapes';
 import type { AudioFileRow, LibraryFolderRow } from '../db/library';
 import { getAdapter, type FolderRow } from './factory';
 
@@ -129,7 +130,7 @@ export async function streamRemoteAudio(
   req: Request,
   onSize?: (size: number) => void,
 ): Promise<Response> {
-  const fwd = new Headers({ 'User-Agent': 'audiobookshelf (+https://audiobookshelf.org; like iTMS)' });
+  const fwd = new Headers({ 'User-Agent': EPISODE_AUDIO_UA });
   const range = req.headers.get('Range');
   const head = req.method === 'HEAD';
   // HEAD with an unknown size: a one-byte GET says the total without

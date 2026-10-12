@@ -236,8 +236,13 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
     if (!target.audio.rel_path) {
       const episodeId = target.episode.id;
       return finish(await streamRemoteAudio(target.audio, c.req.raw, (size) => {
-        c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE podcast_episodes SET size_bytes = ? WHERE id = ?')
-          .bind(size, episodeId).run().then(() => undefined, () => undefined));
+        // A size that CHANGES means the publisher now serves a different
+        // file (ad-inserting hosts restitch it as campaigns change), so
+        // its length and embedded chapters are looked up again.
+        c.executionCtx.waitUntil(c.env.DB.prepare(
+          `UPDATE podcast_episodes SET chapters_checked_at = CASE WHEN size_bytes > 0 THEN NULL ELSE chapters_checked_at END,
+             size_bytes = ? WHERE id = ?`,
+        ).bind(size, episodeId).run().then(() => undefined, () => undefined));
       }));
     }
     return finish(await streamAudio(c.env, target.folder, target.audio, c.req.raw));

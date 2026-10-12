@@ -193,7 +193,30 @@ export async function buildEpisode(e: EpisodeRow, item: LibraryItemRow) {
     // parsed text from GET /api/podcasts/:id/episode/:id/transcript.
     transcripts: (JSON.parse(e.transcripts || '[]') as Array<{ url: string; type: string | null; language: string | null }>)
       .map((t) => ({ url: t.url, type: t.type, language: t.language })),
+    // Not ABS: the audio host stitches ads into the file at download time,
+    // so the feed's chapter and transcript times (made from the master)
+    // run early by the ads played before them, differently per listener.
+    dynamicAds: hasDynamicAds(e.enclosure_url),
   };
+}
+
+// Hosts that insert ads per download (verified 2026-10-12: art19 served
+// this Worker and a home connection two different LINUX Unplugged files,
+// 41 s apart after the mid-roll; Audioboom's No Such Thing As A Fish
+// differed by two minutes). Tracking prefixes (podtrac, chartable, op3,
+// podscribe, mgln) only redirect and aren't listed.
+const DYNAMIC_AD_HOSTS = ['art19.com', 'audioboom.com', 'megaphone.fm', 'simplecastaudio.com', 'simplecast.com',
+  'acast.com', 'omny.fm', 'omnycontent.com', 'anchor.fm', 'spotify.com', 'adswizz.com', 'spreaker.com'];
+// One identity for every request that touches an episode's audio (the
+// stream proxy and the chapter/length probe): art19 served this Worker's
+// home-network twin three different stitches of one episode under three
+// User-Agents (4350 s, 4429 s, 4441 s). The length recorded must be the
+// file that is then streamed.
+export const EPISODE_AUDIO_UA = 'audiobookshelf (+https://audiobookshelf.org; like iTMS)';
+
+export function hasDynamicAds(url: string | null | undefined): boolean {
+  const u = (url || '').toLowerCase();
+  return DYNAMIC_AD_HOSTS.some((h) => u.includes(h));
 }
 
 export async function buildEpisodeExpanded(e: EpisodeRow, item: LibraryItemRow, folder: LibraryFolderRow) {
