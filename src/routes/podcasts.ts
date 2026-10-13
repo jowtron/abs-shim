@@ -4,11 +4,11 @@ import { requireAuth, requireCanAdd, type AuthVars } from '../auth/middleware';
 import { getFolderById, getItem, type LibraryFolderRow, type LibraryItemRow } from '../db/library';
 import { getEpisode, getPodcast, listShowEpisodes, type EpisodeRow, type PodcastRow } from '../db/podcasts';
 import { progressForShows } from '../db/progress';
-import { buildEpisode, buildEpisodeExpanded, buildPodcastItemExpanded } from '../lib/podcast-shapes';
+import { buildEpisode, buildEpisodeExpanded, buildPodcastItemExpanded, hasDynamicAds } from '../lib/podcast-shapes';
 import {
   archivePump, canArchive, createPodcast, ensureEpisodeChapters, episodeTranscript, fetchAndParse, PodcastError, refreshPodcast, searchPodcasts, validFeedUrl,
 } from '../lib/podcasts';
-import { AnalysisInputError, analysisOrigin, analysisPump, analysisStatus, queueAnalysis, storeResult } from '../lib/episode-analysis';
+import { AnalysisInputError, analysisOrigin, analysisPump, analysisStatus, queueAnalysis, storeResult, waitsForArchive } from '../lib/episode-analysis';
 import { wharfConfigured } from '../lib/wharf';
 import { parseOpml, sanitizeHtml, type TranscriptLink } from '../lib/rss';
 
@@ -324,7 +324,16 @@ podcastRoutes.post('/:id/episode/:episodeId/analysis/run', requireCanAdd, async 
     await ensureEpisodeChapters(c.env, e);
     e = (await getEpisode(c.env, show.item.id, e.id, tenantId)) ?? e;
   }
+  // An ad-inserting host: archive it first when the show can, and the pump
+  // holds the analysis until the pCloud copy lands (waitsForArchive), so it
+  // describes a file that never changes. The answer then carries
+  // waitingFor: 'archive'.
+  if (hasDynamicAds(e.enclosure_url) && e.archive_state !== 'done' && await canArchive(c.env, show.folder)) {
+    await queueArchive(c.env, show.item.id, [e.id]);
+    e = (await getEpisode(c.env, show.item.id, e.id, tenantId)) ?? e;
+  }
   await queueAnalysis(c.env, e);
+  if (waitsForArchive(e)) c.executionCtx.waitUntil(archivePump(c.env).then(() => undefined, () => undefined));
   c.executionCtx.waitUntil(analysisPump(c.env, { origin: analysisOrigin(c.env, c.req.url) }).then(() => undefined, () => undefined));
   return c.json(await analysisStatus(c.env, e));
 });
@@ -438,14 +447,7 @@ podcastRoutes.post('/:id/archive', requireCanAdd, async (c) => {
   const ids = Array.isArray(body['episodeIds']) ? (body['episodeIds'] as unknown[]).filter((x): x is string => typeof x === 'string') : null;
   let n = 0;
   if (ids?.length) {
-    for (let i = 0; i < ids.length; i += 90) {
-      const part = ids.slice(i, i + 90);
-      const r = await c.env.DB.prepare(
-        `UPDATE podcast_episodes SET in_library = 1, removed = 0, archive_state = 'queued', archive_error = NULL, updated_at = ?
-          WHERE library_item_id = ? AND (archive_state IS NULL OR archive_state = 'error') AND id IN (${part.map(() => '?').join(',')})`,
-      ).bind(Date.now(), show.item.id, ...part).run();
-      n += r.meta.changes ?? 0;
-    }
+    n = await queueArchive(c.env, show.item.id, ids);
   } else {
     const r = await c.env.DB.prepare(
       `UPDATE podcast_episodes SET archive_state = 'queued', archive_error = NULL, updated_at = ?
@@ -458,6 +460,23 @@ podcastRoutes.post('/:id/archive', requireCanAdd, async (c) => {
   if (n) c.executionCtx.waitUntil(archivePump(c.env).then(() => undefined, () => undefined));
   return c.json({ queued: n });
 });
+
+// Queue these episodes for archiving, putting them on the show; one already
+// queued, fetching or done is left alone, a failed one is tried again. The
+// archive route's {episodeIds}, and "Analyse now" on an ad-inserting host.
+// The caller has checked canArchive. Returns how many were queued.
+async function queueArchive(env: Env, showItemId: string, ids: string[]): Promise<number> {
+  let n = 0;
+  for (let i = 0; i < ids.length; i += 90) {
+    const part = ids.slice(i, i + 90);
+    const r = await env.DB.prepare(
+      `UPDATE podcast_episodes SET in_library = 1, removed = 0, archive_state = 'queued', archive_error = NULL, updated_at = ?
+        WHERE library_item_id = ? AND (archive_state IS NULL OR archive_state = 'error') AND id IN (${part.map(() => '?').join(',')})`,
+    ).bind(Date.now(), showItemId, ...part).run();
+    n += r.meta.changes ?? 0;
+  }
+  return n;
+}
 
 // ─── Search ──────────────────────────────────────────────────────────────────
 

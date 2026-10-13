@@ -154,12 +154,26 @@ function transcriptLinks(e: EpisodeRow) {
 // moved 156 s between two Worker fetches), so an analysis of a STREAMED copy
 // is right only until the next restitch. The pump therefore analyses those
 // shows' episodes once they are archived, when the file is fixed for good;
-// "Analyse now" (a queued row) still works on anything. Joseph, 2026-10-13.
+// "Analyse now" (a queued row) still works on anything, see waitsForArchive.
+// Joseph, 2026-10-13.
 export function wantsAnalysis(e: EpisodeRow, analyse: string | null): boolean {
   if (analyse === 'off') return false;
   if (hasDynamicAds(e.enclosure_url) && e.archive_state !== 'done') return false;
   if (analyse === 'on') return true;
   return hasDynamicAds(e.enclosure_url) || !publisherChapters(e).length || !transcriptLinks(e).length;
+}
+
+// "Analyse now" on an ad-inserting host that isn't archived: the run route
+// queues the pCloud copy first (when the show can archive), and the pump
+// holds the queued row while that copy is queued or being fetched, for the
+// reason above: the streamed stitch changes between fetches (a Fish episode
+// changed size three times on 2026-10-13), the archived file never does.
+// When the copy lands, submit() moves the row to the archived file's size.
+// Only an archive IN FLIGHT holds it: one that ended in error, or a show that
+// can't archive (no pCloud folder, so nothing was queued), lets the streamed
+// copy be analysed anyway, because the listener asked for it explicitly.
+export function waitsForArchive(e: Pick<EpisodeRow, 'enclosure_url' | 'archive_state'>): boolean {
+  return hasDynamicAds(e.enclosure_url) && (e.archive_state === 'queued' || e.archive_state === 'fetching');
 }
 
 // ─── Submitting ──────────────────────────────────────────────────────────────
@@ -324,16 +338,20 @@ type Candidate = EpisodeRow & { show_analyse: string | null; queued_size?: numbe
 async function nextCandidate(env: Env, now: number): Promise<Candidate | null> {
   // 1. Asked for (the "Analyse now" route), or an automatic pick that found
   //    the Mac asleep: oldest first. A restitched episode waits for the
-  //    chapter pump's re-probe (chapters_checked_at) like any other.
+  //    chapter pump's re-probe (chapters_checked_at) like any other, and an
+  //    ad-inserting one for its archive in flight (waitsForArchive). Those
+  //    with an archive in flight sort last, so a run of them can't push a
+  //    ready row out of the batch.
   const queued = await env.DB.prepare(
     `SELECT e.*, p.analyse AS show_analyse, a.size_bytes AS queued_size
        FROM episode_analysis a
        JOIN podcast_episodes e ON e.id = a.episode_id
        JOIN podcasts p ON p.library_item_id = e.library_item_id
       WHERE a.state = 'queued' AND e.chapters_checked_at IS NOT NULL
-      ORDER BY a.updated_at ASC LIMIT 1`,
-  ).first<Candidate>();
-  if (queued) return queued;
+      ORDER BY COALESCE(e.archive_state IN ('queued', 'fetching'), 0) ASC, a.updated_at ASC LIMIT 25`,
+  ).all<Candidate>();
+  const q = queued.results.find((e) => !waitsForArchive(e));
+  if (q) return q;
 
   // 2. Being played, with nothing for the stitch being streamed: results
   //    are a couple of minutes away, so the rest of this listen is right.
@@ -629,6 +647,7 @@ function rowJson(r: AnalysisRow) {
 
 // GET …/analysis: where the episode's analysis stands. `state` is the row
 // for the size served now, else one waiting or running for it.
+// `waitingFor: 'archive'` while a queued row is held for the pCloud copy.
 export async function analysisStatus(env: Env, e: EpisodeRow) {
   const rows = (await env.DB.prepare('SELECT * FROM episode_analysis WHERE episode_id = ? ORDER BY updated_at DESC')
     .bind(e.id).all<AnalysisRow>()).results;
@@ -639,6 +658,7 @@ export async function analysisStatus(env: Env, e: EpisodeRow) {
     configured: wharfConfigured(env),
     currentSize: e.size_bytes,
     state: current?.state ?? null,
+    waitingFor: current?.state === 'queued' && waitsForArchive(e) ? 'archive' as const : null,
     current: current ? rowJson(current) : null,
     rows: rows.map(rowJson),
     analysis: analysisField(e, a, servedChapters(e, a).source),
