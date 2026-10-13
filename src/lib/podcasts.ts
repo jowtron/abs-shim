@@ -15,9 +15,9 @@ import type { Env } from '../types';
 import type { LibraryFolderRow } from '../db/library';
 import type { EpisodeRow, PodcastRow } from '../db/podcasts';
 import { decodeFeedBytes, episodeKey, parseFeed, type FeedEpisode, type ParsedFeed, type TranscriptLink } from './rss';
-import { cuesToServed, currentAnalysis, episodeExt, EPISODE_AUDIO_UA } from './podcast-shapes';
+import { cuesToServed, currentAnalysis, episodeExt, EPISODE_AUDIO_UA, hasDynamicAds } from './podcast-shapes';
 import { parseTranscript, rankTranscripts, type Transcript, type TranscriptCue } from './transcript';
-import { analysisPump, whisperTranscriptFor } from './episode-analysis';
+import { adoptAnalysisForSize, analysisPump, whisperTranscriptFor } from './episode-analysis';
 import { announceNewEpisodes } from './push';
 import {
   pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudStat, type PcloudProfile,
@@ -43,6 +43,18 @@ const TICK_FEEDS = 5;
 const ARCHIVE_STARTS_PER_TICK = 3;
 const ARCHIVE_POLLS_PER_TICK = 10;
 const ARCHIVE_GIVE_UP_MS = 6 * 60 * 60 * 1000;
+// Starting a pull (probe, stat, folder, downloadfileasync) takes seconds; a
+// claim holds the row this long, so a second pump can't start another pull
+// meanwhile, and a starter that died is retried after it.
+const ARCHIVE_START_LEASE_MS = 5 * 60 * 1000;
+// A pCloud file counts as landed once its size has held across two polls,
+// at least this long after the pull started, and pCloud's own `modified`
+// is at least ARCHIVE_SETTLE_MS old (2026-10-14, archivePump).
+const ARCHIVE_MIN_FETCH_MS = 2 * 60 * 1000;
+const ARCHIVE_SETTLE_MS = 60 * 1000;
+// A settled file smaller than the source's size is accepted after this: an
+// ad-inserting host the list doesn't know serves pCloud its own stitch.
+const ARCHIVE_ANY_SIZE_AFTER_MS = 30 * 60 * 1000;
 // Raise when the parser starts storing a field older rows lack: each show's
 // next poll then re-reads its whole feed once (migration 0018: chapters_url;
 // 2 = migration 0021: transcripts).
@@ -837,7 +849,13 @@ export async function ensureEpisodeChapters(env: Env, e: EpisodeRow): Promise<Ch
     // believed.
     const fromAudio = await chaptersFromAudio(e).catch(() => ({ chapters: [] as Chapter[], duration: null }));
     if (!chapters.length) chapters = fromAudio.chapters;
-    const probed = fromAudio.duration;
+    // Except an archived episode on such a host: this probe reads the
+    // enclosure, a different stitch from the pCloud copy that is played, so
+    // its length isn't the played file's (that file's analysis sets it).
+    // Without this, the weekly re-check of an episode with no chapters put
+    // the streamed stitch's length back.
+    const otherStitch = e.archive_state === 'done' && !!e.archive_rel_path && hasDynamicAds(e.enclosure_url);
+    const probed = otherStitch ? null : fromAudio.duration;
     let measured = false;
     if (probed && probed > 0) {
       const feed = e.duration_seconds || 0;
@@ -947,6 +965,53 @@ async function readCapped(res: Response, cap: number): Promise<ArrayBuffer> {
 
 type ArchiveRow = EpisodeRow & { folder_id: string; show_path: string };
 
+// Whether a pull has landed. Until 2026-10-14 it was the FIRST stat that
+// reached the source's size (the Worker's own HEAD of the enclosure), which
+// went wrong on NSTAAF's "Peanut Podcast" (2026-10-13): a stat 14 s after
+// the start found a 31,840,334 B file, the size the Worker's stitch had, and
+// the episode was marked done at that size; pCloud's metadata says the file
+// at that path now was created 9 s later, 30,219,072 B with other ads (a
+// second pull into the same name: the claim race described in
+// archivePump). The analysis submitted in between read the first file, so
+// it matched size_bytes and went on being served against the second, which
+// nothing ever re-measured. And the source's size is no measure for a host
+// that stitches ads per download: pCloud is handed a stitch of its own.
+//
+// So a pull has landed when pCloud's size held across two polls (the
+// previous poll left it in archive_seen_size), at least ARCHIVE_MIN_FETCH_MS
+// after the start, with pCloud's own `modified` ARCHIVE_SETTLE_MS old; and
+// the size then recorded is pCloud's (archiveLanded). Reaching the source's
+// size is still required, except on an ad-inserting host, or once the file
+// has sat unchanged ARCHIVE_ANY_SIZE_AFTER_MS into the pull.
+export function archiveSettled(
+  e: Pick<EpisodeRow, 'archive_seen_size' | 'archive_started_at' | 'archive_expected_size' | 'enclosure_url'>,
+  size: number, modified: string | undefined, now: number,
+): boolean {
+  if (!(size > 0) || size !== e.archive_seen_size) return false;
+  const since = now - (e.archive_started_at ?? now);
+  if (since < ARCHIVE_MIN_FETCH_MS) return false;
+  const m = modified ? Date.parse(modified) : NaN;
+  if (Number.isFinite(m) && now - m < ARCHIVE_SETTLE_MS) return false;
+  const expected = e.archive_expected_size;
+  return !expected || size >= expected || hasDynamicAds(e.enclosure_url) || since >= ARCHIVE_ANY_SIZE_AFTER_MS;
+}
+
+// A pull has landed (or the file was already there): the episode plays from
+// pCloud from now on, and its size is what pCloud holds. When that differs
+// from the size recorded so far (the streamed stitch's, on a host that
+// inserts ads), an analysis of the old size stops being served
+// (currentAnalysis compares sizes), the analysis pump sees the archived file
+// as unanalysed, and an analysis made earlier of this very size is taken up
+// again. Only a row still being archived: one hidden with its files deleted
+// meanwhile stays as it is.
+async function archiveLanded(env: Env, e: EpisodeRow, rel: string, size: number): Promise<void> {
+  const r = await env.DB.prepare(
+    `UPDATE podcast_episodes SET archive_state = 'done', archive_rel_path = ?, size_bytes = ?, archive_error = NULL, updated_at = ?
+      WHERE id = ? AND archive_state IN ('queued', 'fetching')`,
+  ).bind(rel, size, Date.now(), e.id).run();
+  if (r.meta.changes && size !== e.size_bytes) await adoptAnalysisForSize(env, e.id, size).catch(() => undefined);
+}
+
 export async function archivePump(env: Env): Promise<string[]> {
   const log: string[] = [];
   const now = Date.now();
@@ -961,16 +1026,27 @@ export async function archivePump(env: Env): Promise<string[]> {
     "UPDATE podcast_episodes SET archive_state = 'error', archive_error = ?, updated_at = ? WHERE id = ?",
   ).bind(msg.slice(0, 300), Date.now(), e.id).run();
 
+  const leaseCutoff = now - ARCHIVE_START_LEASE_MS;
   const queued = await env.DB.prepare(
     `SELECT e.*, li.folder_id, li.rel_path AS show_path FROM podcast_episodes e JOIN library_items li ON li.id = e.library_item_id
-      WHERE e.archive_state = 'queued' ORDER BY e.updated_at ASC LIMIT ?`,
-  ).bind(ARCHIVE_STARTS_PER_TICK).all<ArchiveRow>();
+      WHERE e.archive_state = 'queued' AND (e.archive_started_at IS NULL OR e.archive_started_at < ?)
+      ORDER BY e.updated_at ASC LIMIT ?`,
+  ).bind(leaseCutoff, ARCHIVE_STARTS_PER_TICK).all<ArchiveRow>();
   for (const e of queued.results) {
     // Two pumps can run at once (the archive route's waitUntil and the
-    // cron): the row's updated_at is the claim, and only the UPDATE that
-    // still matches it wins, so one pCloud pull per episode.
-    const claim = await env.DB.prepare('UPDATE podcast_episodes SET updated_at = ? WHERE id = ? AND archive_state = ? AND updated_at = ?')
-      .bind(Math.max(now, (e.updated_at ?? 0) + 1), e.id, 'queued', e.updated_at).run();
+    // cron), so a row is claimed before its pull is started, and the claim
+    // is a lease: archive_started_at, which the row keeps until 'fetching'
+    // overwrites it. Until 2026-10-14 the claim was a compare-and-set on
+    // updated_at alone, which left the row 'queued' with a NEW updated_at
+    // while the pull was being started: a second pump that read the row
+    // after the first one's claim matched that new value and started a
+    // second pull into the same file name. That is the likeliest way
+    // Peanut got two pCloud files 9 s apart, with the archive route's pump
+    // and the 05:12 UTC cron tick overlapping (archiveSettled, below).
+    const claim = await env.DB.prepare(
+      `UPDATE podcast_episodes SET updated_at = ?, archive_started_at = ?
+        WHERE id = ? AND archive_state = 'queued' AND updated_at = ? AND (archive_started_at IS NULL OR archive_started_at < ?)`,
+    ).bind(Math.max(now, (e.updated_at ?? 0) + 1), now, e.id, e.updated_at, leaseCutoff).run();
     if (!claim.meta.changes) continue;
     const folder = await folderOf(e.folder_id);
     const target = folder ? await pcloudFor(env, folder) : null;
@@ -983,9 +1059,7 @@ export async function archivePump(env: Env): Promise<string[]> {
       const abs = join(target.rootPath, rel);
       const existing = await pcloudStat(target.profile, abs);
       if (existing?.size && (src.size == null || existing.size === src.size)) {
-        await env.DB.prepare(
-          `UPDATE podcast_episodes SET archive_state = 'done', archive_rel_path = ?, size_bytes = ?, archive_error = NULL, updated_at = ? WHERE id = ?`,
-        ).bind(rel, existing.size, Date.now(), e.id).run();
+        await archiveLanded(env, e, rel, existing.size);
         log.push(`archive ${name}: already there`);
         continue;
       }
@@ -1012,16 +1086,9 @@ export async function archivePump(env: Env): Promise<string[]> {
     try {
       const st = await pcloudStat(target.profile, join(target.rootPath, e.archive_rel_path));
       const size = st?.size ?? 0;
-      // With the source's size known, done is "pCloud has all of it". Without
-      // it, done is a size that hasn't moved between two ticks (2+ minutes).
-      const done = e.archive_expected_size
-        ? size >= e.archive_expected_size
-        : size > 0 && size === e.archive_seen_size && now - (e.archive_started_at ?? now) > 2 * 60 * 1000;
-      if (done) {
-        await env.DB.prepare(
-          `UPDATE podcast_episodes SET archive_state = 'done', size_bytes = ?, archive_error = NULL, updated_at = ? WHERE id = ?`,
-        ).bind(size, Date.now(), e.id).run();
-        log.push(`archive ${e.archive_rel_path}: done`);
+      if (archiveSettled(e, size, st?.modified, now)) {
+        await archiveLanded(env, e, e.archive_rel_path, size);
+        log.push(`archive ${e.archive_rel_path}: done (${size} bytes${e.archive_expected_size && size !== e.archive_expected_size ? `, the source said ${e.archive_expected_size}` : ''})`);
       } else if (now - (e.archive_started_at ?? now) > ARCHIVE_GIVE_UP_MS) {
         await fail(e, `pCloud stopped at ${size} bytes${e.archive_expected_size ? ` of ${e.archive_expected_size}` : ''}`);
       } else {

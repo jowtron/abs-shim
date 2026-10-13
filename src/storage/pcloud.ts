@@ -457,6 +457,9 @@ export async function pcloudFetchWithRetry(method: string, url: string, accessTo
 
 export type PcloudMetadata = {
   fileid?: number; folderid?: number; path?: string; name: string; size?: number; isfolder: boolean;
+  // RFC 2822 dates ("Tue, 13 Oct 2026 05:13:18 +0000"); a file written by
+  // downloadfileasync carries the time it landed.
+  created?: string; modified?: string;
 };
 
 // `createfolderifnotexists` only creates the leaf, so walk the path one
