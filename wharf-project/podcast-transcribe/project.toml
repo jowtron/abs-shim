@@ -1,0 +1,28 @@
+# wharf project "podcast-transcribe": podcast episode analysis for ABS_shim.
+#
+# Transcribes an episode exactly as the shim serves it (whisper.cpp), maps the
+# publisher's transcript/chapter times onto that ad-stitched file, finds the
+# inserted ads, and optionally labels ad reads and cuts chapters with an LLM.
+# See README.md for the handler contract.
+#
+# Installed on the Mac node (island "mac", wharfd under launchd as _wharf) at
+# /opt/wharf/projects/podcast-transcribe/ by `sudo ./install.sh`. The
+# directory name MUST stay "podcast-transcribe": the router forwards
+# project_id unchanged, and router-mac's credential lists this id.
+#
+# Layout on the node (on-disk handler, like deploy/macos/whisper-smoke):
+#   handlers/analyse_episode.{py,yaml}   the handler + manifest
+#   handlers/_lib/                       align.py, llm_pass.py
+#   data/models/ggml-base.en.bin         fallback model (not in git; install.sh fetches it)
+#   venv/                                the anthropic SDK (requirements.txt)
+#   .env                                 OPENROUTER_API_KEY, OPENROUTER_MODEL, WHISPER_MODEL, ... (0600)
+#   scratch/<job>/                       audio + wav while a job runs; removed after
+name        = "podcast-transcribe"
+description = "Podcast episode analysis for ABS_shim: whisper transcript of the served (ad-stitched) file, alignment to the publisher's transcript and chapters, inserted-ad ranges, optional LLM ad labels and chapters."
+
+# One whisper run at a time: it already uses the GPU and 8 cores. A backlog
+# waits here; past the queue depth the router fails over (queue_full).
+max_queue_depth = 16
+
+[slots]
+total = 1

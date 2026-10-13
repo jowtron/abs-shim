@@ -1,0 +1,100 @@
+name: analyse_episode
+description: "Transcribe one podcast episode exactly as the shim serves it (whisper.cpp), align it to the publisher's transcript and chapters, find inserted ads, and optionally label ad reads and cut chapters with an LLM. Result POSTed to the shim and printed."
+
+mode_allowed: [async]
+# Re-running is harmless: nothing persists outside scratch/, and the shim
+# keys results by (episode, byte size).
+idempotent: true
+
+# Per hour of audio: ~2 min on the Mac (Metal, base.en); ~30 min on
+# stereo-au with tiny.en (alignment) and ~80 min with base.en (a transcript
+# listeners read), CPU only. 4 h covers a 3-hour episode read with base.en.
+timeout_ms: 14400000
+# base.en / tiny.en with greedy decoding stay well under 1 GB; ffmpeg and
+# python add little. Only enforced on Linux (systemd-run scope); macOS has no
+# per-job limits.
+max_memory_mb: 2048
+# stereo-au (4 cores, live lab PBX + kiosk): at most three cores' worth; the
+# handler runs whisper with -t 4 there. Ignored on macOS.
+cpu_quota_pct: 300
+# The result carries the whole transcript: ~200 KB an hour.
+max_stdout_bytes: 16777216
+# Scratch audio and wav (~250 MB an hour) live in scratch/<job>/.
+cleanup_dirs: ["scratch"]
+
+# Declared on the Mac (agent.toml: whisper:large-v3-turbo, ffmpeg) and on
+# stereo-au; a bare "whisper" is satisfied by any variant or by detection.
+# whisper-cli, ffmpeg and ffprobe are called by name on the handler PATH (the
+# project's bin/ first). Models: see WHISPER_MODEL_DIR below and README.
+requires_capabilities: ["whisper", "ffmpeg"]
+
+# The nodes run WHARF_ENV_PASSTHROUGH=strict: every .env key the handler
+# reads is listed here, and nothing else reaches it.
+#   OPENROUTER_API_KEY     enables the LLM step; without it llm/llmError say
+#                          "skipped: no OPENROUTER_API_KEY"
+#   OPENROUTER_MODEL       default anthropic/claude-sonnet-5
+#   OPENROUTER_REASONING   low (default) | medium | high | off | default
+#   WHISPER_MODEL_DIR      the node's shared models (/opt/wharf/share/whisper
+#                          on the Mac, /usr/local/share/whisper on stereo-au);
+#                          the project's data/models is searched after it
+#   WHISPER_MODEL          override, any transcript (name or absolute path)
+#   WHISPER_MODEL_READ     override when whisper's transcript is the one
+#                          listeners read (no publisher transcript)
+# The handler is stdlib-only: no venv, nothing else to pass.
+env_passthrough: ["OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_REASONING", "WHISPER_MODEL_DIR", "WHISPER_MODEL", "WHISPER_MODEL_READ"]
+
+# warn, not enforce: the shim ships on its own cadence, and the handler reads
+# every field tolerantly (it fails with a clear error only on the three it
+# can't do without), so a schema slip shouldn't block the queue.
+validate_input: warn
+input_schema:
+  type: object
+  required: ["episodeId", "libraryItemId", "audioUrl", "token"]
+  properties:
+    episodeId: {type: string}
+    libraryItemId: {type: string}
+    sizeBytes: {type: ["integer", "null"]}
+    audioUrl: {type: string, description: "The shim's stream route for the episode (/api/items/<item>/file/<ino>)."}
+    token: {type: string, description: "Shim access token minted for this job (2 h). Sent only to audioUrl/resultUrl, over https."}
+    transcripts:
+      type: ["array", "null"]
+      items:
+        type: object
+        properties:
+          url: {type: string}
+          type: {type: ["string", "null"]}
+          language: {type: ["string", "null"]}
+    chapters:
+      type: ["array", "null"]
+      items:
+        type: object
+        properties:
+          start: {type: number}
+          title: {type: ["string", "null"]}
+    title: {type: ["string", "null"]}
+    showNotes: {type: ["string", "null"]}
+    wantLlm: {type: boolean}
+    resultUrl: {type: ["string", "null"]}
+    model: {type: string, pattern: "^[A-Za-z0-9._-]+$", description: "Optional model name (e.g. base.en); WHISPER_MODEL / WHISPER_MODEL_READ in .env win over it."}
+
+output_schema:
+  type: object
+  required: ["version", "episodeId", "sizeBytes", "duration", "model", "offsets", "cuts", "ads", "chapters", "transcript", "timings"]
+  properties:
+    version: {type: integer}
+    episodeId: {type: string}
+    libraryItemId: {type: ["string", "null"]}
+    sizeBytes: {type: integer, description: "Measured from the download: the stitch this result describes."}
+    requestedSizeBytes: {type: ["integer", "null"]}
+    duration: {type: number}
+    model: {type: string}
+    llmModel: {type: ["string", "null"]}
+    llm: {type: string, description: "Only when wantLlm: ok | skipped: no OPENROUTER_API_KEY | error: ..."}
+    llmError: {type: string, description: "Same text as llm when it is not ok"}
+    offsets: {type: array, description: "[{from, to, shift}] master ranges; served = master + shift"}
+    cuts: {type: array, description: "[{from, to}] master audio the served file doesn't have"}
+    ads: {type: array, description: "[{start, end, confidence, kind, source, where|label}] served time"}
+    chapters: {type: array, description: "[{start, title, source}] served time when aligned"}
+    transcript: {type: object, description: "{source: publisher|whisper, cues: [{start, end, speaker, text}]}"}
+    stats: {type: object}
+    timings: {type: object}
