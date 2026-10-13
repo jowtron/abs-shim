@@ -148,8 +148,16 @@ function transcriptLinks(e: EpisodeRow) {
 // A show's `analyse`: 'off' never, 'on' always, auto (NULL) when there is
 // something to fix or fill: a host that inserts ads, or no chapters, or no
 // transcript.
+//
+// An ad-inserting host serves a different stitch over time (LUP 688 came
+// back 90 s shorter the day after it was first measured, a Fish episode
+// moved 156 s between two Worker fetches), so an analysis of a STREAMED copy
+// is right only until the next restitch. The pump therefore analyses those
+// shows' episodes once they are archived, when the file is fixed for good;
+// "Analyse now" (a queued row) still works on anything. Joseph, 2026-10-13.
 export function wantsAnalysis(e: EpisodeRow, analyse: string | null): boolean {
   if (analyse === 'off') return false;
+  if (hasDynamicAds(e.enclosure_url) && e.archive_state !== 'done') return false;
   if (analyse === 'on') return true;
   return hasDynamicAds(e.enclosure_url) || !publisherChapters(e).length || !transcriptLinks(e).length;
 }
