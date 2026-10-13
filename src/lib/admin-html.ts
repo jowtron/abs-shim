@@ -1542,6 +1542,8 @@ function podcastLibraryHtml(lib, folders, s, isOwner, canAdd, status) {
     h += '<button class="secondary" data-attach-pcloud="' + id + '" title="Move this library onto pCloud so episodes can be archived there. Episodes keep playing from their publishers until archived.">Archive to pCloud…</button>';
   }
   h += '</div>';
+  // Filled by wirePodcastLibraries from /api/analysis/runs (canAdd only).
+  if (canAdd) h += '<div class="muted" data-pod-runs="' + id + '" style="font-size:0.85rem;margin-top:0.4rem"></div>';
   if (canAdd) {
     h += '<div class="upload-area" id="pod-add-' + id + '">';
     h += '<div class="upload-row"><input type="text" data-pod-term="' + id + '" placeholder="Search Apple Podcasts, or paste a feed URL">';
@@ -1558,7 +1560,45 @@ function podcastLibraryHtml(lib, folders, s, isOwner, canAdd, status) {
   return h;
 }
 
+// Dollars as OpenRouter reports them: an analysis costs cents, so show a
+// third decimal under a cent rather than rounding a real spend to $0.00.
+function podMoney(n) {
+  n = Number(n) || 0;
+  if (n === 0) return '$0';
+  return '$' + (n < 0.01 ? n.toFixed(3) : n.toFixed(2));
+}
+
+// The run log's one-line total at the top of a podcast library: all time,
+// this month (the browser's calendar month), and anything in flight. The
+// totals are the tenant's, so every podcast library shows the same line.
+async function podLoadRunTotals(el) {
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  let d;
+  try {
+    d = await api('/api/analysis/runs?limit=0&tz=' + encodeURIComponent(tz));
+  } catch (e) {
+    el.remove();
+    return;
+  }
+  const t = d.totals;
+  if (!t.runs && !d.active.length) { el.textContent = 'Episode analysis: no runs yet.'; return; }
+  const now = new Date();
+  const thisMonth = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+  const m = d.months.find((x) => x.month === thisMonth);
+  const hours = (sec) => (sec / 3600).toFixed(1) + ' h';
+  let line = 'Episode analysis, all shows: ' + t.runs + ' run' + (t.runs === 1 ? '' : 's')
+    + (t.failed ? ' (' + t.failed + ' failed)' : '') + ', ' + podMoney(t.costUsd)
+    + (t.costUnknownRuns ? ' + ' + t.costUnknownRuns + ' not recorded' : '')
+    + ', ' + hours(t.audioSeconds) + ' of audio'
+    + ' · this month ' + (m ? m.runs + ' run' + (m.runs === 1 ? '' : 's') + ', ' + podMoney(m.costUsd) : 'none');
+  const running = d.active.filter((a) => a.state === 'running').length;
+  const queued = d.active.length - running;
+  if (d.active.length) line += ' · now ' + [running ? running + ' running' : '', queued ? queued + ' queued' : ''].filter(Boolean).join(', ');
+  el.textContent = line;
+}
+
 function wirePodcastLibraries(body, status) {
+  body.querySelectorAll('[data-pod-runs]').forEach((el) => podLoadRunTotals(el));
   body.querySelectorAll('[data-pod-add]').forEach((btn) => btn.addEventListener('click', () => {
     const area = document.getElementById('pod-add-' + btn.dataset.podAdd);
     area.classList.toggle('open');
@@ -1708,6 +1748,7 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
       + (p.last_error ? '<br><span class="warn">' + escapeHtml(p.last_error) + '</span>' : '')
       + '<br>Analysis ' + (p.analyse === 'on' ? 'on' : p.analyse === 'off' ? 'off' : 'auto')
       + ': ' + p.analysed + ' done' + (p.analysing ? ', ' + p.analysing + ' waiting or running' : '')
+      + (p.analysis_runs ? ' · ' + p.analysis_runs + ' run' + (p.analysis_runs === 1 ? '' : 's') + ', ' + podMoney(p.analysis_cost) : '')
       + (p.analysis_island ? ' (running on ' + escapeHtml(p.analysis_island) + ')' : '')
       + (p.analysis_errors ? ', <span class="warn">' + p.analysis_errors + ' failed</span>' : '')
       + (p.analysis_last_error ? '<br><span class="warn">' + escapeHtml(p.analysis_last_error) + '</span>' : '') + '</span></div>';

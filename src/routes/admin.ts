@@ -15,6 +15,7 @@ import { resolveLibraryScope, viewFilter, type LibraryViewRow } from '../db/libr
 import type { PodcastRow } from '../db/podcasts';
 import { refreshPodcast } from '../lib/podcasts';
 import { jobIsland } from '../lib/episode-analysis';
+import { backfillAnalysisRuns } from '../db/analysis-runs';
 import { probeM4b } from '../prober/m4b';
 import { probeMp3 } from '../prober/mp3';
 import { resolveProbeUrl } from '../storage/resolve';
@@ -250,12 +251,22 @@ adminRoutes.get('/libraries/:libId/podcasts', async (c) => {
             (SELECT a.error FROM episode_analysis a WHERE a.library_item_id = p.library_item_id AND a.error IS NOT NULL
               ORDER BY a.updated_at DESC LIMIT 1) AS analysis_last_error,
             (SELECT a.job_id FROM episode_analysis a WHERE a.library_item_id = p.library_item_id AND a.state = 'running'
-              LIMIT 1) AS analysis_job
+              LIMIT 1) AS analysis_job,
+            (SELECT COUNT(*) FROM analysis_runs r WHERE r.library_item_id = p.library_item_id) AS analysis_runs,
+            (SELECT SUM(r.cost_usd) FROM analysis_runs r WHERE r.library_item_id = p.library_item_id) AS analysis_cost
        FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
       WHERE li.library_id = ? AND p.tenant_id = ?
       ORDER BY p.title COLLATE NOCASE`,
   ).bind(c.req.param('libId'), tenantId).all<Record<string, unknown>>();
   return c.json({ podcasts: r.results.map((p) => ({ ...p, analysis_island: jobIsland(p['analysis_job'] as string | null) })) });
+});
+
+// Owner-only, one-off and idempotent: fill the episode analysis run log
+// (migration 0027) from what existed before it, recovering cost and tokens
+// from the finished jobs through the wharf-router. `?dry=1` reports what it
+// would do. See backfillAnalysisRuns.
+adminRoutes.post('/analysis/runs/backfill', requireTenantOwner, async (c) => {
+  return c.json(await backfillAnalysisRuns(c.env, c.get('tenantId'), { dry: c.req.query('dry') === '1' }));
 });
 
 // Owner-only: the one per-tenant permission switch. Body {membersCanAdd: bool}.

@@ -39,6 +39,7 @@ import {
 } from './podcast-shapes';
 import { rankTranscripts, whisperTranscript, type Transcript } from './transcript';
 import { stripAllTags, type TranscriptLink } from './rss';
+import { doneRun, emptyRun, LOST_PREFIX, nodeStats, recordRun } from './analysis-runs';
 
 export const ANALYSIS_PROJECT = 'podcast-transcribe';
 export const ANALYSIS_HANDLER = 'analyse_episode';
@@ -114,6 +115,7 @@ export type AnalysisRow = {
   transcript_source: string | null;
   transcript_key: string | null;
   timings: string | null;
+  reason: string | null;              // migration 0027: 'asked' | 'played' | 'new'
   created_at: number;
   updated_at: number;
 };
@@ -215,15 +217,43 @@ function isQuiet(err: unknown): boolean {
 }
 
 // A failed try: queued again while tries are left, else error. Only a row
-// still running: a result POST that landed meanwhile has settled it.
-async function failRow(env: Env, episodeId: string, size: number, msg: string): Promise<void> {
-  await env.DB.prepare(
+// still running: a result POST that landed meanwhile has settled it. Every
+// failed try is one error row in the run log (analysis_runs), written only
+// when this call is the one that settled the row, so a try is logged once.
+// `jobId`: the job that failed, if one was started; `raw`: its result, when
+// it delivered one that couldn't be used (it may still say what it cost);
+// `noJob`: nothing ran, so nothing was spent.
+type FailOpts = { jobId?: string | null; raw?: unknown; noJob?: boolean };
+async function failRow(env: Env, episodeId: string, size: number, msg: string, opts: FailOpts = {}): Promise<void> {
+  const now = Date.now();
+  const error = msg.slice(0, 300);
+  const settled = await env.DB.prepare(
     `UPDATE episode_analysis SET state = CASE WHEN attempts >= ? THEN 'error' ELSE 'queued' END, job_id = NULL, error = ?, updated_at = ?
-      WHERE episode_id = ? AND size_bytes = ? AND state = 'running'`,
-  ).bind(MAX_ATTEMPTS, msg.slice(0, 300), Date.now(), episodeId, size).run();
+      WHERE episode_id = ? AND size_bytes = ? AND state = 'running'
+      RETURNING tenant_id, library_item_id, reason`,
+  ).bind(MAX_ATTEMPTS, error, now, episodeId, size).all<{ tenant_id: string; library_item_id: string; reason: string | null }>();
+  const row = settled.results[0];
+  if (!row) return;
+  const run = emptyRun({ tenantId: row.tenant_id, episodeId, libraryItemId: row.library_item_id, outcome: 'error' });
+  const s = opts.raw && typeof opts.raw === 'object' ? nodeStats(opts.raw) : null;
+  await recordRun(env, {
+    ...run,
+    ...(s ?? {}),
+    sizeBytes: size || null,
+    jobId: opts.jobId ?? null,
+    island: jobIsland(opts.jobId) ?? s?.island ?? null,
+    error,
+    reason: row.reason,
+    // A failed job's spend is unknown unless its result said; a try that
+    // never started a job spent nothing.
+    costUsd: s?.costUsd ?? (opts.noJob ? 0 : null),
+    createdAt: now,
+  });
 }
 
-async function submit(env: Env, e: EpisodeRow, queuedSize: number | null, origin: string): Promise<string> {
+// `reason`: why the pump took it ('asked', 'played', 'new'), kept on the
+// row and copied onto its runs.
+async function submit(env: Env, e: EpisodeRow, queuedSize: number | null, origin: string, reason: string | null): Promise<string> {
   const now = Date.now();
   const size = e.size_bytes || 0;
   // A row queued for a stitch the episode no longer has gives way to one
@@ -236,16 +266,22 @@ async function submit(env: Env, e: EpisodeRow, queuedSize: number | null, origin
   // waitUntil) can't both start a job: it only inserts while no row is
   // running.
   const claim = await env.DB.prepare(
-    `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, attempts, created_at, updated_at)
-     SELECT ?, ?, ?, ?, 'running', 1, ?, ? WHERE NOT EXISTS (SELECT 1 FROM episode_analysis WHERE state = 'running')
+    `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, attempts, reason, created_at, updated_at)
+     SELECT ?, ?, ?, ?, 'running', 1, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM episode_analysis WHERE state = 'running')
      ON CONFLICT (episode_id, size_bytes) DO UPDATE SET state = 'running', job_id = NULL,
-       attempts = episode_analysis.attempts + 1, updated_at = excluded.updated_at
+       attempts = episode_analysis.attempts + 1, reason = COALESCE(excluded.reason, episode_analysis.reason),
+       updated_at = excluded.updated_at
      WHERE episode_analysis.state != 'running'`,
-  ).bind(e.id, size, e.tenant_id, e.library_item_id, now, now).run();
+  ).bind(e.id, size, e.tenant_id, e.library_item_id, reason, now, now).run();
   if (!claim.meta.changes) return `analysis: ${e.id} not started (a job is in flight)`;
+  let jobId: string | null = null;
   try {
     const args = await buildArgs(env, e, origin);
-    const jobId = await runAsync(env, ANALYSIS_PROJECT, ANALYSIS_HANDLER, args);
+    // wharf's dashboard line for the job: which episode it is.
+    const show = await env.DB.prepare('SELECT title FROM podcasts WHERE library_item_id = ?')
+      .bind(e.library_item_id).first<{ title: string | null }>();
+    const label = [show?.title, e.title ?? e.id].filter((x): x is string => !!x && !!x.trim()).join(' \u00b7 ');
+    jobId = await runAsync(env, ANALYSIS_PROJECT, ANALYSIS_HANDLER, args, { label });
     await env.DB.prepare('UPDATE episode_analysis SET job_id = ?, error = NULL, updated_at = ? WHERE episode_id = ? AND size_bytes = ?')
       .bind(jobId, Date.now(), e.id, size).run();
     return `analysis: submitted "${e.title ?? e.id}" as ${jobId}`;
@@ -259,7 +295,9 @@ async function submit(env: Env, e: EpisodeRow, queuedSize: number | null, origin
       ).bind(msg, Date.now(), e.id, size).run();
       return `analysis: ${msg} (left queued)`;
     }
-    await failRow(env, e.id, size, `submit failed: ${msg}`);
+    // runAsync refused: no job ran. A job id here means it was accepted and
+    // only recording it failed; that job may yet run (and cost).
+    await failRow(env, e.id, size, `submit failed: ${msg}`, jobId ? { jobId } : { noJob: true });
     return `analysis: submit failed: ${msg}`;
   }
 }
@@ -295,7 +333,7 @@ async function checkRunning(env: Env, r: RunningRow, now: number): Promise<{ bus
     // Asleep mid-job: the job freezes with the Mac and /jobs/:id reads only
     // reach its own island. Wait, then give it up as lost.
     if (age > lostAfter) {
-      await failRow(env, r.episode_id, r.size_bytes, `no result after ${after} (${errMsg(err)})`);
+      await failRow(env, r.episode_id, r.size_bytes, `${LOST_PREFIX} ${after} (${errMsg(err)})`, { jobId: r.job_id });
       return { busy: false, log: `analysis: ${r.job_id} lost` };
     }
     await env.DB.prepare('UPDATE episode_analysis SET error = ? WHERE episode_id = ? AND size_bytes = ? AND state = ?')
@@ -312,20 +350,28 @@ async function checkRunning(env: Env, r: RunningRow, now: number): Promise<{ bus
       return { busy: false, log: `analysis: ${r.job_id} done (from the job)` };
     } catch (err) {
       if (!e) {
+        // The run still happened (and may have cost): log it before the
+        // rows go.
+        const s = nodeStats(job.result);
+        await recordRun(env, {
+          ...emptyRun({ tenantId: r.tenant_id, episodeId: r.episode_id, libraryItemId: r.library_item_id, outcome: 'error' }),
+          ...s, sizeBytes: r.size_bytes || null, jobId: r.job_id, island: jobIsland(r.job_id) ?? s.island,
+          error: 'the episode is gone', reason: r.reason ?? null,
+        });
         await env.DB.prepare('DELETE FROM episode_analysis WHERE episode_id = ?').bind(r.episode_id).run();
       } else {
-        await failRow(env, r.episode_id, r.size_bytes, `the job's result was unusable: ${errMsg(err)}`);
+        await failRow(env, r.episode_id, r.size_bytes, `the job's result was unusable: ${errMsg(err)}`, { jobId: r.job_id, raw: job.result });
       }
       return { busy: false, log: `analysis: ${r.job_id} result unusable` };
     }
   }
   if (TERMINAL.has(job.state)) {
-    await failRow(env, r.episode_id, r.size_bytes, await jobFailure(env, job));
+    await failRow(env, r.episode_id, r.size_bytes, await jobFailure(env, job), { jobId: r.job_id, raw: job.result });
     return { busy: false, log: `analysis: ${r.job_id} ${job.state}` };
   }
   if (age > lostAfter) {
     await cancelJob(env, r.job_id).catch(() => undefined);
-    await failRow(env, r.episode_id, r.size_bytes, `no result after ${after} (job still ${job.state})`);
+    await failRow(env, r.episode_id, r.size_bytes, `${LOST_PREFIX} ${after} (job still ${job.state})`, { jobId: r.job_id });
     return { busy: false, log: `analysis: ${r.job_id} given up after ${after}` };
   }
   return { busy: true, log: '' };
@@ -333,9 +379,12 @@ async function checkRunning(env: Env, r: RunningRow, now: number): Promise<{ bus
 
 // ─── Choosing the next episode ───────────────────────────────────────────────
 
-type Candidate = EpisodeRow & { show_analyse: string | null; queued_size?: number };
+type Candidate = EpisodeRow & { show_analyse: string | null; queued_size?: number; queued_reason?: string | null };
 
-async function nextCandidate(env: Env, now: number): Promise<Candidate | null> {
+// The run log's `reason` for each kind of pick: a queued row keeps the one
+// it was queued with ("Analyse now" queues 'asked'; an automatic pick that
+// found the Mac asleep keeps its own).
+async function nextCandidate(env: Env, now: number): Promise<(Candidate & { reason: string }) | null> {
   // 1. Asked for (the "Analyse now" route), or an automatic pick that found
   //    the Mac asleep: oldest first. A restitched episode waits for the
   //    chapter pump's re-probe (chapters_checked_at) like any other, and an
@@ -343,7 +392,7 @@ async function nextCandidate(env: Env, now: number): Promise<Candidate | null> {
   //    with an archive in flight sort last, so a run of them can't push a
   //    ready row out of the batch.
   const queued = await env.DB.prepare(
-    `SELECT e.*, p.analyse AS show_analyse, a.size_bytes AS queued_size
+    `SELECT e.*, p.analyse AS show_analyse, a.size_bytes AS queued_size, a.reason AS queued_reason
        FROM episode_analysis a
        JOIN podcast_episodes e ON e.id = a.episode_id
        JOIN podcasts p ON p.library_item_id = e.library_item_id
@@ -351,7 +400,7 @@ async function nextCandidate(env: Env, now: number): Promise<Candidate | null> {
       ORDER BY COALESCE(e.archive_state IN ('queued', 'fetching'), 0) ASC, a.updated_at ASC LIMIT 25`,
   ).all<Candidate>();
   const q = queued.results.find((e) => !waitsForArchive(e));
-  if (q) return q;
+  if (q) return { ...q, reason: q.queued_reason ?? 'asked' };
 
   // 2. Being played, with nothing for the stitch being streamed: results
   //    are a couple of minutes away, so the rest of this listen is right.
@@ -369,7 +418,7 @@ async function nextCandidate(env: Env, now: number): Promise<Candidate | null> {
       ORDER BY mp.last_update DESC LIMIT 10`,
   ).bind(now - PLAYING_MS).all<Candidate>();
   const p = played.results.find((e) => wantsAnalysis(e, e.show_analyse));
-  if (p) return p;
+  if (p) return { ...p, reason: 'played' };
 
   // 3. New episodes on a show, newest first, ready before the first listen.
   //    Shows outer (CROSS JOIN) so idx_episodes_item_published reads only
@@ -382,7 +431,8 @@ async function nextCandidate(env: Env, now: number): Promise<Candidate | null> {
         AND NOT EXISTS (SELECT 1 FROM episode_analysis a WHERE a.episode_id = e.id AND a.size_bytes = e.size_bytes)
       ORDER BY e.published_at DESC LIMIT 25`,
   ).bind(now - RECENT_MS).all<Candidate>();
-  return recent.results.find((e) => wantsAnalysis(e, e.show_analyse)) ?? null;
+  const n = recent.results.find((e) => wantsAnalysis(e, e.show_analyse));
+  return n ? { ...n, reason: 'new' } : null;
 }
 
 // Cron (runPodcastTick) and the routes' waitUntil. Without the router
@@ -404,7 +454,7 @@ export async function analysisPump(env: Env, opts: { origin?: string } = {}): Pr
   }
   if (busy) return log;
   const next = await nextCandidate(env, now);
-  if (next) log.push(await submit(env, next, next.queued_size ?? null, opts.origin ?? analysisOrigin(env)));
+  if (next) log.push(await submit(env, next, next.queued_size ?? null, opts.origin ?? analysisOrigin(env), next.reason));
   return log;
 }
 
@@ -413,10 +463,10 @@ export async function analysisPump(env: Env, opts: { origin?: string } = {}): Pr
 export async function queueAnalysis(env: Env, e: EpisodeRow): Promise<void> {
   const now = Date.now();
   await env.DB.prepare(
-    `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, attempts, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'queued', 0, ?, ?)
+    `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, attempts, reason, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'queued', 0, 'asked', ?, ?)
      ON CONFLICT (episode_id, size_bytes) DO UPDATE SET state = 'queued', attempts = 0, error = NULL, job_id = NULL,
-       updated_at = excluded.updated_at
+       reason = 'asked', updated_at = excluded.updated_at
      WHERE episode_analysis.state != 'running'`,
   ).bind(e.id, e.size_bytes || 0, e.tenant_id, e.library_item_id, now, now).run();
 }
@@ -434,7 +484,7 @@ const text = (v: unknown, max: number): string | null => {
   return t || null;
 };
 
-type ParsedResult = {
+export type ParsedResult = {
   size: number;
   duration: number | null;
   offsets: AnalysisOffset[];
@@ -453,6 +503,10 @@ export function parseResult(body: unknown, submittedSize: number): ParsedResult 
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new AnalysisInputError('the result must be a JSON object');
   const o = body as Record<string, unknown>;
   if (o['ok'] === false) throw new AnalysisInputError(text(o['error'], 300) ?? 'the node reported a failure');
+  // wharf's stand-in for a result over 256 KB it no longer holds (GET
+  // /jobs/:id inlines the real one while the spill file exists). Read as a
+  // result it would store an empty analysis as done.
+  if (o['_wharf_result_spilled'] === true) throw new AnalysisInputError('wharf no longer holds the job\'s result (it was spilled to a file that is gone)');
   const sizeRaw = num(o['sizeBytes']) ?? num(o['size']);
   const size = sizeRaw && sizeRaw > 0 ? Math.round(sizeRaw) : submittedSize > 0 ? submittedSize : 0;
   if (!size) throw new AnalysisInputError('sizeBytes (the measured size of the file analysed) is missing');
@@ -552,6 +606,16 @@ export function summaryFromRow(r: AnalysisRow): AnalysisSummary {
 export async function storeResult(env: Env, e: EpisodeRow, body: unknown, opts: { jobId?: string | null } = {}): Promise<{ size: number; current: boolean }> {
   const r = parseResult(body, e.size_bytes);
   const now = Date.now();
+  // The job this answers and why it ran. The node's POST names no job, so it
+  // is the episode's row in flight, whatever its size: the node stores under
+  // the size it measured, which differs from the one submitted when the
+  // publisher restitched (until 2026-10-13 such a row lost its job id).
+  const prior = (await env.DB.prepare('SELECT size_bytes, state, job_id, reason FROM episode_analysis WHERE episode_id = ?')
+    .bind(e.id).all<Pick<AnalysisRow, 'size_bytes' | 'state' | 'job_id' | 'reason'>>()).results;
+  const running = prior.find((p) => p.state === 'running') ?? null;
+  const jobId = opts.jobId ?? running?.job_id ?? null;
+  const reason = (jobId ? prior.find((p) => p.job_id === jobId)?.reason : null)
+    ?? running?.reason ?? prior.find((p) => p.size_bytes === r.size)?.reason ?? null;
   let transcriptKey: string | null = null;
   if (r.whisper) {
     transcriptKey = transcriptKeyFor(e.id, r.size);
@@ -564,19 +628,26 @@ export async function storeResult(env: Env, e: EpisodeRow, body: unknown, opts: 
     env.DB.prepare("DELETE FROM episode_analysis WHERE episode_id = ? AND size_bytes != ? AND state = 'running'").bind(e.id, r.size),
     env.DB.prepare(
       `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, job_id, attempts, error, duration, model, llm_model,
-         offsets, cuts, ads, chapters, transcript_source, transcript_key, timings, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'done', ?, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         offsets, cuts, ads, chapters, transcript_source, transcript_key, timings, reason, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'done', ?, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (episode_id, size_bytes) DO UPDATE SET state = 'done', job_id = COALESCE(excluded.job_id, episode_analysis.job_id),
+         reason = COALESCE(excluded.reason, episode_analysis.reason),
          error = NULL, duration = excluded.duration, model = excluded.model, llm_model = excluded.llm_model,
          offsets = excluded.offsets, cuts = excluded.cuts, ads = excluded.ads, chapters = excluded.chapters,
          transcript_source = excluded.transcript_source, transcript_key = excluded.transcript_key, timings = excluded.timings,
          updated_at = excluded.updated_at`,
     ).bind(
-      e.id, r.size, e.tenant_id, e.library_item_id, opts.jobId ?? null, r.duration, r.model, r.llmModel,
+      e.id, r.size, e.tenant_id, e.library_item_id, jobId, r.duration, r.model, r.llmModel,
       json(r.offsets), json(r.cuts), json(r.ads), r.generatedChapters ? json(r.generatedChapters) : null,
-      r.transcriptSource, transcriptKey, r.timings, now, now,
+      r.transcriptSource, transcriptKey, r.timings, reason, now, now,
     ),
   ]);
+  // The run log: once per job, whichever of the POST and the pump stores it
+  // first (recordRun dedupes and never throws).
+  await recordRun(env, doneRun(
+    { tenantId: e.tenant_id, episodeId: e.id, libraryItemId: e.library_item_id, showTitle: null, episodeTitle: e.title, jobId, reason },
+    jobIsland(jobId), r, body,
+  ));
 
   // The episode as it is now (the stream route may have recorded a new
   // size while the job ran).
@@ -639,7 +710,7 @@ export async function adoptAnalysisForSize(env: Env, episodeId: string, size: nu
 
 function rowJson(r: AnalysisRow) {
   return {
-    size: r.size_bytes, state: r.state, attempts: r.attempts, error: r.error, jobId: r.job_id, island: jobIsland(r.job_id),
+    size: r.size_bytes, state: r.state, attempts: r.attempts, error: r.error, jobId: r.job_id, island: jobIsland(r.job_id), reason: r.reason ?? null,
     duration: r.duration, model: r.model, llmModel: r.llm_model, transcriptSource: r.transcript_source,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };

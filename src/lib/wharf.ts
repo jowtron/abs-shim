@@ -57,13 +57,56 @@ async function json<T>(res: Response): Promise<T> {
   return body as T;
 }
 
-export async function runAsync(env: Env, project: string, handler: string, args: unknown): Promise<string> {
-  const r = await json<{ job_id: string }>(await call(env, '/run-async', { method: 'POST', body: JSON.stringify({ project_id: project, handler, args }) }));
-  return r.job_id;
+// wharf (v0.2.23+) shows a job's `label` on its dashboard. It is strict at
+// submit time: control characters or more than 200 runes is a 400
+// invalid_field (jobs.ValidateLabel), so clean it the same way its lenient
+// CleanLabel does: controls to spaces, whitespace collapsed, a lone UTF-16
+// surrogate to U+FFFD (it would reach Go as one), and past the limit cut at
+// a code point with an ellipsis. It is logged and listed: never put a
+// secret in one.
+export const LABEL_MAX = 200;
+export function cleanLabel(s: string): string {
+  const t = s
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD')
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const cps = Array.from(t);
+  return cps.length > LABEL_MAX ? cps.slice(0, LABEL_MAX - 1).join('').trimEnd() + '\u2026' : t;
+}
+
+// `label` (optional): see cleanLabel. Older nodes ignore the field. Should a
+// node refuse it anyway, the job is submitted again without one: a label is
+// display only and must never stop the work (or burn an analysis attempt).
+export async function runAsync(env: Env, project: string, handler: string, args: unknown, opts: { label?: string } = {}): Promise<string> {
+  const label = opts.label ? cleanLabel(opts.label) : '';
+  const submit = async (withLabel: boolean) => json<{ job_id: string }>(await call(env, '/run-async', {
+    method: 'POST', body: JSON.stringify({ project_id: project, handler, args, ...(withLabel ? { label } : {}) }),
+  }));
+  try {
+    return (await submit(!!label)).job_id;
+  } catch (err) {
+    if (label && err instanceof WharfError && err.status === 400 && (err.code === 'invalid_field' || /label/i.test(err.message))) {
+      return (await submit(false)).job_id;
+    }
+    throw err;
+  }
 }
 
 export async function getJob(env: Env, id: string): Promise<WharfJob> {
   return json<WharfJob>(await call(env, `/jobs/${encodeURIComponent(id)}`));
+}
+
+// A project's jobs on its home island, newest first (the router's GET /jobs;
+// ids come back namespaced). One page per call: pass `next_cursor` back as
+// `afterId`. Each job carries its args and result, so keep `limit` small for
+// a handler whose results are large.
+export async function listJobs(env: Env, project: string, opts: { limit?: number; afterId?: string; state?: string } = {}): Promise<{ jobs: WharfJob[]; next_cursor?: string }> {
+  const qs = new URLSearchParams({ project_id: project });
+  if (opts.limit) qs.set('limit', String(opts.limit));
+  if (opts.afterId) qs.set('after_id', opts.afterId);
+  if (opts.state) qs.set('state', opts.state);
+  return json<{ jobs: WharfJob[]; next_cursor?: string }>(await call(env, `/jobs?${qs}`));
 }
 
 export async function getJobLog(env: Env, id: string, opts: { offset?: number; tail?: number } = {}): Promise<WharfLog> {
