@@ -32,7 +32,7 @@ requires_capabilities: ["whisper", "ffmpeg"]
 # reads is listed here, and nothing else reaches it.
 #   OPENROUTER_API_KEY     enables the LLM step; without it llm/llmError say
 #                          "skipped: no OPENROUTER_API_KEY"
-#   OPENROUTER_MODEL       default anthropic/claude-sonnet-5
+#   OPENROUTER_MODEL       default anthropic/claude-sonnet-5.5
 #   OPENROUTER_REASONING   low (default) | medium | high | off | default
 #   WHISPER_MODEL_DIR      the node's shared models (/opt/wharf/share/whisper
 #                          on the Mac, /usr/local/share/whisper on stereo-au);

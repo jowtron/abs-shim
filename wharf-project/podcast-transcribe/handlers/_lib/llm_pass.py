@@ -15,7 +15,7 @@ WHARF_ENV_PASSTHROUGH=strict, so the manifest lists each one):
 
   OPENROUTER_API_KEY    required; without it analyse() raises NoApiKey and
                         the handler reports the step as skipped
-  OPENROUTER_MODEL      default anthropic/claude-sonnet-5
+  OPENROUTER_MODEL      default anthropic/claude-sonnet-5.5
   OPENROUTER_REASONING  low (default) | medium | high | off | default
                         (default = send no reasoning param: the model's own)
 
@@ -45,7 +45,7 @@ import argparse, html, json, os, re, sys, time
 import urllib.error, urllib.request
 
 API_URL = 'https://openrouter.ai/api/v1/chat/completions'
-DEFAULT_MODEL = 'anthropic/claude-sonnet-5'   # closest to what the prototype validated (Sonnet, low effort)
+DEFAULT_MODEL = 'anthropic/claude-sonnet-5.5'   # closest to what the prototype validated (Sonnet, low effort)
 DEFAULT_REASONING = 'low'
 RETRYABLE = (408, 429, 500, 502, 503, 504, 529)
 

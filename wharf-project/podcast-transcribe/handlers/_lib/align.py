@@ -39,6 +39,7 @@ from collections import Counter, defaultdict
 TOL = 2.5          # s: anchors within this of a run's offset belong to it
 MIN_RUN = 4        # anchors needed for a run to count
 MIN_EVENT = 4.0    # s: offset changes smaller than this are timing jitter
+SHORT_INSERT = 10.0  # s: insertions shorter than this are never auto-skipped
 
 
 def norm_words(s):
@@ -369,6 +370,10 @@ def classify(sw, mw, prev, nxt, duration, master_end):
         # where the served words don't belong to the master.
         start = place_window(sw, mw, gap_s0, b_s, a_m, b_m, delta)
         conf = 0.95 if served_gap - delta < 6 else (0.85 if foreign_frac > 0.5 else 0.7)
+        # A real inserted ad is 15 s or longer; an insertion under 10 s is
+        # as likely a sting or a misplaced anchor, so it gets the "Skip ad"
+        # pill (< 0.8) rather than an automatic jump (Joseph, 2026-10-13).
+        if delta < SHORT_INSERT: conf = min(conf, 0.7)
         ads.append({'start': round(start, 2), 'end': round(start + delta, 2), 'confidence': conf,
                     'source': 'align', 'kind': 'inserted',
                     'where': 'pre-roll' if prev is None else 'mid-roll'})
