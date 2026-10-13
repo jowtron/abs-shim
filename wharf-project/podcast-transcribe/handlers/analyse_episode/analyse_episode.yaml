@@ -32,7 +32,7 @@ requires_capabilities: ["whisper", "ffmpeg"]
 # reads is listed here, and nothing else reaches it.
 #   OPENROUTER_API_KEY     enables the LLM step; without it llm/llmError say
 #                          "skipped: no OPENROUTER_API_KEY"
-#   OPENROUTER_MODEL       default anthropic/claude-sonnet-5.5
+#   OPENROUTER_MODEL       default anthropic/claude-haiku-5.5
 #   OPENROUTER_REASONING   low (default) | medium | high | off | default
 #   WHISPER_MODEL_DIR      the node's shared models (/opt/wharf/share/whisper
 #                          on the Mac, /usr/local/share/whisper on stereo-au);
@@ -72,7 +72,9 @@ input_schema:
           start: {type: number}
           title: {type: ["string", "null"]}
     title: {type: ["string", "null"]}
+    show: {type: ["string", "null"], description: "The podcast's title, for the LLM prompt (it says \"(unknown)\" without it)."}
     showNotes: {type: ["string", "null"]}
+    dynamicAds: {type: ["boolean", "null"], description: "The host stitches ads in per download (the shim's hasDynamicAds): the LLM step expects pre-, mid- and post-rolls and labels them inserted. Absent or null: the prompt says nothing either way."}
     wantLlm: {type: boolean}
     resultUrl: {type: ["string", "null"]}
     model: {type: string, pattern: "^[A-Za-z0-9._-]+$", description: "Optional model name (e.g. base.en); WHISPER_MODEL / WHISPER_MODEL_READ in .env win over it."}
@@ -98,3 +100,4 @@ output_schema:
     transcript: {type: object, description: "{source: publisher|whisper, cues: [{start, end, speaker, text}]}"}
     stats: {type: object}
     timings: {type: object}
+    _wharf: {type: object, description: "wharf v0.2.23 job cost: {cost_usd}, the sum of OpenRouter's usage.cost over every call the job made (retries included); absent when no call was made"}

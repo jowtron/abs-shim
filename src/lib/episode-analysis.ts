@@ -13,10 +13,12 @@
 // The contract with the node (fixed; the handler is built to it):
 //   submit  project `podcast-transcribe`, handler `analyse_episode`, async,
 //           args {episodeId, libraryItemId, sizeBytes, audioUrl, token,
-//           transcripts, chapters, title, showNotes, wantLlm, resultUrl}.
+//           transcripts, chapters, title, show, dynamicAds, showNotes,
+//           wantLlm, resultUrl} (show and dynamicAds since 2026-10-14;
+//           the node reads both as optional).
 //           audioUrl is this shim's own stream route, so the node gets the
 //           stitch listeners get (the Worker's fetch, EPISODE_AUDIO_UA);
-//           token is a 2-hour access token for the tenant owner.
+//           token is a 20-minute access token for the tenant owner.
 //   result  POSTed to resultUrl with the same bearer, and printed as the
 //           job result, so the pump can take it from the job when the POST
 //           never came. Stored under the size the node MEASURED.
@@ -185,13 +187,15 @@ async function buildArgs(env: Env, e: EpisodeRow, origin: string) {
     'SELECT u.id, u.username FROM tenants t JOIN users u ON u.id = t.owner_user_id WHERE t.id = ?',
   ).bind(e.tenant_id).first<{ id: string; username: string }>();
   if (!owner) throw new Error('the library has no owner to act as');
-  // Never logged: it is a full access token for two hours.
+  // Never logged: it is a full access token (TOKEN_TTL_SECONDS).
   const { token } = await issueAccessToken(env, owner, TOKEN_TTL_SECONDS);
   // The token acts in the owner's default tenant; name this one when it isn't.
   const m = await getActiveMembership(env, owner.id);
   const q = m?.tenantId === e.tenant_id ? '' : `?tenant=${encodeURIComponent(e.tenant_id)}`;
   const chapters = publisherChapters(e);
   const transcripts = transcriptLinks(e);
+  const show = await env.DB.prepare('SELECT title FROM podcasts WHERE library_item_id = ?')
+    .bind(e.library_item_id).first<{ title: string | null }>();
   return {
     episodeId: e.id,
     libraryItemId: e.library_item_id,
@@ -201,6 +205,13 @@ async function buildArgs(env: Env, e: EpisodeRow, origin: string) {
     transcripts,
     chapters: chapters.length ? chapters.map((c) => ({ start: c.start, title: c.title })) : null,
     title: e.title ?? '',
+    // For the LLM prompt (2026-10-14): the show's name, and whether its host
+    // stitches ads in per download. Told that, Haiku 5.5 labels a
+    // host-voiced pre-roll "inserted" (which is skipped automatically)
+    // instead of "host-read"; without either the prompt said "Show:
+    // (unknown)". Both optional on the node.
+    show: show?.title ?? '',
+    dynamicAds: hasDynamicAds(e.enclosure_url),
     showNotes: stripAllTags(e.description ?? '').replace(/\s+/g, ' ').trim().slice(0, 20_000),
     // The LLM labels ads and cuts chapters; without a publisher transcript
     // it also is the only ad finder (align.py needs one), and without
@@ -278,9 +289,7 @@ async function submit(env: Env, e: EpisodeRow, queuedSize: number | null, origin
   try {
     const args = await buildArgs(env, e, origin);
     // wharf's dashboard line for the job: which episode it is.
-    const show = await env.DB.prepare('SELECT title FROM podcasts WHERE library_item_id = ?')
-      .bind(e.library_item_id).first<{ title: string | null }>();
-    const label = [show?.title, e.title ?? e.id].filter((x): x is string => !!x && !!x.trim()).join(' \u00b7 ');
+    const label = [args.show, e.title ?? e.id].filter((x): x is string => !!x && !!x.trim()).join(' \u00b7 ');
     jobId = await runAsync(env, ANALYSIS_PROJECT, ANALYSIS_HANDLER, args, { label });
     await env.DB.prepare('UPDATE episode_analysis SET job_id = ?, error = NULL, updated_at = ? WHERE episode_id = ? AND size_bytes = ?')
       .bind(jobId, Date.now(), e.id, size).run();

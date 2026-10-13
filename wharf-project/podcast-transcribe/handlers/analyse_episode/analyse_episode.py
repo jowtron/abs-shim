@@ -10,16 +10,18 @@ stdin, built by the shim (the contract; see README.md):
     "episodeId": "...", "libraryItemId": "li_...",
     "sizeBytes": 71169166,              # what the shim last saw; may be stale or 0
     "audioUrl": "https://abs-shim.jderrick.app/api/items/<libraryItemId>/file/<ino>",
-    "token": "<2-hour shim access token minted for this job>",
+    "token": "<20-minute shim access token minted for this job>",
     "transcripts": [{"url", "type", "language"}],   # publisher's, ranked, master time
     "chapters": [{"start", "title"}] | null,          # publisher's, master time
     "title": "...", "showNotes": "<p>...</p>",
+    "show": "...", "dynamicAds": true,  # optional, for the LLM prompt (shim since 2026-10-14)
     "wantLlm": false,
     "resultUrl": "https://abs-shim.jderrick.app/..."  # POSTed the result, same bearer
   }
 stdout: exactly one JSON object, the result (the shape of the prototype's
-out/*.result.json, size reported as `sizeBytes`). It is also POSTed to
-resultUrl; printing it is what lets the shim poll the job instead.
+out/*.result.json, size reported as `sizeBytes`; plus `_wharf: {cost_usd}`,
+what the job's OpenRouter calls cost, whenever it made any). It is also
+POSTed to resultUrl; printing it is what lets the shim poll the job instead.
 stderr: progress, i.e. the job log. Never the token.
 
 The audio MUST come through the shim: ad-inserting hosts stitch a different
@@ -400,11 +402,17 @@ def main():
         # `llm` says what happened to the LLM step whenever it was asked for:
         # "ok", or "skipped: no OPENROUTER_API_KEY" / "error: ..." with the
         # same text in llmError. Either way the alignment above is delivered.
+        # What the job spent at OpenRouter, every call counted (retries and
+        # failed answers included): reported as `_wharf.cost_usd`, wharf
+        # v0.2.23's per-job cost, whenever a call was made.
+        spend = {'calls': 0, 'usd': 0.0}
         if args.get('wantLlm'):
             t = time.time()
             try:
+                dyn = args.get('dynamicAds')   # the shim's hasDynamicAds(); absent from older shims
                 llm_ads, llm_ch, meta = L.analyse(wj, dur, show=args.get('show') or args.get('showTitle') or '',
-                                                  title=args.get('title') or '', notes=args.get('showNotes') or '')
+                                                  title=args.get('title') or '', notes=args.get('showNotes') or '',
+                                                  dynamic_ads=dyn if isinstance(dyn, bool) else None, spend=spend)
                 for ad in llm_ads:   # an LLM ad overlapping an aligned one adds nothing
                     if not any(x['start'] < ad['end'] and ad['start'] < x['end'] for x in result['ads']):
                         result['ads'].append({**ad, 'source': 'llm'})
@@ -422,6 +430,9 @@ def main():
                 result['llm'] = result['llmError'] = f'error: {str(e)[:400]}'
                 log(f'llm failed, result has no LLM ads/chapters: {e}')
             timings['llm'] = round(time.time() - t, 2)
+        if spend['calls']:
+            result['_wharf'] = {'cost_usd': round(spend['usd'], 8)}
+            log(f"openrouter: {spend['calls']} call(s), ${spend['usd']:.6f}")
         result['ads'].sort(key=lambda x: x['start'])
         timings['total'] = round(time.time() - T0, 2)
 

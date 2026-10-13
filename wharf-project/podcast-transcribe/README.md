@@ -63,8 +63,8 @@ Owned by the daemon's user, mode 600. Edit as that user, then reload (wharfd rea
 
 | key | |
 |---|---|
-| `OPENROUTER_API_KEY` | enables the LLM step. Unset (today, both nodes): jobs still complete, and a `wantLlm` result carries `llm` and `llmError` = `"skipped: no OPENROUTER_API_KEY"` and no LLM ads or chapters |
-| `OPENROUTER_MODEL` | OpenRouter slug, default `anthropic/claude-sonnet-5.5` |
+| `OPENROUTER_API_KEY` | enables the LLM step. Unset: jobs still complete, and a `wantLlm` result carries `llm` and `llmError` = `"skipped: no OPENROUTER_API_KEY"` and no LLM ads or chapters |
+| `OPENROUTER_MODEL` | OpenRouter slug, default `anthropic/claude-haiku-5.5` (since 2026-10-14; `anthropic/claude-sonnet-5.5` before). See "The LLM step" for the alternatives |
 | `OPENROUTER_REASONING` | `low` (default), `medium`, `high`, `off` or `default` (send no reasoning param); see the LLM step for why this matters |
 | `WHISPER_MODEL_DIR` | the node's shared whisper models; install.sh sets it. The project's `data/models` is searched after it |
 | `WHISPER_MODEL` | model override for every job: a name (`tiny.en`, `base.en`, `large-v3-turbo`) or an absolute path to a ggml `.bin` |
@@ -97,11 +97,13 @@ Project `podcast-transcribe`, handler `analyse_episode`, async only. The shim su
 |---|---|
 | `episodeId`, `libraryItemId` | required |
 | `audioUrl` | required: the shim's stream route, `https://abs-shim.jderrick.app/api/items/<libraryItemId>/file/<ino>` (a `?tenant=` query is fine) |
-| `token` | required: a shim access token minted for this job, 2 h |
+| `token` | required: a shim access token minted for this job, 20 minutes |
 | `sizeBytes` | what the shim last saw; may be stale, 0 or null |
 | `transcripts` | `[{url, type, language}]`, the publisher's, ranked by the shim, master time |
 | `chapters` | `[{start, title}]` or null, the publisher's, master time |
 | `title`, `showNotes` | for the LLM (HTML is stripped) |
+| `show` | the podcast's title, for the LLM prompt (since 2026-10-14; without it the prompt says "Show: (unknown)") |
+| `dynamicAds` | the shim's `hasDynamicAds()`: the host stitches ads in per download. The prompt then expects pre-, mid- and post-rolls and says they are `inserted` even when a host voices them; `false` says inserted ads are unlikely; absent or null says nothing (since 2026-10-14) |
 | `wantLlm` | run the LLM step |
 | `resultUrl` | where to POST the result |
 | `model` | optional whisper model name; `.env` overrides win over it |
@@ -116,7 +118,7 @@ Input validation is `warn`, not enforce: the shim ships on its own cadence and t
 4. fetches the first transcript in `transcripts[]` that parses into at least 20 timed cues (WebVTT, SRT or Podcasting 2.0 JSON; text and HTML links carry no times and are skipped; an editor SRT that starts at 01:00:00 is shifted back when the shifted cues then fit the file);
 5. whisper.cpp with the node's model for that case (see "Which model");
 6. with a publisher transcript: `align.py` (offsets, cuts, inserted ads; publisher cues and chapters shifted into served time). Without one: whisper's cues, publisher chapters passed through unaligned;
-7. if `wantLlm`: `llm_pass.py` labels ad reads and, when there are no chapters yet, writes chapters; LLM ads that overlap an aligned ad are dropped. With no key, or on any LLM error, the job still succeeds (see `llm` below);
+7. if `wantLlm`: `llm_pass.py` labels ad reads and, when there are no chapters yet, writes chapters; LLM ads that overlap an aligned ad are dropped. With no key, or on any LLM error, the job still succeeds (see `llm` below). What every OpenRouter call cost is summed into `_wharf.cost_usd`;
 8. POSTs the result to `resultUrl` with the same bearer, as `application/json`: 2xx is delivered; 408, 429, 5xx and network errors are retried 3 times (5 s, 20 s, 60 s); any other 4xx is final; redirects are not followed;
 9. **always** prints the result to stdout as the job result, also when the POST failed, so the shim can poll `GET /jobs/<id>` instead.
 
@@ -141,22 +143,41 @@ Input validation is `warn`, not enforce: the shim ships on its own cadence and t
 - `ads[].source` is `align` (with `where`: pre-roll, mid-roll, post-roll, replacement, swap) or `llm` (with `label`); `kind` is `inserted`, `host-read` or `promo`. LLM `promo` ranges should not be auto-skipped: Haiku called LUP's own housekeeping a promo.
 - `chapters[].source`: `publisher` or `llm`. `stats.chaptersAligned` false means publisher chapters passed through in master time (no transcript to align against).
 - `transcript.source`: `publisher` (shifted cues, with speakers) or `whisper` (no speakers).
-- **`llm`**, present only when `wantLlm` was true: `"ok"` (then `llmModel`, e.g. `anthropic/claude-sonnet-5.5`, and `stats.llm` = `{backend: "openrouter", model, requestedModel, reasoning, structuredOutput, usage: {prompt_tokens, completion_tokens, reasoning_tokens}, costUsd, lines, promptChars}`), `"skipped: no OPENROUTER_API_KEY"`, or `"error: …"` (refusal, `max_tokens`, HTTP failure); when it isn't ok, `llmError` carries the same text. Note for the shim: `llmModel` stays null then, so don't fall back to reading a model name out of `llm`.
+- **`llm`**, present only when `wantLlm` was true: `"ok"` (then `llmModel`, e.g. `anthropic/claude-haiku-5.5`, and `stats.llm` = `{backend: "openrouter", model, requestedModel, reasoning, structuredOutput, usage: {prompt_tokens, completion_tokens, reasoning_tokens}, costUsd, lines, promptChars}`, where `usage` is the final answer's and `costUsd` the whole step's, every billed attempt included), `"skipped: no OPENROUTER_API_KEY"`, or `"error: …"` (refusal, `max_tokens`, HTTP failure); when it isn't ok, `llmError` carries the same text. Note for the shim: `llmModel` stays null then, so don't fall back to reading a model name out of `llm`.
+- **`_wharf: {cost_usd}`** (since 2026-10-14, for wharf v0.2.23's per-job cost): the sum of OpenRouter's `usage.cost` over every call the job made, retries and failed answers included (an empty completion, an answer that hit `max_tokens` or didn't parse are billed too), so it is there after an LLM error as well. Absent when no call was made (`wantLlm` false, or no key). The shim's run log takes it as the cost when `stats.llm.costUsd` is missing. Caveat from the tuning: OpenRouter reported cost 0 for Gemini calls it routed via Google AI Studio, so a Gemini job may under-report.
 - `timings.total` excludes the POST. Results are ~50-200 KB an hour of audio (the transcript); wharf stores up to 256 KB inline and spills larger ones beside the job log, which `GET /jobs/<id>` reassembles transparently.
 
 **Failure:** a non-zero exit with a last stderr line `ERROR: <Type>: <message>`, which wharf puts in the job's `error` (e.g. `audio fetch: HTTP 401 from https://abs-shim.jderrick.app/api/items/.../file/...`). Nothing is POSTed on failure.
 
 **Idempotent:** all scratch (~250 MB an hour: the audio plus the wav) lives in `scratch/<job>/`, removed by the handler and again by wharf's `cleanup_dirs`; a re-run gives the same result apart from timings (unless the host served a different stitch, which is then what the result describes).
 
-**The job token** is sent only to `audioUrl` and `resultUrl`, only over https (plain http is allowed to 127.0.0.1/localhost, for tests), and never across a redirect to another origin: urllib copies `Authorization` onto a redirected request, so a cross-origin redirect is refused rather than followed (the shim proxies episode audio and never redirects it). Publisher transcripts are fetched without it. It never appears in the job log. It does sit in the job's `args`, which wharf keeps in its database for 30 days and returns from `GET /jobs/<id>` to any credential for this project; the 2-hour lifetime is what bounds that.
+**The job token** is sent only to `audioUrl` and `resultUrl`, only over https (plain http is allowed to 127.0.0.1/localhost, for tests), and never across a redirect to another origin: urllib copies `Authorization` onto a redirected request, so a cross-origin redirect is refused rather than followed (the shim proxies episode audio and never redirects it). Publisher transcripts are fetched without it. It never appears in the job log. It does sit in the job's `args`, which wharf keeps in its database for 30 days and returns from `GET /jobs/<id>` to any credential for this project; the token's 20-minute lifetime is what bounds that (wharfd v0.2.22 and later keep token-like args out of their "run-async accepted" log line, not out of the database).
 
 ## The LLM step
 
 `handlers/_lib/llm_pass.py`, modelled on eastsidefm's `core/chapter_pipeline.py` (`run_llm`) and its CLAUDE.md "Models (via OpenRouter)": plain HTTPS (urllib, so no node needs a venv) to `POST https://openrouter.ai/api/v1/chat/completions` with `Authorization: Bearer $OPENROUTER_API_KEY`, `usage: {include: true}` for inline token and cost accounting, and `response_format: {type: "json_schema", json_schema: {strict: true, …}}`. The reply is still parsed tolerantly (code fences, prose around the object), and a provider that answers 400 to `response_format` is retried once without it, relying on the prompt. 408/429/5xx (honouring `retry-after`), network errors, a 200 carrying a retryable `error` object, and empty completions are retried, 4 attempts in all. A refusal, a `length` finish or anything else becomes `llm: "error: …"`.
 
-Default `anthropic/claude-sonnet-5.5` with reasoning `low` (a 2026-10-13 comparison on LUP 688 + a Fish episode, 12 calls: Sonnet 5.5 and Gemini 3.8 Flash found every known ad read within 15 s and invented none, but Gemini labelled the inserted pre-roll `host-read` in 4 of 4 runs, which downgrades auto-skip to a button, named chapters after the ad, and cut Fish into one chapter per fact; Sonnet costs ≈ $0.07 an episode, Gemini ≈ $0.03, so the saving doesn't pay; `anthropic/claude-haiku-5.5` (≈ $0.004) also said `host-read`, called LUP's housekeeping a promo in both runs and invented 2–4 low-confidence promos, so it is out too), the closest to what the prototype validated (Sonnet; Haiku had called LUP's own housekeeping a promo). The gotchas carried over from eastsidefm: `anthropic/*` never gets `temperature` (Claude 4.7+ rejects it) and Claude 5 can't turn thinking off (so `off` sends effort `low` there); other models get `temperature: 0.1`; Gemini thinking is billed at output rates and dominates cost unless a reasoning override is sent, but `low` on `google/gemini-3.8-flash` means **zero** thinking and over-consolidated chapters, so for that model use `medium`, or accept `default` and the cost.
+Default `anthropic/claude-haiku-5.5` with reasoning `low`, since 2026-10-14 (it was `anthropic/claude-sonnet-5.5`). The prompt (P5 of the tuning) gives the transcript as paragraphs of ~15 s with one `m:ss` stamp each, a new one at every pause of 2 s or more (the per-line `[MM:SS]` stamps of the first prompt were a fifth of the tokens); asks for each ad's first words and the show's first words after it, which `clean()` finds within 30 s of the chosen line and moves the edge onto (an ad also ends on its last word when 3 s or more of music or silence follows); defines the kinds by where an ad sits and who made it, not who voices it (anything before the show's opening or after its goodbye is `inserted`, a produced trailer for another podcast is `inserted`, the hosts' own plug is `promo`, housekeeping is not an ad); says whether the host inserts ads (`dynamicAds`); and sets the chapter count by length. `clean()` then drops anything under confidence 0.5, needs 0.7 and 15 s for `inserted` (the kind skipped without asking), keeps chapter starts out of ad reads, and drops a 0:00 chapter that is only the pre-roll.
 
-No key exists yet, so the request construction and the parse paths were tested against a stub on 2026-10-13 (both model families, the 429-in-body retry, the 400 `response_format` fallback, fenced and prose-wrapped JSON, bad settings, no key), and the no-key path end to end. There is no `claude -p` path: handlers run as `_wharf` or `wharf`, which have no Claude Code login. An hour of audio is ~1,300 transcript lines, ~26k input tokens.
+The evidence (2026-10-13/14, six episodes: LINUX Unplugged 688, three Fish stitches, This American Life 899 and Linux Matters; ~160 runs, ~$1.23; list prices per hour of audio, uncached):
+
+| model, prompt | $ / hour | inserted spots labelled inserted | false skips | other invented | ad edge error, median / max | chapter hit rate |
+|---|---|---|---|---|---|---|
+| Sonnet 5.5, first prompt (the old default) | 0.065 | 8/8 | 0 | 0 | 0.3 / 11.2 s | 0.83 |
+| Haiku 5.5, first prompt | 0.0034 | 2/8 | 1 | 6 | - | 0.68 |
+| Gemini 3.8 Flash low, first prompt | 0.022 | 0/2 | 0 | 0 | - | 0.85 |
+| Sonnet 5.5, P3 | 0.054 | 6/6 | 0 | 0 | 0.3 / 5.7 s | 0.92 |
+| Gemini 3.8 Flash low, P3 | 0.016 | 12/12 | 0 | 0 | 0.3 / 2.3 s | 0.93 |
+| **Haiku 5.5, P5 (the default)** | **0.0033** | **12/12** | **0** | 3 | 0.3 / 2.3 s | 0.62 |
+| `openai/gpt-6-luna`, P5 | 0.0022 | 12/12 | 0 | 1 | 0.3 / 2.3 s | 0.79 |
+
+P3 is P5 without its last refinements. Rejected: Gemini 3.5 Flash-Lite (two false skips, missed an iHeart spot), DeepSeek V4.1 Flash (10k reasoning tokens, 54 s), Qwen 3.8 Flash (broken JSON), OpenRouter's `:batch` (half price, but asynchronous: median 7 min, up to 24 h). A real check on 2026-10-14 through the repo's `analyse()`: Haiku on the archived Peanut file found both inserted McDonald's spots, $0.0024.
+
+What Haiku does worse: chapters (hit rate 0.62-0.69 against Sonnet's 0.83-0.92; sometimes 13-15 an hour; bland opening titles; a chapter-focused prompt didn't help). About one run in four adds a promo or host-read that isn't one (This American Life's break bumper, a Patreon plug): not skipped automatically, but `skip.ads: 'all'` would skip it. About one run in three thinks for 1-4k tokens (worst seen $0.0046 an hour). The 0.7 / 15 s guard on `inserted` could drop a real spot the model is unsure of (it didn't in testing).
+
+Switching is one line in the node's `.env`: `OPENROUTER_MODEL=google/gemini-3.8-flash` for the best chapters at ~$0.016 an hour, or `OPENROUTER_MODEL=openai/gpt-6-luna` (~$0.002 an hour, cleaner chapters than Haiku, as good on ads with this prompt, though under P3's wording it once called both iHeart mid-rolls `promo`); reload the project after editing. The gotchas carried over from eastsidefm: `anthropic/*` never gets `temperature` (Claude 4.7+ rejects it) and Claude 5 can't turn thinking off (so `off` sends effort `low` there); other models get `temperature: 0.1`; Gemini thinking is billed at output rates. With the first prompt `low` on `google/gemini-3.8-flash` meant zero thinking and over-consolidated chapters; with P3 it scored the best chapters of all, so `low` is fine there now.
+
+Before the key existed, the request construction and the parse paths were tested against a stub on 2026-10-13 (both model families, the 429-in-body retry, the 400 `response_format` fallback, fenced and prose-wrapped JSON, bad settings, no key), and the no-key path end to end; the cost accounting (`_wharf.cost_usd`, billed retries, a raise after a billed answer) was tested the same way on 2026-10-14, and the whole handler against a stub shim and a stub OpenRouter. There is no `claude -p` path: handlers run as `_wharf` or `wharf`, which have no Claude Code login. An hour of audio is ~200 paragraphs, ~23k input tokens with Claude's tokenizer (~16k with gpt-6-luna's), against ~1,300 lines and ~29k with the first prompt.
 
 ## Testing by hand
 
@@ -173,7 +194,7 @@ with `args.json` holding a 2-hour token minted the way the shim mints it (HS256 
 
 ## stereo-au
 
-Deployed on 2026-10-13 with `./install.sh stereo-au` (Joseph approved it as the fallback): registered and approved, `.env` with `WHISPER_MODEL_DIR=/usr/local/share/whisper`, wharfd reloaded, never restarted (same PID throughout). Right after the deploy the node's capability set had no `whisper` or `ffmpeg` (its last detection pass predated the wharf session's install of them), so a submit would have been refused with 422 `capability_unavailable`; wharfd's periodic re-detect picked both up within minutes ("detected: curl-impersonate, ffmpeg, patchright, systemctl, whisper"). Still open: no job has run there yet, and it has no `OPENROUTER_API_KEY` (LLM steps report skipped). A first real job is best run outside PBX hours.
+Deployed on 2026-10-13 with `./install.sh stereo-au` (Joseph approved it as the fallback): registered and approved, `.env` with `WHISPER_MODEL_DIR=/usr/local/share/whisper`, wharfd reloaded, never restarted (same PID throughout). Right after the deploy the node's capability set had no `whisper` or `ffmpeg` (its last detection pass predated the wharf session's install of them), so a submit would have been refused with 422 `capability_unavailable`; wharfd's periodic re-detect picked both up within minutes ("detected: curl-impersonate, ffmpeg, patchright, systemctl, whisper"). Updated on 2026-10-14 the same way for the Haiku prompt and `_wharf.cost_usd` (handler hash `296141188aad…`, wharfd v0.2.23, same PID throughout); its `.env` by then had `OPENROUTER_API_KEY` and no `OPENROUTER_MODEL`, so the Haiku default applies there. A first real job is best run outside PBX hours. The Mac needs the same update (`sudo ./install.sh mac`), or the two islands run different prompts and only stereo-au reports `_wharf`.
 
 ## Gotchas
 

@@ -92,7 +92,10 @@ export function knownCost(llm: RunLlm, reported: number | null): number | null {
 // timings, llm, and stats.llm = {model, usage: {prompt_tokens,
 // completion_tokens, reasoning_tokens}, costUsd}. Loose on purpose: it also
 // reads a result that failed parseResult, so a run with an unusable result
-// still records what it cost.
+// still records what it cost. Since 2026-10-14 the node also puts
+// `_wharf: {cost_usd}` at the top (wharf v0.2.23's per-job cost: every
+// OpenRouter call the job made, retries included, and absent when it made
+// none); it is the cost when stats.llm has none, as after an LLM error.
 export function nodeStats(raw: unknown): Pick<RunRecord,
   'island' | 'whisperBackend' | 'whisperSeconds' | 'totalSeconds' | 'llm' | 'llmModel' | 'tokensIn' | 'tokensOut' | 'tokensReasoning' | 'costUsd' | 'audioSeconds' | 'whisperModel'> {
   // No result object at all (a failed job), or wharf's marker for a result
@@ -116,7 +119,7 @@ export function nodeStats(raw: unknown): Pick<RunRecord,
     tokensIn: int(usage['prompt_tokens']),
     tokensOut: int(usage['completion_tokens']),
     tokensReasoning: int(usage['reasoning_tokens']),
-    costUsd: given ? knownCost(llm, num(sl['costUsd'])) : null,
+    costUsd: given ? knownCost(llm, num(sl['costUsd']) ?? num(obj(o['_wharf'])?.['cost_usd'])) : null,
     audioSeconds: dur && dur > 0 ? dur : null,
     whisperModel: str(o['model'], 80),
   };
