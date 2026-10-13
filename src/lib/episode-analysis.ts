@@ -482,8 +482,12 @@ export function parseResult(body: unknown, submittedSize: number): ParsedResult 
   }
 
   const llm = o['llm'];
+  // A string `llm` is a model name only when the step ran: with no key the
+  // handler sets `llm` to "skipped: no OPENROUTER_API_KEY" and `llmError`,
+  // which must not be stored as a model.
   const llmModel = text(o['llmModel'], 80) ?? text(o['llm_model'], 80)
-    ?? (llm && typeof llm === 'object' ? text((llm as Record<string, unknown>)['model'], 80) : text(llm, 80));
+    ?? (llm && typeof llm === 'object' ? text((llm as Record<string, unknown>)['model'], 80)
+      : o['llmError'] ? null : text(llm, 80));
   let timings: string | null = null;
   if (o['timings'] && typeof o['timings'] === 'object') {
     const j = JSON.stringify(o['timings']);
