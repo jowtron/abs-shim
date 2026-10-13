@@ -21,6 +21,8 @@ import { passkeyRoutes } from './routes/passkeys';
 import { audibleRoutes } from './routes/audible';
 import { podcastRoutes, podcastSearchRoutes } from './routes/podcasts';
 import { playlistRoutes } from './routes/playlists';
+import { pushRoutes } from './routes/push';
+import { cleanPushLog } from './lib/push';
 import { runPodcastTick } from './lib/podcasts';
 import { runCatalogTick } from './lib/abb-catalog';
 import { signupRoutes } from './routes/signup';
@@ -500,6 +502,7 @@ app.route('/api/libraries', libraryRoutes);
 app.route('/api/items', itemRoutes);
 app.route('/api/podcasts', podcastRoutes);
 app.route('/api/playlists', playlistRoutes);
+app.route('/api/push', pushRoutes);
 app.route('/api/search', podcastSearchRoutes);
 app.route('/api/authors', authorRoutes);
 app.route('/api/auth/passkey', passkeyRoutes);
@@ -833,5 +836,7 @@ export default {
     // A node that stopped reporting on rclone's pCloud token is as quiet as
     // a revoked one.
     ctx.waitUntil(checkSilentNodes(env).catch((e: Error) => console.error('[node-health] ' + e.message)));
+    // Push log rows older than 30 days (an indexed range delete; usually nothing).
+    ctx.waitUntil(cleanPushLog(env).catch((e: Error) => console.error('[push] log cleanup: ' + e.message)));
   },
 };

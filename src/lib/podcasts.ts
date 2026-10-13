@@ -18,6 +18,7 @@ import { decodeFeedBytes, episodeKey, parseFeed, type FeedEpisode, type ParsedFe
 import { cuesToServed, currentAnalysis, episodeExt, EPISODE_AUDIO_UA } from './podcast-shapes';
 import { parseTranscript, rankTranscripts, type Transcript, type TranscriptCue } from './transcript';
 import { analysisPump, whisperTranscriptFor } from './episode-analysis';
+import { announceNewEpisodes } from './push';
 import {
   pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudStat, type PcloudProfile,
 } from '../storage/pcloud';
@@ -323,8 +324,8 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<string> {
     env.DB.prepare(
       `INSERT INTO podcasts (library_item_id, tenant_id, feed_url, title, author, description, release_date, genres,
          image_url, cover_url, itunes_page_url, itunes_id, itunes_artist_id, explicit, language, podcast_type,
-         auto_download, max_new_episodes_to_download, archive, next_check_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         auto_download, max_new_episodes_to_download, archive, next_check_at, parse_version, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       itemId, a.tenantId, a.feedUrl, title,
       feed?.metadata.author || str('author') || itunes?.artistName || null,
@@ -343,6 +344,11 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<string> {
       0,   // max_new_episodes_to_download: 0 = every new episode lands on the show (migration 0023)
       a.archive ? 1 : 0,
       a.deferFetch ? now : now + POLL_EVERY_MS,
+      // The feed was just read by this parser, so its first poll is an
+      // ordinary one. Left at 0 (as it was until 2026-10-13) that poll was a
+      // full re-read, and one that counts as a reparse can't announce a new
+      // episode (refreshPodcast). A deferred OPML show hasn't been read: 0.
+      feed ? PARSE_VERSION : 0,
       now, now,
     ),
   ]);
@@ -639,6 +645,26 @@ export async function refreshPodcast(env: Env, p: PodcastRow, opts: { force?: bo
       .bind(got.etag, got.lastModified, PARSE_VERSION, p.library_item_id).run();
     if (added.length) {
       await env.DB.prepare('UPDATE library_items SET updated_at = ? WHERE id = ?').bind(now, p.library_item_id).run();
+    }
+    // New-episode push notifications (src/lib/push.ts). `added` is what this
+    // check INSERTED and put on the show, newest first: a guid re-key is an
+    // update and never in it, and episodes/add and play-to-add don't come
+    // through here. A check counts only when this parser had read the feed
+    // before: not a PARSE_VERSION re-read and not an OPML show's first fetch
+    // (both have a stale parse_version), whose inserts are the back
+    // catalogue, not news. A show first fetched by createPodcast never gets
+    // here for its initial episodes, and one subscribed while its feed was
+    // still empty does count, rightly: its first episodes are new. The
+    // three-day publication window is applied in announceNewEpisodes.
+    // Awaited, so it runs inside the cron's or the request's lifetime; a
+    // failure must not be recorded as the feed's.
+    if (added.length && !reparse) {
+      try {
+        const line = await announceNewEpisodes(env, fresh ?? p, added);
+        if (line) console.log('[push] ' + line);
+      } catch (e) {
+        console.error(`[push] ${p.library_item_id}: ${(e as Error).message}`);
+      }
     }
     return { notModified: false, added };
   } catch (e) {

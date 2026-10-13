@@ -43,4 +43,12 @@ export type Env = {
   // Shared key the wharf nodes send with their hourly pCloud-token report
   // (POST /api/node-health, ops/pcloud-health/). Unset = the route answers 503.
   NODE_HEALTH_KEY?: string;
+  // Web Push (src/lib/push.ts): the VAPID pair new-episode notifications are
+  // signed with. Public = base64url 65-byte uncompressed P-256 point, private
+  // = base64url 32-byte scalar. Unset = /api/push/status says configured:
+  // false. NEVER rotate once devices have subscribed (see pushConfig).
+  // VAPID_SUBJECT overrides the JWT's `sub` (default the shim's https URL).
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_KEY?: string;
+  VAPID_SUBJECT?: string;
 };
