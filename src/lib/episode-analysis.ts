@@ -47,7 +47,11 @@ const RECENT_MS = 14 * 86400_000;          // new episodes analysed ahead of the
 const PLAYING_MS = 2 * 3600_000;           // "being played": progress written this recently
 const UNSUBMITTED_AFTER_MS = 5 * 60_000;   // a claim whose submit never finished
 const MAX_ATTEMPTS = 3;
-const TOKEN_TTL_SECONDS = 2 * 3600;
+// wharfd logs a job's full args, token included, so keep it short: the shim
+// has one job in flight, so the node fetches the audio within a minute of the
+// submit, and a result POST after expiry (a long stereo-au run) is covered by
+// the pump taking the result from the finished job (2026-10-13).
+const TOKEN_TTL_SECONDS = 20 * 60;
 const KEEP_ROWS = 2;
 // "Right box, wrong moment" (and "no box routed yet"): the row stays queued
 // and costs no attempt.
