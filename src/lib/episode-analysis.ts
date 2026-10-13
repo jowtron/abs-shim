@@ -431,12 +431,14 @@ async function nextCandidate(env: Env, now: number): Promise<(Candidate & { reas
 
   // 3. New episodes on a show, newest first, ready before the first listen.
   //    Shows outer (CROSS JOIN) so idx_episodes_item_published reads only
-  //    each show's recent episodes.
+  //    each show's recent episodes. Not a show nobody follows (migration
+  //    0028): nobody is about to listen to it.
   const recent = await env.DB.prepare(
     `SELECT e.*, p.analyse AS show_analyse
        FROM podcasts p
        CROSS JOIN podcast_episodes e ON e.library_item_id = p.library_item_id AND e.in_library = 1 AND e.published_at > ?
       WHERE (p.analyse IS NULL OR p.analyse != 'off') AND e.chapters_checked_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM podcast_follows f WHERE f.library_item_id = p.library_item_id)
         AND NOT EXISTS (SELECT 1 FROM episode_analysis a WHERE a.episode_id = e.id AND a.size_bytes = e.size_bytes)
       ORDER BY e.published_at DESC LIMIT 25`,
   ).bind(now - RECENT_MS).all<Candidate>();

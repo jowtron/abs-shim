@@ -232,13 +232,18 @@ adminRoutes.post('/libraries', requireTenantOwner, async (c) => {
 // ─── Podcasts (owner/member overview for /admin) ────────────────────────────
 
 // Every show in a podcast library with what /admin's Podcasts panel shows:
-// episode counts, archive progress, the last check and its error, and the
-// episode analysis setting with its counts and latest problem.
+// episode counts, archive progress, the last check and its error, the
+// episode analysis setting with its counts and latest problem, and who
+// follows it (migration 0028): the count and whether the caller does for
+// everyone, the usernames for the owner. Every show, followed or not: this
+// is where the owner sees the whole library, idle shows included.
 adminRoutes.get('/libraries/:libId/podcasts', async (c) => {
   const tenantId = c.get('tenantId');
   const r = await c.env.DB.prepare(
     `SELECT p.library_item_id, p.title, p.author, p.feed_url, p.archive, p.auto_download, p.last_episode_check,
             p.next_check_at, p.last_error, p.check_failures, li.rel_path,
+            (SELECT COUNT(*) FROM podcast_follows f WHERE f.library_item_id = p.library_item_id) AS followers,
+            EXISTS (SELECT 1 FROM podcast_follows f WHERE f.user_id = ? AND f.library_item_id = p.library_item_id) AS following,
             (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.in_library = 1) AS on_show,
             (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id) AS in_feed,
             (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.archive_state = 'done') AS archived,
@@ -257,8 +262,26 @@ adminRoutes.get('/libraries/:libId/podcasts', async (c) => {
        FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
       WHERE li.library_id = ? AND p.tenant_id = ?
       ORDER BY p.title COLLATE NOCASE`,
-  ).bind(c.req.param('libId'), tenantId).all<Record<string, unknown>>();
-  return c.json({ podcasts: r.results.map((p) => ({ ...p, analysis_island: jobIsland(p['analysis_job'] as string | null) })) });
+  ).bind(c.get('userId'), c.req.param('libId'), tenantId).all<Record<string, unknown>>();
+  // Who follows what, for the owner only: a member's list is theirs.
+  const names = new Map<string, string[]>();
+  if (c.get('tenantRole') === 'owner' && r.results.length) {
+    const f = await c.env.DB.prepare(
+      `SELECT f.library_item_id, u.username FROM podcast_follows f
+         JOIN library_items li ON li.id = f.library_item_id
+         JOIN users u ON u.id = f.user_id
+        WHERE li.library_id = ? AND f.tenant_id = ? ORDER BY u.username COLLATE NOCASE`,
+    ).bind(c.req.param('libId'), tenantId).all<{ library_item_id: string; username: string }>();
+    for (const row of f.results) names.set(row.library_item_id, [...(names.get(row.library_item_id) ?? []), row.username]);
+  }
+  return c.json({
+    podcasts: r.results.map((p) => ({
+      ...p,
+      following: p['following'] === 1,
+      ...(c.get('tenantRole') === 'owner' ? { follower_names: names.get(p['library_item_id'] as string) ?? [] } : {}),
+      analysis_island: jobIsland(p['analysis_job'] as string | null),
+    })),
+  });
 });
 
 // Owner-only, one-off and idempotent: fill the episode analysis run log
@@ -712,12 +735,16 @@ adminRoutes.post('/libraries/:id/scan', async (c) => {
   // A podcast library has nothing to walk — its shows come from feeds. A
   // "scan" there (Pholia's Rescan, /admin's Scan) checks those feeds now,
   // skipping any checked in the last five minutes, the rest left to the cron.
+  // The caller's shows only (migration 0028): that's their list, and a show
+  // nobody follows is idle.
   if (scope.library.media_type === 'podcast') {
     const due = await c.env.DB.prepare(
-      `SELECT p.* FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
-        WHERE li.library_id = ? AND p.tenant_id = ? AND COALESCE(p.last_episode_check, 0) < ?
+      `SELECT p.* FROM podcast_follows f
+         JOIN podcasts p ON p.library_item_id = f.library_item_id
+         JOIN library_items li ON li.id = p.library_item_id
+        WHERE f.user_id = ? AND li.library_id = ? AND p.tenant_id = ? AND COALESCE(p.last_episode_check, 0) < ?
         ORDER BY COALESCE(p.last_episode_check, 0) ASC LIMIT 15`,
-    ).bind(scope.library.id, tenantId, Date.now() - 5 * 60 * 1000).all<PodcastRow>();
+    ).bind(c.get('userId'), scope.library.id, tenantId, Date.now() - 5 * 60 * 1000).all<PodcastRow>();
     let added = 0;
     const errors: Array<{ relPath: string; reason: string }> = [];
     for (const p of due.results) {
@@ -1439,6 +1466,10 @@ adminRoutes.delete('/items/:itemId', requireTenantOwner, async (c) => {
     c.env.DB.prepare('DELETE FROM playlist_items WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM podcast_episodes WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM podcasts WHERE library_item_id = ?').bind(itemId),
+    // Everyone's follows and hidden episodes of a deleted show (the
+    // library_items cascade would take them too; said here like the rest).
+    c.env.DB.prepare('DELETE FROM podcast_follows WHERE library_item_id = ?').bind(itemId),
+    c.env.DB.prepare('DELETE FROM podcast_episode_hidden WHERE library_item_id = ?').bind(itemId),
     c.env.DB.prepare('DELETE FROM library_items WHERE id = ?').bind(itemId),
   ]);
   try { await c.env.COVERS.delete(`covers/${itemId}`); } catch { /* non-fatal */ }

@@ -19,6 +19,7 @@ import { cuesToServed, currentAnalysis, episodeExt, EPISODE_AUDIO_UA, hasDynamic
 import { parseTranscript, rankTranscripts, type Transcript, type TranscriptCue } from './transcript';
 import { adoptAnalysisForSize, analysisPump, whisperTranscriptFor } from './episode-analysis';
 import { announceNewEpisodes } from './push';
+import { followShow, isIdle } from '../db/podcast-follows';
 import {
   pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudStat, type PcloudProfile,
 } from '../storage/pcloud';
@@ -263,6 +264,8 @@ async function itunesForFeed(title: string, feedUrl: string, author: string | nu
 
 export type CreateArgs = {
   tenantId: string;
+  // Who is subscribing: they follow the show, new or already stored.
+  userId: string;
   libraryId: string;
   folderId?: string | null;
   feedUrl: string;
@@ -280,7 +283,12 @@ function safeName(s: string): string {
   return s.replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim().replace(/^\.+/, '').slice(0, 100) || 'Podcast';
 }
 
-export async function createPodcast(env: Env, a: CreateArgs): Promise<string> {
+// `existing`: the library already had this feed, so the caller now follows
+// that show (no fetch, no second copy); `followed`: this call added the
+// caller's follow (false when they already followed it).
+export type CreateResult = { itemId: string; existing: boolean; followed: boolean };
+
+export async function createPodcast(env: Env, a: CreateArgs): Promise<CreateResult> {
   const lib = await env.DB.prepare('SELECT id, media_type FROM libraries WHERE id = ? AND tenant_id = ?')
     .bind(a.libraryId, a.tenantId).first<{ id: string; media_type: string }>();
   if (!lib) throw new PodcastError(404, 'Library not found');
@@ -297,7 +305,15 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<string> {
     `SELECT p.library_item_id FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
       WHERE p.tenant_id = ? AND li.library_id = ? AND p.feed_url = ?`,
   ).bind(a.tenantId, a.libraryId, a.feedUrl).first<{ library_item_id: string }>();
-  if (dupe) throw new PodcastError(409, 'Podcast already exists');
+  // A show is stored once per library and each person follows it (migration
+  // 0028). Until 2026-10-14 this was a 409 "Podcast already exists", which
+  // was right while the library was one shared list; now the second person
+  // to add a feed follows the stored show: same episodes, same archive, same
+  // analysis, no second poll.
+  if (dupe) {
+    const { added } = await followShow(env, a.userId, dupe.library_item_id, a.tenantId);
+    return { itemId: dupe.library_item_id, existing: true, followed: added };
+  }
 
   const feed = a.deferFetch ? null : await fetchAndParse(a.feedUrl);
   const m = a.metadata ?? {};
@@ -363,13 +379,16 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<string> {
       feed ? PARSE_VERSION : 0,
       now, now,
     ),
+    // Whoever adds a show follows it, or it would be idle from birth.
+    env.DB.prepare('INSERT INTO podcast_follows (user_id, library_item_id, tenant_id, created_at) VALUES (?, ?, ?, ?)')
+      .bind(a.userId, itemId, a.tenantId, now),
   ]);
 
   if (feed) {
     const p = await env.DB.prepare('SELECT * FROM podcasts WHERE library_item_id = ?').bind(itemId).first<PodcastRow>();
     await storeEpisodes(env, p!, feed.episodes, { initial: true });
   }
-  return itemId;
+  return { itemId, existing: false, followed: true };
 }
 
 // ─── Episodes ────────────────────────────────────────────────────────────────
@@ -569,8 +588,10 @@ async function storeEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], opts: 
     onShow = [];
   }
   // Archive only what arrives after subscribing: a whole back catalogue
-  // queued on day one is a job for "archive all", asked for explicitly.
-  const archive = !opts.initial && p.archive === 1;
+  // queued on day one is a job for "archive all", asked for explicitly. Nor
+  // for a show nobody follows (an owner's "Check now" on an idle show still
+  // stores what's new, but copies nothing into pCloud for no listener).
+  const archive = !opts.initial && p.archive === 1 && !await isIdle(env, p.library_item_id);
   for (let i = 0; i < onShow.length; i += 90) {
     const part = onShow.slice(i, i + 90);
     await env.DB.prepare(
@@ -691,11 +712,17 @@ export async function refreshPodcast(env: Env, p: PodcastRow, opts: { force?: bo
 }
 
 // Cron: a few due feeds, then the archive queue. Every 2 minutes (the ABB
-// catalogue's cron), so up to 150 feed checks an hour.
+// catalogue's cron), so up to 150 feed checks an hour. Only shows someone
+// follows (migration 0028): an idle show isn't polled. unfollowShow parks a
+// show that loses its last follower (next_check_at NULL) so it isn't even
+// read here; the EXISTS is what guarantees it when follows vanish another
+// way (a deleted user, leaving the tenant).
 export async function runPodcastTick(env: Env): Promise<string[]> {
   const log: string[] = [];
   const due = await env.DB.prepare(
-    'SELECT * FROM podcasts WHERE next_check_at IS NOT NULL AND next_check_at <= ? ORDER BY next_check_at ASC LIMIT ?',
+    `SELECT * FROM podcasts p WHERE p.next_check_at IS NOT NULL AND p.next_check_at <= ?
+        AND EXISTS (SELECT 1 FROM podcast_follows f WHERE f.library_item_id = p.library_item_id)
+      ORDER BY p.next_check_at ASC LIMIT ?`,
   ).bind(Date.now(), TICK_FEEDS).all<PodcastRow>();
   for (const p of due.results) {
     const r = await refreshPodcast(env, p);

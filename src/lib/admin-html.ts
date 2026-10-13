@@ -1523,7 +1523,10 @@ function renderLibraries(status, libraries) {
 // A podcast library's shows come from feeds (src/lib/podcasts.ts), so its
 // block has no upload, scan-a-folder or re-probe: search Apple's directory
 // (or paste a feed URL) to subscribe, import and export OPML, and per show
-// check the feed, switch archiving to pCloud, or unsubscribe.
+// follow or unfollow, check the feed, switch archiving to pCloud, or (the
+// owner) delete it for everyone. Lists are per person (migration 0028):
+// subscribing to a feed the library has follows that show, and is open to
+// every member; the shows panel lists every show with who follows it.
 
 function podcastLibraryHtml(lib, folders, s, isOwner, canAdd, status) {
   const id = escapeHtml(lib.id);
@@ -1536,7 +1539,7 @@ function podcastLibraryHtml(lib, folders, s, isOwner, canAdd, status) {
   h += '<div class="row" style="flex-wrap:wrap; gap:0.5rem; margin-top:0.5rem">';
   h += '<button data-scan="' + id + '" title="Check every show for new episodes now. The server also checks each feed hourly.">Check feeds now</button>';
   h += '<button class="secondary" data-pod-shows="' + id + '" data-pod-pcloud="' + (pc ? '1' : '') + '">Shows (' + s.bookCount + ')</button>';
-  if (canAdd) h += '<button class="secondary" data-pod-add="' + id + '">Add podcast…</button>';
+  h += '<button class="secondary" data-pod-add="' + id + '">Add podcast…</button>';
   h += '<a class="btn secondary" href="/api/libraries/' + id + '/opml" download="' + escapeHtml(lib.name) + '.opml" title="Every show\'s feed, for importing into another podcast app">Export OPML</a>';
   if (isOwner && !pc && (status.profiles || []).some((p) => p.provider === 'pcloud')) {
     h += '<button class="secondary" data-attach-pcloud="' + id + '" title="Move this library onto pCloud so episodes can be archived there. Episodes keep playing from their publishers until archived.">Archive to pCloud…</button>';
@@ -1544,17 +1547,17 @@ function podcastLibraryHtml(lib, folders, s, isOwner, canAdd, status) {
   h += '</div>';
   // Filled by wirePodcastLibraries from /api/analysis/runs (canAdd only).
   if (canAdd) h += '<div class="muted" data-pod-runs="' + id + '" style="font-size:0.85rem;margin-top:0.4rem"></div>';
-  if (canAdd) {
-    h += '<div class="upload-area" id="pod-add-' + id + '">';
-    h += '<div class="upload-row"><input type="text" data-pod-term="' + id + '" placeholder="Search Apple Podcasts, or paste a feed URL">';
-    h += '<button data-pod-search="' + id + '">Search</button></div>';
-    if (pc) h += '<label class="muted" style="display:block;margin-bottom:0.5rem"><input type="checkbox" data-pod-archive="' + id + '"> Archive new episodes to pCloud</label>';
-    h += '<div data-pod-results="' + id + '"></div>';
-    h += '<div class="upload-row" style="margin-top:0.6rem"><span class="muted">Or import an OPML file from another podcast app:</span>';
-    h += '<input type="file" accept=".opml,.xml,text/xml,text/x-opml" data-pod-opml="' + id + '"></div>';
-    h += '<div data-pod-opml-out="' + id + '" class="muted"></div>';
-    h += '</div>';
-  }
+  // Subscribing is open to every member (a podcast list is personal);
+  // archiving spends the library's pCloud, so that box is canAdd's.
+  h += '<div class="upload-area" id="pod-add-' + id + '">';
+  h += '<div class="upload-row"><input type="text" data-pod-term="' + id + '" placeholder="Search Apple Podcasts, or paste a feed URL">';
+  h += '<button data-pod-search="' + id + '">Search</button></div>';
+  if (pc && canAdd) h += '<label class="muted" style="display:block;margin-bottom:0.5rem"><input type="checkbox" data-pod-archive="' + id + '"> Archive new episodes to pCloud</label>';
+  h += '<div data-pod-results="' + id + '"></div>';
+  h += '<div class="upload-row" style="margin-top:0.6rem"><span class="muted">Or import an OPML file from another podcast app:</span>';
+  h += '<input type="file" accept=".opml,.xml,text/xml,text/x-opml" data-pod-opml="' + id + '"></div>';
+  h += '<div data-pod-opml-out="' + id + '" class="muted"></div>';
+  h += '</div>';
   h += '<div id="pod-shows-' + id + '" class="books-list" style="display:none"></div>';
   h += '</div>';
   return h;
@@ -1691,7 +1694,9 @@ async function podSearch(libId, term, body) {
           },
         }),
       });
-      b.textContent = '✓ ' + item.media.numEpisodes + ' episode' + (item.media.numEpisodes === 1 ? '' : 's');
+      // A feed the library already had is followed, not added again.
+      b.textContent = item.followedExisting ? '✓ Following'
+        : '✓ ' + item.media.numEpisodes + ' episode' + (item.media.numEpisodes === 1 ? '' : 's');
       b.className = 'secondary';
     } catch (e) {
       b.disabled = false; b.textContent = 'Subscribe';
@@ -1714,6 +1719,7 @@ async function podImportOpml(libId, inp, body) {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ libraryId: libId, feeds: parsed.feeds }),
     });
     out.textContent = 'Added ' + r.created + ' show' + (r.created === 1 ? '' : 's')
+      + (r.followed ? ', now following ' + r.followed + ' the library already had' : '')
       + (r.skipped.length ? '; skipped ' + r.skipped.length + ' (' + r.skipped.map((s) => s.reason).join('; ') + ')' : '')
       + '. Their episodes arrive over the next few minutes as the server checks each feed.';
   } catch (e) {
@@ -1721,6 +1727,16 @@ async function podImportOpml(libId, inp, body) {
   } finally {
     inp.value = '';
   }
+}
+
+// Who follows a show (migration 0028). Nobody: the show is idle, kept but
+// not polled, archived or analysed until someone follows it again. The
+// usernames come only to the owner.
+function podFollowersLine(p) {
+  const n = Number(p.followers) || 0;
+  if (!n) return '<span class="warn">idle, nobody follows</span>';
+  const names = p.follower_names && p.follower_names.length ? ': ' + p.follower_names.map(escapeHtml).join(', ') : '';
+  return n + ' follower' + (n === 1 ? '' : 's') + names + (p.following ? ' (you follow it)' : '');
 }
 
 async function podLoadShows(libId, panel, status, hasPcloud) {
@@ -1745,6 +1761,7 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
       + (p.archive ? ' · archived ' + p.archived + (p.archiving ? ', ' + p.archiving + ' in progress' : '')
         + (p.archive_errors ? ', <span class="warn">' + p.archive_errors + ' failed</span>' : '') : '')
       + ' · checked ' + abbAgo(p.last_episode_check)
+      + '<br>' + podFollowersLine(p)
       + (p.last_error ? '<br><span class="warn">' + escapeHtml(p.last_error) + '</span>' : '')
       + '<br>Analysis ' + (p.analyse === 'on' ? 'on' : p.analyse === 'off' ? 'off' : 'auto')
       + ': ' + p.analysed + ' done' + (p.analysing ? ', ' + p.analysing + ' waiting or running' : '')
@@ -1752,6 +1769,8 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
       + (p.analysis_island ? ' (running on ' + escapeHtml(p.analysis_island) + ')' : '')
       + (p.analysis_errors ? ', <span class="warn">' + p.analysis_errors + ' failed</span>' : '')
       + (p.analysis_last_error ? '<br><span class="warn">' + escapeHtml(p.analysis_last_error) + '</span>' : '') + '</span></div>';
+    h += '<button class="secondary" data-pod-follow="' + id + '" data-pod-following="' + (p.following ? '1' : '') + '" data-pod-title="' + escapeHtml(p.title || '') + '">'
+      + (p.following ? 'Unfollow' : 'Follow') + '</button>';
     if (canAdd) {
       h += '<select data-pod-analyse="' + id + '" title="Transcribe new episodes on the Mac: align chapters and transcripts, find inserted ads">'
         + [['', 'Analysis: auto'], ['on', 'Analysis: on'], ['off', 'Analysis: off']]
@@ -1763,12 +1782,26 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
         if (p.archive) h += '<button class="secondary" data-pod-archall="' + id + '" title="Queue every episode on the show that isn\'t archived yet">Archive all</button>';
       }
     }
-    if (owner) h += '<button class="danger" data-pod-remove="' + id + '" data-pod-title="' + escapeHtml(p.title || '') + '" data-pod-archived="' + p.archived + '">Unsubscribe</button>';
+    if (owner) h += '<button class="danger" data-pod-remove="' + id + '" data-pod-title="' + escapeHtml(p.title || '') + '" data-pod-archived="' + p.archived + '" title="Remove the show from the library, from every member\'s list">Delete show</button>';
     h += '</div>';
   }
   panel.innerHTML = h;
   const reload = () => podLoadShows(libId, panel, status, hasPcloud);
 
+  panel.querySelectorAll('[data-pod-follow]').forEach((b) => b.addEventListener('click', async () => {
+    const following = !!b.dataset.podFollowing;
+    if (following && !confirm('Stop following ' + (b.dataset.podTitle || 'this podcast') + '? It leaves your list; your progress is kept.')) return;
+    b.disabled = true;
+    try {
+      await api('/api/podcasts/' + b.dataset.podFollow + '/follow', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ follow: !following }),
+      });
+      reload();
+    } catch (e) {
+      b.disabled = false;
+      showError((following ? 'Unfollow' : 'Follow') + ' failed: ' + e.message);
+    }
+  }));
   panel.querySelectorAll('[data-pod-check]').forEach((b) => b.addEventListener('click', async () => {
     b.disabled = true; b.textContent = 'Checking…';
     try {
@@ -1817,7 +1850,7 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
   }));
   panel.querySelectorAll('[data-pod-remove]').forEach((b) => b.addEventListener('click', async () => {
     const title = b.dataset.podTitle || 'this podcast';
-    if (!confirm('Unsubscribe from ' + title + '? Its listening progress goes with it.')) return;
+    if (!confirm('Delete ' + title + ' for everyone? It leaves every member\'s list, and everyone\'s listening progress on it goes with it. To take it off only your list, Unfollow.')) return;
     const archived = Number(b.dataset.podArchived || '0');
     const files = archived > 0 && confirm('Also delete its ' + archived + ' archived episode' + (archived === 1 ? '' : 's') + ' from pCloud?\n\nCancel keeps the files.');
     b.disabled = true;
@@ -1827,7 +1860,7 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
       refresh();
     } catch (e) {
       b.disabled = false;
-      showError('Unsubscribe failed: ' + e.message);
+      showError('Delete failed: ' + e.message);
     }
   }));
 }

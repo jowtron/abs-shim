@@ -515,10 +515,12 @@ type RecipientRow = { uid: string; id: string | null; user_id: string | null; en
 // INSERTED and put on the show, and only for a check that counts (see
 // there). One notification per show per check: with several new episodes it
 // names the newest and how many. Recipients: users with the bell on for
-// this show who are still active members of its tenant, each to every
-// device they have; their devices come back in the same query, so the cost
-// doesn't grow with the number of recipients. Returns a log line, or null
-// when there was no one to tell.
+// this show who follow it (migration 0028: unfollowing turns the bell off,
+// and a bell left on for a show that isn't followed never rings) and are
+// still active members of its tenant, each to every device they have; their
+// devices come back in the same query, so the cost doesn't grow with the
+// number of recipients. Returns a log line, or null when there was no one to
+// tell.
 export async function announceNewEpisodes(
   env: Env,
   show: { library_item_id: string; tenant_id: string; title: string | null },
@@ -529,6 +531,7 @@ export async function announceNewEpisodes(
   const rows = (await env.DB.prepare(
     `SELECT sp.user_id AS uid, s.id, s.user_id, s.endpoint, s.p256dh, s.auth
        FROM push_show_prefs sp
+       JOIN podcast_follows f ON f.user_id = sp.user_id AND f.library_item_id = sp.library_item_id
        JOIN tenant_members tm ON tm.user_id = sp.user_id AND tm.tenant_id = ?
        JOIN users u ON u.id = sp.user_id AND u.is_active = 1 AND u.is_locked = 0
        LEFT JOIN push_subscriptions s ON s.user_id = sp.user_id

@@ -5,6 +5,7 @@
 
 import type { LibraryFolderRow, LibraryItemRow } from '../db/library';
 import type { EpisodeCounts, EpisodeRow, PodcastRow } from '../db/podcasts';
+import type { FollowInfo } from '../db/podcast-follows';
 import { derivedId } from './ids';
 import { stripAllTags } from './rss';
 import { storageLabel } from './storage-label';
@@ -440,10 +441,19 @@ function settings(p: PodcastRow) {
   };
 }
 
-export async function buildPodcastItemMinified(item: LibraryItemRow, p: PodcastRow, counts: EpisodeCounts | undefined) {
+// Not ABS (migration 0028): whether the caller follows the show, and how
+// many people do. On the item, where Pholia reads it, and in `media` beside
+// the other shim extras; strict clients ignore both. Absent when the caller
+// didn't look it up (a play session's item).
+function followFields(follow: FollowInfo | undefined) {
+  return follow ? { following: follow.following, followers: follow.followers } : {};
+}
+
+export async function buildPodcastItemMinified(item: LibraryItemRow, p: PodcastRow, counts: EpisodeCounts | undefined, follow?: FollowInfo) {
   const size = counts?.size ?? 0;
   return {
     ...itemWrapper(item, size, counts?.numEpisodes ?? 0),
+    ...followFields(follow),
     media: {
       id: await derivedId(item.id, 'media'),
       metadata: metadataExpanded(p),
@@ -453,13 +463,14 @@ export async function buildPodcastItemMinified(item: LibraryItemRow, p: PodcastR
       ...settings(p),
       size,
       ...shimFields(p),
+      ...followFields(follow),
     },
   };
 }
 
 export async function buildPodcastItemExpanded(
   item: LibraryItemRow, folder: LibraryFolderRow, p: PodcastRow, episodes: EpisodeRow[],
-  opts?: { userMediaProgress?: unknown | null } & EpisodeListOpts,
+  opts?: { userMediaProgress?: unknown | null; follow?: FollowInfo } & EpisodeListOpts,
 ) {
   const size = episodes.reduce((s, e) => s + episodeSize(e), 0);
   const listOpts: EpisodeListOpts = {
@@ -469,6 +480,7 @@ export async function buildPodcastItemExpanded(
   const eps = await Promise.all(episodes.map((e) => buildEpisodeExpanded(e, item, folder, listOpts)));
   return {
     ...itemWrapper(item, size, episodes.length),
+    ...followFields(opts?.follow),
     lastScan: item.updated_at,
     scanVersion: '2.34.0',
     ...(opts?.userMediaProgress != null ? { userMediaProgress: opts.userMediaProgress } : {}),
@@ -483,6 +495,7 @@ export async function buildPodcastItemExpanded(
       size,
       episodes: eps,
       ...shimFields(p, folder),
+      ...followFields(opts?.follow),
     },
     libraryFiles: eps.map((e) => ({
       ino: e.audioFile.ino,

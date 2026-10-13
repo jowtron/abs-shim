@@ -1,4 +1,5 @@
 import type { Env } from '../types';
+import { NOT_HIDDEN } from './podcast-follows';
 
 // Rows of migration 0016. See src/lib/podcasts.ts for how they're filled.
 
@@ -131,22 +132,31 @@ export async function getPodcasts(env: Env, itemIds: string[], tenantId: string)
 export type EpisodeCounts = { numEpisodes: number; size: number; duration: number };
 
 // Per-show totals over the episodes on the show (in_library), for list
-// shapes that carry numEpisodes but not the episodes themselves.
-export async function getEpisodeCounts(env: Env, itemIds: string[], tenantId: string): Promise<Map<string, EpisodeCounts>> {
+// shapes that carry numEpisodes but not the episodes themselves. With
+// `userId`, the episodes that person hid don't count (migration 0028), so
+// the number matches the episodes their show page lists.
+export async function getEpisodeCounts(env: Env, itemIds: string[], tenantId: string, userId?: string): Promise<Map<string, EpisodeCounts>> {
   if (!itemIds.length) return new Map();
+  const hidden = userId ? NOT_HIDDEN : '';
   const rows = await inChunks<{ library_item_id: string; n: number; size: number; duration: number }>(env, itemIds,
     (m) => `SELECT library_item_id, COUNT(*) AS n, SUM(CASE WHEN size_bytes > 0 THEN size_bytes ELSE COALESCE(enclosure_length, 0) END) AS size,
                    SUM(duration_seconds) AS duration
-              FROM podcast_episodes WHERE library_item_id IN (${m}) AND tenant_id = ? AND in_library = 1
-             GROUP BY library_item_id`, [tenantId]);
+              FROM podcast_episodes e WHERE library_item_id IN (${m}) AND tenant_id = ? AND in_library = 1${hidden}
+             GROUP BY library_item_id`, userId ? [tenantId, userId] : [tenantId]);
   return new Map(rows.map((r) => [r.library_item_id, { numEpisodes: r.n, size: r.size ?? 0, duration: r.duration ?? 0 }]));
 }
 
-export async function listShowEpisodes(env: Env, itemId: string, tenantId: string): Promise<EpisodeRow[]> {
+// The episodes on a show, newest first. With `userId`, without the ones
+// that person hid: the show item's own media.episodes is a list too.
+// `+tenant_id` keeps tenant_id out of index selection: with it, SQLite was
+// as happy with idx_episodes_tenant_published (tenant_id, in_library, ...)
+// as with the show's own index, and walked every on-show episode of the
+// tenant (526 locally, 2026-10-14) on every show page.
+export async function listShowEpisodes(env: Env, itemId: string, tenantId: string, userId?: string): Promise<EpisodeRow[]> {
   const r = await env.DB.prepare(
-    `SELECT * FROM podcast_episodes WHERE library_item_id = ? AND tenant_id = ? AND in_library = 1
+    `SELECT * FROM podcast_episodes e WHERE library_item_id = ? AND +tenant_id = ? AND in_library = 1${userId ? NOT_HIDDEN : ''}
       ORDER BY published_at DESC, idx DESC`,
-  ).bind(itemId, tenantId).all<EpisodeRow>();
+  ).bind(itemId, tenantId, ...(userId ? [userId] : [])).all<EpisodeRow>();
   return r.results;
 }
 

@@ -38,10 +38,12 @@ async function subsFor(c: C) {
 }
 
 // The caller's shows with the bell on, in the tenant they are acting in (a
-// show of another tenant couldn't be opened from here).
+// show of another tenant couldn't be opened from here), and only those they
+// follow: the trigger rings for nothing else (migration 0028).
 async function showsFor(c: C): Promise<string[]> {
   const r = await c.env.DB.prepare(
     `SELECT sp.library_item_id FROM push_show_prefs sp JOIN library_items li ON li.id = sp.library_item_id
+       JOIN podcast_follows f ON f.user_id = sp.user_id AND f.library_item_id = sp.library_item_id
       WHERE sp.user_id = ? AND sp.notify = 1 AND li.tenant_id = ? ORDER BY sp.updated_at ASC`,
   ).bind(c.get('userId'), c.get('tenantId')).all<{ library_item_id: string }>();
   return r.results.map((x) => x.library_item_id);

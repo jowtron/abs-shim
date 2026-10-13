@@ -97,7 +97,10 @@ const originOf = (url: string) => new URL(url).origin;
 
 // Also the capability probe both UIs make (Pholia hides its Add screen and
 // its delete-from-pCloud on these): canGrab follows the members_can_add
-// switch, canDelete is owner-only.
+// switch, canDelete is owner-only. canSubscribe (2026-10-14): subscribing to
+// podcasts is open to every member, since a podcast list is personal
+// (migration 0028); Pholia shows the podcast "+" on it, falling back to
+// canGrab for a shim without it.
 abbRoutes.get('/settings', async (c) => {
   const creds = await loadCreds(c.env, c.get('tenantId'));
   const isOwner = c.get('tenantRole') === 'owner';
@@ -109,6 +112,7 @@ abbRoutes.get('/settings', async (c) => {
     canEdit: isOwner,
     canGrab: isOwner || membersMayAdd,
     canDelete: isOwner,
+    canSubscribe: true,
     membersCanAdd: membersMayAdd,
     encryptionConfigured: secretsConfigured(c.env),
   });

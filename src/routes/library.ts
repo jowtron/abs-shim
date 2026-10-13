@@ -8,6 +8,7 @@ import {
   type LibraryFolderRow, type LibraryItemRow,
 } from '../db/library';
 import { getEpisodeCounts, getPodcasts, type EpisodeRow, type PodcastRow } from '../db/podcasts';
+import { FOLLOWED_AND_VISIBLE, followInfo, followedShowIds } from '../db/podcast-follows';
 import { buildEpisodeExpanded, buildPodcastItemMinified, buildPodcastOld } from '../lib/podcast-shapes';
 import { buildOpml } from '../lib/rss';
 import { downloadJson } from './podcasts';
@@ -47,7 +48,7 @@ libraryRoutes.get('/:id', async (c) => {
 
   const include = (c.req.query('include') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   if (include.includes('filterdata') && scope.library.media_type === 'podcast') {
-    return c.json(await podcastFilterData(c.env, scope, tenantId, folders));
+    return c.json(await podcastFilterData(c.env, scope, tenantId, c.get('userId'), folders));
   }
   if (include.includes('filterdata')) {
     const metadata = await listAllBookMetadata(c.env, scope.library.id, tenantId, scope.filter('li.'));
@@ -470,13 +471,33 @@ export async function buildItemBundle(env: Env, itemId: string, tenantId: string
 // A library whose media_type is 'podcast' holds shows, not books (migration
 // 0016). These build ABS's podcast-library answers; the routes above branch
 // to them on scope.library.media_type.
+//
+// Every list here is the CALLER's (migration 0028): the shows they follow,
+// without the episodes they hid. A show is stored once and followed by each
+// person who has it on their list; a single show or episode (GET
+// /api/items/:id, a playlist entry, a push link) is still answered whether
+// followed or not, so links never 404. Library stats stay library-wide.
 
 type PodcastScope = NonNullable<Awaited<ReturnType<typeof resolveLibraryScope>>>;
 
-async function podcastItemsMinified(env: Env, items: LibraryItemRow[], tenantId: string) {
+// Minified shows, each with the caller's follow, the follower count and an
+// episode count without the caller's hidden episodes.
+async function podcastItemsMinified(env: Env, items: LibraryItemRow[], tenantId: string, userId: string) {
   const ids = items.map((i) => i.id);
-  const [pods, counts] = await Promise.all([getPodcasts(env, ids, tenantId), getEpisodeCounts(env, ids, tenantId)]);
-  return Promise.all(items.filter((i) => pods.has(i.id)).map((i) => buildPodcastItemMinified(i, pods.get(i.id)!, counts.get(i.id))));
+  const [pods, counts, follows] = await Promise.all([
+    getPodcasts(env, ids, tenantId), getEpisodeCounts(env, ids, tenantId, userId), followInfo(env, userId, ids),
+  ]);
+  return Promise.all(items.filter((i) => pods.has(i.id))
+    .map((i) => buildPodcastItemMinified(i, pods.get(i.id)!, counts.get(i.id), follows.get(i.id))));
+}
+
+// The library's shows the caller follows.
+async function followedItems(env: Env, scope: PodcastScope, tenantId: string, userId: string): Promise<LibraryItemRow[]> {
+  const [items, followed] = await Promise.all([
+    listItemsByLibrary(env, scope.library.id, tenantId, { view: scope.filter('') }),
+    followedShowIds(env, userId, tenantId),
+  ]);
+  return items.filter((i) => followed.has(i.id));
 }
 
 const byTitle = (a: { media: { metadata: { titleIgnorePrefix: string | null } } }, b: typeof a) =>
@@ -484,8 +505,8 @@ const byTitle = (a: { media: { metadata: { titleIgnorePrefix: string | null } } 
 
 async function podcastItems(c: Context<{ Bindings: Env; Variables: AuthVars }>, scope: PodcastScope) {
   const tenantId = c.get('tenantId');
-  const items = await listItemsByLibrary(c.env, scope.library.id, tenantId, { view: scope.filter('') });
-  const all = await podcastItemsMinified(c.env, items, tenantId);
+  const items = await followedItems(c.env, scope, tenantId, c.get('userId'));
+  const all = await podcastItemsMinified(c.env, items, tenantId, c.get('userId'));
   const sort = c.req.query('sort') ?? 'media.metadata.title';
   const desc = c.req.query('desc') === '1';
   all.sort((a, b) => {
@@ -506,22 +527,27 @@ async function podcastItems(c: Context<{ Bindings: Env; Variables: AuthVars }>, 
 
 type EpisodeWithShow = EpisodeRow & { li_library_id: string };
 
-// Episodes on the shows of one library, joined to the caller's progress.
+// Episodes on the shows of one library that the caller follows, without the
+// ones they hid, joined to their progress. The follow and hidden tests are
+// primary-key probes per row, so the ORDER BY still walks the tenant's
+// published-date index and stops at the LIMIT; a caller who follows nothing
+// isn't asked about at all (`followed` empty).
 async function libraryEpisodes(env: Env, scope: PodcastScope, tenantId: string, userId: string, opts: {
-  where: string; order: string; limit: number; offset?: number;
+  where: string; order: string; limit: number; offset?: number; followed: Set<string>;
 }) {
+  if (!opts.followed.size) return [];
   const view = scope.filter('li.');
   const r = await env.DB.prepare(
     `SELECT e.*, li.library_id AS li_library_id FROM podcast_episodes e
        JOIN library_items li ON li.id = e.library_item_id
        LEFT JOIN media_progress mp ON mp.library_item_id = e.library_item_id AND mp.episode_id = e.id AND mp.user_id = ?
-      WHERE li.library_id = ? AND e.tenant_id = ? AND e.in_library = 1${view.sql} AND ${opts.where}
+      WHERE li.library_id = ? AND e.tenant_id = ? AND e.in_library = 1${view.sql}${FOLLOWED_AND_VISIBLE} AND ${opts.where}
       ORDER BY ${opts.order} LIMIT ? OFFSET ?`,
-  ).bind(userId, scope.library.id, tenantId, ...view.binds, opts.limit, opts.offset ?? 0).all<EpisodeWithShow>();
+  ).bind(userId, scope.library.id, tenantId, ...view.binds, userId, userId, opts.limit, opts.offset ?? 0).all<EpisodeWithShow>();
   return r.results;
 }
 
-async function showsFor(env: Env, itemIds: string[], tenantId: string) {
+async function showsFor(env: Env, itemIds: string[], tenantId: string, userId: string) {
   const uniq = [...new Set(itemIds)];
   const items = new Map<string, LibraryItemRow>();
   for (let i = 0; i < uniq.length; i += 90) {
@@ -530,20 +556,22 @@ async function showsFor(env: Env, itemIds: string[], tenantId: string) {
       .bind(...part, tenantId).all<LibraryItemRow>();
     for (const row of r.results) items.set(row.id, row);
   }
-  const [pods, counts] = await Promise.all([getPodcasts(env, uniq, tenantId), getEpisodeCounts(env, uniq, tenantId)]);
+  const [pods, counts, follows] = await Promise.all([
+    getPodcasts(env, uniq, tenantId), getEpisodeCounts(env, uniq, tenantId, userId), followInfo(env, userId, uniq),
+  ]);
   const folderIds = [...new Set([...items.values()].map((i) => i.folder_id))];
   const folders = new Map<string, LibraryFolderRow>();
   for (const id of folderIds) {
     const f = await getFolderById(env, id, tenantId);
     if (f) folders.set(id, f);
   }
-  return { items, pods, counts, folders };
+  return { items, pods, counts, folders, follows };
 }
 
 // ABS's recent-episodes entry: the expanded episode, plus `podcast` (the show
 // with an empty episode list) and `libraryId`.
-async function recentEpisodeEntries(env: Env, eps: EpisodeWithShow[], tenantId: string, progress?: Map<string, unknown>) {
-  const { items, pods, folders } = await showsFor(env, eps.map((e) => e.library_item_id), tenantId);
+async function recentEpisodeEntries(env: Env, eps: EpisodeWithShow[], tenantId: string, userId: string, progress?: Map<string, unknown>) {
+  const { items, pods, folders } = await showsFor(env, eps.map((e) => e.library_item_id), tenantId, userId);
   const out = [];
   for (const e of eps) {
     const item = items.get(e.library_item_id);
@@ -564,15 +592,15 @@ async function recentEpisodeEntries(env: Env, eps: EpisodeWithShow[], tenantId: 
 // Shelf entities for episode shelves: the show (minified) with the episode
 // as `recentEpisode`, which is how ABS shapes continue-listening and
 // newest-episodes in a podcast library.
-async function episodeShelfEntities(env: Env, eps: EpisodeWithShow[], tenantId: string, progress: Map<string, unknown>) {
-  const { items, pods, counts, folders } = await showsFor(env, eps.map((e) => e.library_item_id), tenantId);
+async function episodeShelfEntities(env: Env, eps: EpisodeWithShow[], tenantId: string, userId: string, progress: Map<string, unknown>) {
+  const { items, pods, counts, folders, follows } = await showsFor(env, eps.map((e) => e.library_item_id), tenantId, userId);
   const out = [];
   for (const e of eps) {
     const item = items.get(e.library_item_id);
     const p = pods.get(e.library_item_id);
     const folder = item ? folders.get(item.folder_id) : undefined;
     if (!item || !p || !folder) continue;
-    const show = await buildPodcastItemMinified(item, p, counts.get(item.id));
+    const show = await buildPodcastItemMinified(item, p, counts.get(item.id), follows.get(item.id));
     out.push({
       ...show,
       // The episode carries it too, as on every list of episodes: a client
@@ -594,21 +622,21 @@ async function episodeProgress(env: Env, userId: string) {
 async function podcastPersonalized(c: Context<{ Bindings: Env; Variables: AuthVars }>, scope: PodcastScope) {
   const tenantId = c.get('tenantId');
   const userId = c.get('userId');
-  const progress = await episodeProgress(c.env, userId);
+  const [progress, followed] = await Promise.all([episodeProgress(c.env, userId), followedShowIds(c.env, userId, tenantId)]);
   const [inProgress, newest, finished] = await Promise.all([
     libraryEpisodes(c.env, scope, tenantId, userId, {
       where: 'mp.progress > 0 AND mp.is_finished = 0 AND mp.hide_from_continue_listening = 0',
-      order: 'mp.last_update DESC', limit: 20,
+      order: 'mp.last_update DESC', limit: 20, followed,
     }),
-    libraryEpisodes(c.env, scope, tenantId, userId, { where: 'COALESCE(mp.is_finished, 0) = 0', order: 'e.published_at DESC', limit: 25 }),
-    libraryEpisodes(c.env, scope, tenantId, userId, { where: 'mp.is_finished = 1', order: 'mp.finished_at DESC', limit: 20 }),
+    libraryEpisodes(c.env, scope, tenantId, userId, { where: 'COALESCE(mp.is_finished, 0) = 0', order: 'e.published_at DESC', limit: 25, followed }),
+    libraryEpisodes(c.env, scope, tenantId, userId, { where: 'mp.is_finished = 1', order: 'mp.finished_at DESC', limit: 20, followed }),
   ]);
-  const items = await listItemsByLibrary(c.env, scope.library.id, tenantId, { view: scope.filter('') });
-  const shows = await podcastItemsMinified(c.env, items, tenantId);
+  const items = (await listItemsByLibrary(c.env, scope.library.id, tenantId, { view: scope.filter('') })).filter((i) => followed.has(i.id));
+  const shows = await podcastItemsMinified(c.env, items, tenantId, userId);
   const recentlyAdded = [...shows].sort((a, b) => b.addedAt - a.addedAt);
-  const continueListening = await episodeShelfEntities(c.env, inProgress, tenantId, progress);
-  const newestEpisodes = await episodeShelfEntities(c.env, newest, tenantId, progress);
-  const listenAgain = await episodeShelfEntities(c.env, finished, tenantId, progress);
+  const continueListening = await episodeShelfEntities(c.env, inProgress, tenantId, userId, progress);
+  const newestEpisodes = await episodeShelfEntities(c.env, newest, tenantId, userId, progress);
+  const listenAgain = await episodeShelfEntities(c.env, finished, tenantId, userId, progress);
   const shelf = (id: string, label: string, key: string, type: string, entities: unknown[]) =>
     ({ id, label, labelStringKey: key, type, entities, total: entities.length });
   return c.json([
@@ -626,11 +654,13 @@ libraryRoutes.get('/:id/recent-episodes', async (c) => {
   if (!scope || scope.library.media_type !== 'podcast') return c.json({ error: 'Not a podcast library' }, 404);
   const limit = Math.min(Math.max(Number(c.req.query('limit') ?? '25') || 25, 1), 200);
   const page = Math.max(Number(c.req.query('page') ?? '0') || 0, 0);
-  const eps = await libraryEpisodes(c.env, scope, tenantId, c.get('userId'), {
+  const userId = c.get('userId');
+  const eps = await libraryEpisodes(c.env, scope, tenantId, userId, {
     where: 'COALESCE(mp.is_finished, 0) = 0', order: 'e.published_at DESC', limit, offset: page * limit,
+    followed: await followedShowIds(c.env, userId, tenantId),
   });
-  const progress = await episodeProgress(c.env, c.get('userId'));
-  return c.json({ episodes: await recentEpisodeEntries(c.env, eps, tenantId, progress), limit, page });
+  const progress = await episodeProgress(c.env, userId);
+  return c.json({ episodes: await recentEpisodeEntries(c.env, eps, tenantId, userId, progress), limit, page });
 });
 
 libraryRoutes.get('/:id/podcast-titles', async (c) => {
@@ -638,25 +668,32 @@ libraryRoutes.get('/:id/podcast-titles', async (c) => {
   const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
   if (!scope) return c.json({ error: 'Library not found' }, 404);
   const view = scope.filter('li.');
+  // The caller's shows only: "subscribed" in a search means on their list.
   const r = await c.env.DB.prepare(
-    `SELECT p.title, p.itunes_id, p.feed_url, li.id, li.library_id FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
-      WHERE li.library_id = ? AND p.tenant_id = ?${view.sql}`,
-  ).bind(scope.library.id, tenantId, ...view.binds).all<{ title: string; itunes_id: string | null; feed_url: string; id: string; library_id: string }>();
+    `SELECT p.title, p.itunes_id, p.feed_url, li.id, li.library_id
+       FROM podcast_follows f
+       JOIN podcasts p ON p.library_item_id = f.library_item_id
+       JOIN library_items li ON li.id = p.library_item_id
+      WHERE f.user_id = ? AND li.library_id = ? AND p.tenant_id = ?${view.sql}`,
+  ).bind(c.get('userId'), scope.library.id, tenantId, ...view.binds).all<{ title: string; itunes_id: string | null; feed_url: string; id: string; library_id: string }>();
   // feedUrl isn't in ABS's answer: Pholia marks search results already
   // subscribed by it, since Apple can list one feed under two ids.
   return c.json({ podcasts: r.results.map((p) => ({ title: p.title, itunesId: p.itunes_id, feedUrl: p.feed_url, libraryItemId: p.id, libraryId: p.library_id })) });
 });
 
-// The archive queue across the library, in ABS's episode-download shape.
+// The archive queue across the library, in ABS's episode-download shape:
+// the caller's shows, without the episodes they hid.
 libraryRoutes.get('/:id/episode-downloads', async (c) => {
   const tenantId = c.get('tenantId');
+  const userId = c.get('userId');
   const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
   if (!scope) return c.json({ error: 'Library not found' }, 404);
   const r = await c.env.DB.prepare(
     `SELECT e.*, li.library_id AS li_library_id FROM podcast_episodes e JOIN library_items li ON li.id = e.library_item_id
-      WHERE li.library_id = ? AND e.tenant_id = ? AND e.archive_state IN ('queued', 'fetching') ORDER BY e.updated_at ASC LIMIT 100`,
-  ).bind(scope.library.id, tenantId).all<EpisodeWithShow>();
-  const { items, pods } = await showsFor(c.env, r.results.map((e) => e.library_item_id), tenantId);
+      WHERE li.library_id = ? AND e.tenant_id = ? AND e.archive_state IN ('queued', 'fetching')${FOLLOWED_AND_VISIBLE}
+      ORDER BY e.updated_at ASC LIMIT 100`,
+  ).bind(scope.library.id, tenantId, userId, userId).all<EpisodeWithShow>();
+  const { items, pods } = await showsFor(c.env, r.results.map((e) => e.library_item_id), tenantId, userId);
   const rows = r.results.filter((e) => items.has(e.library_item_id) && pods.has(e.library_item_id))
     .map((e) => downloadJson(e, { item: items.get(e.library_item_id)!, podcast: pods.get(e.library_item_id)! }));
   const current = rows.find((d) => d.startedAt != null) ?? null;
@@ -668,22 +705,27 @@ libraryRoutes.get('/:id/opml', async (c) => {
   const scope = await resolveLibraryScope(c.env, c.req.param('id'), tenantId);
   if (!scope) return c.json({ error: 'Library not found' }, 404);
   const view = scope.filter('li.');
+  // The caller's list, like every other: an export is "my podcasts".
   const r = await c.env.DB.prepare(
-    `SELECT p.* FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
-      WHERE li.library_id = ? AND p.tenant_id = ?${view.sql} ORDER BY p.title COLLATE NOCASE`,
-  ).bind(scope.library.id, tenantId, ...view.binds).all<PodcastRow>();
+    `SELECT p.* FROM podcast_follows f
+       JOIN podcasts p ON p.library_item_id = f.library_item_id
+       JOIN library_items li ON li.id = p.library_item_id
+      WHERE f.user_id = ? AND li.library_id = ? AND p.tenant_id = ?${view.sql} ORDER BY p.title COLLATE NOCASE`,
+  ).bind(c.get('userId'), scope.library.id, tenantId, ...view.binds).all<PodcastRow>();
   const xml = buildOpml(scope.view?.name ?? scope.library.name, r.results.map((p) => ({
     title: p.title ?? p.feed_url, feedUrl: p.feed_url, description: p.description, pageUrl: p.itunes_page_url, language: p.language,
   })));
   return c.body(xml, 200, { 'Content-Type': 'application/xml; charset=utf-8' });
 });
 
-async function podcastFilterData(env: Env, scope: PodcastScope, tenantId: string, folders: LibraryFolderRow[]) {
+async function podcastFilterData(env: Env, scope: PodcastScope, tenantId: string, userId: string, folders: LibraryFolderRow[]) {
   const view = scope.filter('li.');
   const r = await env.DB.prepare(
-    `SELECT p.genres, p.language, p.tags FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
-      WHERE li.library_id = ? AND p.tenant_id = ?${view.sql}`,
-  ).bind(scope.library.id, tenantId, ...view.binds).all<{ genres: string; language: string | null; tags: string }>();
+    `SELECT p.genres, p.language, p.tags FROM podcast_follows f
+       JOIN podcasts p ON p.library_item_id = f.library_item_id
+       JOIN library_items li ON li.id = p.library_item_id
+      WHERE f.user_id = ? AND li.library_id = ? AND p.tenant_id = ?${view.sql}`,
+  ).bind(userId, scope.library.id, tenantId, ...view.binds).all<{ genres: string; language: string | null; tags: string }>();
   const genres = new Set<string>();
   const tags = new Set<string>();
   const languages = new Set<string>();
@@ -709,22 +751,27 @@ async function podcastFilterData(env: Env, scope: PodcastScope, tenantId: string
 // shape puts shows in `podcast` and episode hits in `episodes`.
 async function podcastSearch(c: Context<{ Bindings: Env; Variables: AuthVars }>, scope: PodcastScope, q: string, limit: number) {
   const tenantId = c.get('tenantId');
+  const userId = c.get('userId');
   const view = scope.filter('li.');
   const pattern = '%' + q.replace(/[\\%_]/g, (ch) => '\\' + ch).toLowerCase() + '%';
+  // The caller's shows and their visible episodes, like every list here.
   const shows = await c.env.DB.prepare(
-    `SELECT li.* FROM library_items li JOIN podcasts p ON p.library_item_id = li.id
-      WHERE li.library_id = ? AND li.tenant_id = ?${view.sql}
+    `SELECT li.* FROM podcast_follows f
+       JOIN library_items li ON li.id = f.library_item_id
+       JOIN podcasts p ON p.library_item_id = li.id
+      WHERE f.user_id = ? AND li.library_id = ? AND li.tenant_id = ?${view.sql}
         AND (lower(COALESCE(p.title, '')) LIKE ? ESCAPE '\\' OR lower(COALESCE(p.author, '')) LIKE ? ESCAPE '\\')
       LIMIT ?`,
-  ).bind(scope.library.id, tenantId, ...view.binds, pattern, pattern, limit).all<LibraryItemRow>();
-  const showJson = await podcastItemsMinified(c.env, shows.results, tenantId);
+  ).bind(userId, scope.library.id, tenantId, ...view.binds, pattern, pattern, limit).all<LibraryItemRow>();
+  const showJson = await podcastItemsMinified(c.env, shows.results, tenantId, userId);
   const epRows = await c.env.DB.prepare(
     `SELECT e.*, li.library_id AS li_library_id FROM podcast_episodes e JOIN library_items li ON li.id = e.library_item_id
-      WHERE li.library_id = ? AND e.tenant_id = ? AND e.in_library = 1${view.sql} AND lower(COALESCE(e.title, '')) LIKE ? ESCAPE '\\'
+      WHERE li.library_id = ? AND e.tenant_id = ? AND e.in_library = 1${view.sql}${FOLLOWED_AND_VISIBLE}
+        AND lower(COALESCE(e.title, '')) LIKE ? ESCAPE '\\'
       ORDER BY e.published_at DESC LIMIT ?`,
-  ).bind(scope.library.id, tenantId, ...view.binds, pattern, limit).all<EpisodeWithShow>();
-  const progress = await episodeProgress(c.env, c.get('userId'));
-  const episodeEntities = await episodeShelfEntities(c.env, epRows.results, tenantId, progress);
+  ).bind(scope.library.id, tenantId, ...view.binds, userId, userId, pattern, limit).all<EpisodeWithShow>();
+  const progress = await episodeProgress(c.env, userId);
+  const episodeEntities = await episodeShelfEntities(c.env, epRows.results, tenantId, userId, progress);
   return c.json({
     book: [], authors: [], series: [], narrators: [], tags: [],
     podcast: showJson.map((s) => ({ libraryItem: s, matchKey: 'title', matchText: s.media.metadata.title ?? '' })),

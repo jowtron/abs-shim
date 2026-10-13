@@ -3,6 +3,7 @@ import type { Env } from '../types';
 import { requireAuth, type AuthVars } from '../auth/middleware';
 import { loadItemBundles, type LibraryFolderRow, type LibraryItemRow } from '../db/library';
 import { getEpisodeCounts, getEpisodesByIds, getPodcasts, type EpisodeRow } from '../db/podcasts';
+import { NOT_HIDDEN, followInfo } from '../db/podcast-follows';
 import { resolveLibraryScope } from '../db/library-views';
 import { buildItemDetail } from '../lib/abs-shapes';
 import { progressForShows } from '../db/progress';
@@ -65,13 +66,16 @@ async function refsFor(env: Env, pl: PlaylistRow, userId: string): Promise<Ref[]
   const where: string[] = [];
   if (rules.include === 'unplayed') where.push('COALESCE(mp.is_finished, 0) = 0');
   if (rules.include === 'inProgress') where.push('mp.progress > 0 AND mp.is_finished = 0');
-  const binds: unknown[] = [userId, pl.tenant_id, ...ids];
+  // Episodes the caller hid stay out (migration 0028). The rules' shows are
+  // NOT limited to those they follow: a playlist they made keeps computing
+  // after an unfollow, which is theirs to change.
+  const binds: unknown[] = [userId, pl.tenant_id, ...ids, userId];
   if (rules.days) { where.push('e.published_at >= ?'); binds.push(Date.now() - rules.days * 86400_000); }
   binds.push(rules.limit);
   const r = await env.DB.prepare(
     `SELECT e.library_item_id, e.id AS episode_id FROM podcast_episodes e
        LEFT JOIN media_progress mp ON mp.library_item_id = e.library_item_id AND mp.episode_id = e.id AND mp.user_id = ?
-      WHERE e.tenant_id = ? AND e.in_library = 1 AND e.library_item_id IN (${ids.map(() => '?').join(',')})
+      WHERE e.tenant_id = ? AND e.in_library = 1 AND e.library_item_id IN (${ids.map(() => '?').join(',')})${NOT_HIDDEN}
         ${where.length ? 'AND ' + where.join(' AND ') : ''}
       ORDER BY e.published_at ${rules.sort === 'oldest' ? 'ASC' : 'DESC'}, e.idx ${rules.sort === 'oldest' ? 'ASC' : 'DESC'}
       LIMIT ?`,
@@ -96,14 +100,15 @@ export async function expandPlaylist(env: Env, pl: PlaylistRow, userId: string) 
     (m) => `SELECT * FROM library_items WHERE id IN (${m}) AND tenant_id = ?`, [tenantId])).map((i) => [i.id, i]));
   const showIds = [...items.values()].filter((i) => i.media_type === 'podcast').map((i) => i.id);
   const bookItems = [...items.values()].filter((i) => i.media_type !== 'podcast');
-  const [pods, counts, episodes, bundles, progress] = await Promise.all([
+  const [pods, counts, episodes, bundles, progress, follows] = await Promise.all([
     getPodcasts(env, showIds, tenantId),
-    getEpisodeCounts(env, showIds, tenantId),
+    getEpisodeCounts(env, showIds, tenantId, userId),
     getEpisodesByIds(env, refs.map((r) => r.episode_id).filter((x): x is string => !!x), tenantId),
     loadItemBundles(env, bookItems, tenantId),
     // The caller's progress on each episode, carried on the episode so a
     // playlist marks what's played without /api/me.
     progressForShows(env, userId, showIds),
+    followInfo(env, userId, showIds),
   ]);
   const epById = new Map(episodes.map((e) => [e.id, e]));
   const bundleById = new Map(bundles.map((b) => [b.item.id, b]));
@@ -124,7 +129,7 @@ export async function expandPlaylist(env: Env, pl: PlaylistRow, userId: string) 
         episodeId: ep.id,
         episode: await buildEpisodeExpanded(ep, item, folder, { progress }),
         libraryItemId: item.id,
-        libraryItem: await buildPodcastItemMinified(item, pod, counts.get(item.id)),
+        libraryItem: await buildPodcastItemMinified(item, pod, counts.get(item.id), follows.get(item.id)),
       });
     } else {
       const b = bundleById.get(item.id);

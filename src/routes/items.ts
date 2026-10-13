@@ -14,6 +14,7 @@ import { insertListeningSession } from '../db/sessions';
 import { getProgress, progressForShows, progressToAbs } from '../db/progress';
 import { audioContentType, resolveProbeUrl, resolveStreamUrl, streamAudio, streamRemoteAudio } from '../storage/resolve';
 import { getEpisode, getPodcast, listShowEpisodes } from '../db/podcasts';
+import { followInfo, unhideEpisodes } from '../db/podcast-follows';
 import { ensureEpisodeChapters } from '../lib/podcasts';
 import { buildEpisodeExpanded, buildPodcastItemExpanded, normalizeSkip, podcastMetadata } from '../lib/podcast-shapes';
 import { adoptAnalysisForSize } from '../lib/episode-analysis';
@@ -183,12 +184,15 @@ itemRoutes.get('/:id', async (c) => {
   const show = await loadPodcastItem(c.env, c.req.param('id'), c.get('tenantId'));
   if (show) {
     // Each episode carries the caller's progress (`mediaProgress`) and a
-    // snippet of its notes (podcast-shapes, notesForList).
-    const [episodes, progress] = await Promise.all([
-      listShowEpisodes(c.env, show.item.id, c.get('tenantId')),
+    // snippet of its notes (podcast-shapes, notesForList). Answered whether
+    // the caller follows the show or not (`following` says), without the
+    // episodes they hid (migration 0028).
+    const [episodes, progress, follow] = await Promise.all([
+      listShowEpisodes(c.env, show.item.id, c.get('tenantId'), userRow.id),
       progressForShows(c.env, userRow.id, [show.item.id]),
+      followInfo(c.env, userRow.id, [show.item.id]),
     ]);
-    return c.json(await buildPodcastItemExpanded(show.item, show.folder, show.podcast, episodes, { progress }));
+    return c.json(await buildPodcastItemExpanded(show.item, show.folder, show.podcast, episodes, { progress, follow: follow.get(show.item.id)! }));
   }
   const bundle = await buildItemBundle(c.env, c.req.param('id'), c.get('tenantId'));
   if (!bundle) return c.json({ error: 'Item not found' }, 404);
@@ -468,11 +472,13 @@ itemRoutes.post('/:id/play/:episodeId', async (c) => {
     if (done) ep = (await getEpisode(c.env, show.item.id, ep.id, tenantId)) ?? ep;
   }
   // Playing an episode from the feed that isn't on the show puts it there:
-  // Continue Listening and Latest only list episodes on a show.
+  // Continue Listening and Latest only list episodes on a show. Playing one
+  // the caller hid unhides it for them (migration 0028), for the same reason.
   if (ep.in_library !== 1) {
     await c.env.DB.prepare('UPDATE podcast_episodes SET in_library = 1, removed = 0, updated_at = ? WHERE id = ?')
       .bind(Date.now(), ep.id).run();
   }
+  await unhideEpisodes(c.env, userRow.id, [ep.id]);
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const episode = await buildEpisodeExpanded(ep, show.item, show.folder);
 
@@ -590,6 +596,10 @@ itemRoutes.patch('/:id/media', requireCanAdd, async (c) => {
     await c.env.DB.prepare("DELETE FROM episode_analysis WHERE library_item_id = ? AND state = 'queued'").bind(show.item.id).run();
   }
   const fresh = (await loadPodcastItem(c.env, show.item.id, tenantId))!;
-  const libraryItem = await buildPodcastItemExpanded(fresh.item, fresh.folder, fresh.podcast, await listShowEpisodes(c.env, show.item.id, tenantId));
+  const userId = c.get('userId');
+  const [episodes, follow] = await Promise.all([
+    listShowEpisodes(c.env, show.item.id, tenantId, userId), followInfo(c.env, userId, [show.item.id]),
+  ]);
+  const libraryItem = await buildPodcastItemExpanded(fresh.item, fresh.folder, fresh.podcast, episodes, { follow: follow.get(show.item.id)! });
   return c.json({ updated: sets.length > 0, libraryItem });
 });

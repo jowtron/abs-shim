@@ -85,9 +85,22 @@ export async function listTenantMembers(env: Env, tenantId: string): Promise<Ten
 
 // Remove a user from a tenant. A user with no remaining membership can no longer
 // resolve a tenant in requireAuth, so they lose access (their account row stays).
+// Their podcast follows in that tenant go too (migration 0028), or a show only
+// they followed would go on being polled for nobody; one left with no
+// follower is parked as unfollowShow parks it.
 export async function removeMember(env: Env, tenantId: string, userId: string): Promise<void> {
-  await env.DB.prepare('DELETE FROM tenant_members WHERE tenant_id = ? AND user_id = ?')
-    .bind(tenantId, userId).run();
+  const shows = (await env.DB.prepare('SELECT library_item_id FROM podcast_follows WHERE user_id = ? AND tenant_id = ?')
+    .bind(userId, tenantId).all<{ library_item_id: string }>()).results.map((r) => r.library_item_id);
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM tenant_members WHERE tenant_id = ? AND user_id = ?').bind(tenantId, userId),
+    env.DB.prepare('DELETE FROM podcast_follows WHERE user_id = ? AND tenant_id = ?').bind(userId, tenantId),
+  ]);
+  for (const id of shows) {
+    await env.DB.prepare(
+      `UPDATE podcasts SET next_check_at = NULL
+        WHERE library_item_id = ? AND NOT EXISTS (SELECT 1 FROM podcast_follows f WHERE f.library_item_id = podcasts.library_item_id)`,
+    ).bind(id).run();
+  }
 }
 
 // Flip which tenant is the user's default (used by the /api/me/tenant switch).
