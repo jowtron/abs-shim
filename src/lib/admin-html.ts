@@ -1708,6 +1708,7 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
       + (p.last_error ? '<br><span class="warn">' + escapeHtml(p.last_error) + '</span>' : '')
       + '<br>Analysis ' + (p.analyse === 'on' ? 'on' : p.analyse === 'off' ? 'off' : 'auto')
       + ': ' + p.analysed + ' done' + (p.analysing ? ', ' + p.analysing + ' waiting or running' : '')
+      + (p.analysis_island ? ' (running on ' + escapeHtml(p.analysis_island) + ')' : '')
       + (p.analysis_errors ? ', <span class="warn">' + p.analysis_errors + ' failed</span>' : '')
       + (p.analysis_last_error ? '<br><span class="warn">' + escapeHtml(p.analysis_last_error) + '</span>' : '') + '</span></div>';
     if (canAdd) {

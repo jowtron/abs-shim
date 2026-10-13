@@ -14,6 +14,7 @@ import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem, getBook
 import { resolveLibraryScope, viewFilter, type LibraryViewRow } from '../db/library-views';
 import type { PodcastRow } from '../db/podcasts';
 import { refreshPodcast } from '../lib/podcasts';
+import { jobIsland } from '../lib/episode-analysis';
 import { probeM4b } from '../prober/m4b';
 import { probeMp3 } from '../prober/mp3';
 import { resolveProbeUrl } from '../storage/resolve';
@@ -247,12 +248,14 @@ adminRoutes.get('/libraries/:libId/podcasts', async (c) => {
             (SELECT COUNT(*) FROM episode_analysis a WHERE a.library_item_id = p.library_item_id AND a.state IN ('queued', 'running')) AS analysing,
             (SELECT COUNT(*) FROM episode_analysis a WHERE a.library_item_id = p.library_item_id AND a.state = 'error') AS analysis_errors,
             (SELECT a.error FROM episode_analysis a WHERE a.library_item_id = p.library_item_id AND a.error IS NOT NULL
-              ORDER BY a.updated_at DESC LIMIT 1) AS analysis_last_error
+              ORDER BY a.updated_at DESC LIMIT 1) AS analysis_last_error,
+            (SELECT a.job_id FROM episode_analysis a WHERE a.library_item_id = p.library_item_id AND a.state = 'running'
+              LIMIT 1) AS analysis_job
        FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
       WHERE li.library_id = ? AND p.tenant_id = ?
       ORDER BY p.title COLLATE NOCASE`,
-  ).bind(c.req.param('libId'), tenantId).all();
-  return c.json({ podcasts: r.results });
+  ).bind(c.req.param('libId'), tenantId).all<Record<string, unknown>>();
+  return c.json({ podcasts: r.results.map((p) => ({ ...p, analysis_island: jobIsland(p['analysis_job'] as string | null) })) });
 });
 
 // Owner-only: the one per-tenant permission switch. Body {membersCanAdd: bool}.

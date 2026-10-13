@@ -25,7 +25,8 @@
 // time (one Mac). The Mac sleeps: a submit answered island_unreachable
 // leaves the row queued with the reason (shown in /admin) and is tried again
 // next tick; a job caught by sleep freezes until wake, so one unfinished
-// after 45 minutes is treated as lost and submitted again (3 tries).
+// past its island's limit (`lostAfterMs`: 45 minutes on the Mac) is treated
+// as lost and submitted again (3 tries).
 
 import type { Env } from '../types';
 import type { EpisodeRow } from '../db/podcasts';
@@ -44,7 +45,6 @@ export const ANALYSIS_HANDLER = 'analyse_episode';
 
 const RECENT_MS = 14 * 86400_000;          // new episodes analysed ahead of the first listen
 const PLAYING_MS = 2 * 3600_000;           // "being played": progress written this recently
-const LOST_AFTER_MS = 45 * 60_000;         // a job unfinished this long is resubmitted
 const UNSUBMITTED_AFTER_MS = 5 * 60_000;   // a claim whose submit never finished
 const MAX_ATTEMPTS = 3;
 const TOKEN_TTL_SECONDS = 2 * 3600;
@@ -52,6 +52,42 @@ const KEEP_ROWS = 2;
 // "Right box, wrong moment" (and "no box routed yet"): the row stays queued
 // and costs no attempt.
 const QUIET_CODES = new Set(['island_unreachable', 'island_unconfigured', 'node_busy', 'busy', 'project_not_routed', 'capabilities_initialising']);
+
+// ─── When a job in flight counts as lost ─────────────────────────────────────
+
+const MIN_MS = 60_000;
+
+// The island a job runs on: wharf-router namespaces job ids `<island>.<id>`
+// (`mac.…`, `stereo-au.…`). null for an id without one.
+export function jobIsland(jobId: string | null | undefined): string | null {
+  if (!jobId) return null;
+  const dot = jobId.indexOf('.');
+  return dot > 0 ? jobId.slice(0, dot) : null;
+}
+
+// How long a job may stay unfinished before it is cancelled and resubmitted,
+// per island, as a function of the episode's length. whisper's speed differs
+// ~50× between the boxes, so one number can't serve both:
+//  - mac: M1 Max, whisper.cpp on Metal, a 74-minute episode in about 2 min.
+//    45 min is far past any real run and short enough that a job frozen by
+//    the Mac sleeping is retried within the hour.
+//  - stereo-au: a Celeron, CPU only; whisper takes about 80 min of CPU per
+//    hour of audio with base.en (~30 with tiny.en). At 45 min every hour-long
+//    episode would be cancelled and resubmitted until it ran out of tries.
+//    2.5× the audio + 15 min covers base.en with headroom; capped at 6 h so a
+//    job that really is stuck still gets retried the same day.
+// An island not listed here gets the Mac's rule. A new island is one line.
+const LOST_AFTER: ReadonlyMap<string, (audioMs: number) => number> = new Map([
+  ['mac', () => 45 * MIN_MS],
+  ['stereo-au', (audioMs: number) => Math.min(2.5 * audioMs + 15 * MIN_MS, 6 * 60 * MIN_MS)],
+]);
+const UNKNOWN_AUDIO_MS = 90 * MIN_MS;     // an episode whose length the feed and probe never gave
+
+export function lostAfterMs(jobId: string | null | undefined, durationSeconds: number | null | undefined): number {
+  const rule = LOST_AFTER.get(jobIsland(jobId) ?? 'mac') ?? LOST_AFTER.get('mac')!;
+  const audioMs = durationSeconds && durationSeconds > 0 ? durationSeconds * 1000 : UNKNOWN_AUDIO_MS;
+  return Math.round(rule(audioMs));
+}
 
 export class AnalysisInputError extends Error {}
 
@@ -215,8 +251,12 @@ async function jobFailure(env: Env, job: WharfJob): Promise<string> {
 }
 
 // 'busy' while the job is still going, 'freed' once its row is settled.
-async function checkRunning(env: Env, r: AnalysisRow, now: number): Promise<{ busy: boolean; log: string }> {
+// `episode_duration` is podcast_episodes.duration_seconds (the pump joins it).
+type RunningRow = AnalysisRow & { episode_duration: number | null };
+async function checkRunning(env: Env, r: RunningRow, now: number): Promise<{ busy: boolean; log: string }> {
   const age = now - r.updated_at;
+  const lostAfter = lostAfterMs(r.job_id, r.episode_duration);
+  const after = `${Math.round(lostAfter / MIN_MS)} min${jobIsland(r.job_id) ? ` on ${jobIsland(r.job_id)}` : ''}`;
   if (!r.job_id) {
     if (age < UNSUBMITTED_AFTER_MS) return { busy: true, log: '' };
     await failRow(env, r.episode_id, r.size_bytes, 'the submit never finished');
@@ -228,8 +268,8 @@ async function checkRunning(env: Env, r: AnalysisRow, now: number): Promise<{ bu
   } catch (err) {
     // Asleep mid-job: the job freezes with the Mac and /jobs/:id reads only
     // reach its own island. Wait, then give it up as lost.
-    if (age > LOST_AFTER_MS) {
-      await failRow(env, r.episode_id, r.size_bytes, `no result after 45 min (${errMsg(err)})`);
+    if (age > lostAfter) {
+      await failRow(env, r.episode_id, r.size_bytes, `no result after ${after} (${errMsg(err)})`);
       return { busy: false, log: `analysis: ${r.job_id} lost` };
     }
     await env.DB.prepare('UPDATE episode_analysis SET error = ? WHERE episode_id = ? AND size_bytes = ? AND state = ?')
@@ -257,10 +297,10 @@ async function checkRunning(env: Env, r: AnalysisRow, now: number): Promise<{ bu
     await failRow(env, r.episode_id, r.size_bytes, await jobFailure(env, job));
     return { busy: false, log: `analysis: ${r.job_id} ${job.state}` };
   }
-  if (age > LOST_AFTER_MS) {
+  if (age > lostAfter) {
     await cancelJob(env, r.job_id).catch(() => undefined);
-    await failRow(env, r.episode_id, r.size_bytes, `no result after 45 min (job still ${job.state})`);
-    return { busy: false, log: `analysis: ${r.job_id} given up after 45 min` };
+    await failRow(env, r.episode_id, r.size_bytes, `no result after ${after} (job still ${job.state})`);
+    return { busy: false, log: `analysis: ${r.job_id} given up after ${after}` };
   }
   return { busy: true, log: '' };
 }
@@ -321,8 +361,11 @@ export async function analysisPump(env: Env, opts: { origin?: string } = {}): Pr
   if (!wharfConfigured(env)) return [];
   const log: string[] = [];
   const now = Date.now();
-  const running = await env.DB.prepare("SELECT * FROM episode_analysis WHERE state = 'running' ORDER BY updated_at ASC")
-    .all<AnalysisRow>();
+  const running = await env.DB.prepare(
+    `SELECT a.*, e.duration_seconds AS episode_duration
+       FROM episode_analysis a LEFT JOIN podcast_episodes e ON e.id = a.episode_id
+      WHERE a.state = 'running' ORDER BY a.updated_at ASC`,
+  ).all<RunningRow>();
   let busy = false;
   for (const r of running.results) {
     const res = await checkRunning(env, r, now);
@@ -562,7 +605,7 @@ export async function adoptAnalysisForSize(env: Env, episodeId: string, size: nu
 
 function rowJson(r: AnalysisRow) {
   return {
-    size: r.size_bytes, state: r.state, attempts: r.attempts, error: r.error, jobId: r.job_id,
+    size: r.size_bytes, state: r.state, attempts: r.attempts, error: r.error, jobId: r.job_id, island: jobIsland(r.job_id),
     duration: r.duration, model: r.model, llmModel: r.llm_model, transcriptSource: r.transcript_source,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
