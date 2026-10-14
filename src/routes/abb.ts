@@ -1,6 +1,7 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { Env } from '../types';
 import { requireAuth, requireCanAdd, type AuthVars } from '../auth/middleware';
+import { nodeForKey, touchNodeKey } from '../db/node-keys';
 import { getTenantSetting, setTenantSetting, deleteTenantSetting, membersCanAdd } from '../db/settings';
 import { abbLogin, abbSearch, abbMagnet, abbDetails, magnetFromHash, type AbbCookie, type AbbResult } from '../lib/abb';
 import {
@@ -30,7 +31,32 @@ import {
 // landed. RD caps active torrents (~25 premium), hence the client batches.
 
 export const abbRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
-abbRoutes.use('*', requireAuth);
+
+// The catalogue's wharf nodes (wharf-project/abbcrawl, abbcovers) send their
+// own key, made in /admin (src/db/node-keys.ts), as X-Node-Key instead of
+// signing in as the owner. A key opens only these routes, and it names the
+// node: a keyed request's `node` comes from the key, never the body.
+const NODE_ROUTE = /^\/api\/admin\/abb\/catalog\/(details\/(claim|submit)|covers\/(pending|\d+(\/error)?))$/;
+abbRoutes.use('*', async (c, next) => {
+  const key = c.req.header('X-Node-Key');
+  if (key === undefined) return requireAuth(c, next);
+  if (!NODE_ROUTE.test(c.req.path)) return c.json({ error: 'A node key only opens the catalogue node routes' }, 403);
+  const node = await nodeForKey(c.env, key);
+  if (!node) return c.json({ error: 'Unknown or revoked node key' }, 401);
+  c.set('nodeName', node.name);
+  c.executionCtx.waitUntil(touchNodeKey(c.env, node).catch(() => undefined));
+  await next();
+});
+
+// The node routes answer a keyed node, or the tenant owner (the Mac's cover
+// runner, and nodes not yet given a key, still sign in as the owner).
+// Returns the node's name ('' when the owner sent none), or null = refuse.
+function catalogNode(c: Context<{ Bindings: Env; Variables: AuthVars }>, given: unknown): string | null {
+  const keyed = c.get('nodeName');
+  if (keyed) return keyed;
+  if (c.get('tenantRole') !== 'owner') return null;
+  return String(given ?? '').trim().slice(0, 40);
+}
 
 const K = { user: 'abb_username', pass: 'abb_password', rd: 'rd_token', cookie: 'abb_cookie' } as const;
 
@@ -285,6 +311,7 @@ abbRoutes.get('/catalog/browse', async (c) => {
 // ?shard=&shards= partitions the backlog between several runners (the Mac
 // and/or the wharf nodes) so they don't resize the same covers.
 abbRoutes.get('/catalog/covers/pending', async (c) => {
+  if (catalogNode(c, '') === null) return c.json({ error: 'Only the owner or a catalogue node can do this' }, 403);
   const limit = Number(c.req.query('limit') ?? '200') || 200;
   const shards = Number(c.req.query('shards') ?? '1') || 1;
   const shard = Number(c.req.query('shard') ?? '0') || 0;
@@ -293,6 +320,8 @@ abbRoutes.get('/catalog/covers/pending', async (c) => {
 
 // Body: the webp bytes. Stored as abbcovers/<id>.webp, served at /public/abb-cover/<id>.webp.
 abbRoutes.put('/catalog/covers/:id', async (c) => {
+  const node = catalogNode(c, c.req.query('node'));
+  if (node === null) return c.json({ error: 'Only the owner or a catalogue node can do this' }, 403);
   const id = Number(c.req.param('id'));
   if (!Number.isInteger(id)) return c.json({ error: 'bad id' }, 400);
   const body = await c.req.arrayBuffer();
@@ -300,17 +329,17 @@ abbRoutes.put('/catalog/covers/:id', async (c) => {
   const isWebp = magic.length === 12 && String.fromCharCode(...magic.subarray(0, 4)) === 'RIFF' && String.fromCharCode(...magic.subarray(8, 12)) === 'WEBP';
   if (!isWebp || body.byteLength > 512 * 1024) return c.json({ error: 'expected a webp under 512 KB' }, 400);
   if (!(await coverStore(c.env, id, body))) return c.json({ error: 'no such post' }, 404);
-  const node = (c.req.query('node') ?? '').trim().slice(0, 40);
   if (node) c.executionCtx.waitUntil(noteCoverStored(c.env, node).catch(() => undefined));
   return c.json({ ok: true, bytes: body.byteLength });
 });
 
 abbRoutes.post('/catalog/covers/:id/error', async (c) => {
+  const node = catalogNode(c, c.req.query('node'));
+  if (node === null) return c.json({ error: 'Only the owner or a catalogue node can do this' }, 403);
   const id = Number(c.req.param('id'));
   const body = await c.req.json().catch(() => ({})) as { error?: string };
   if (!Number.isInteger(id)) return c.json({ error: 'bad id' }, 400);
   await coverFailed(c.env, id, String(body.error ?? 'unknown'));
-  const node = (c.req.query('node') ?? '').trim().slice(0, 40);
   if (node) c.executionCtx.waitUntil(noteCoverFailed(c.env, node).catch(() => undefined));
   return c.json({ ok: true });
 });
@@ -350,9 +379,9 @@ abbRoutes.post('/catalog/control', async (c) => {
 // Owner-only: a submission becomes catalogue content every tenant sees, so
 // this isn't a route any member should be able to feed.
 abbRoutes.post('/catalog/details/claim', async (c) => {
-  if (c.get('tenantRole') !== 'owner') return c.json({ error: 'Only the tenant owner can run a crawl node' }, 403);
   const body = await c.req.json().catch(() => ({})) as { node?: string; limit?: number };
-  const node = String(body.node ?? '').trim().slice(0, 40);
+  const node = catalogNode(c, body.node);
+  if (node === null) return c.json({ error: 'Only the tenant owner can run a crawl node' }, 403);
   if (!node) return c.json({ error: 'node required' }, 400);
   const items = await detailClaim(c.env, node, Number(body.limit ?? 10));
   return c.json({ items, count: items.length });
@@ -362,9 +391,9 @@ abbRoutes.post('/catalog/details/claim', async (c) => {
 // that failed, or { node, url, release: true } to hand a leased row back
 // untouched (a node shutting down or backing off).
 abbRoutes.post('/catalog/details/submit', async (c) => {
-  if (c.get('tenantRole') !== 'owner') return c.json({ error: 'Only the tenant owner can run a crawl node' }, 403);
   const body = await c.req.json().catch(() => ({})) as { node?: string } & Record<string, unknown>;
-  const node = String(body.node ?? '').trim().slice(0, 40);
+  const node = catalogNode(c, body.node);
+  if (node === null) return c.json({ error: 'Only the tenant owner can run a crawl node' }, 403);
   if (!node) return c.json({ error: 'node required' }, 400);
   const html = typeof body.html === 'string' ? body.html : undefined;
   // ABB detail pages are ~100 KB; anything far past that is a mistake, not

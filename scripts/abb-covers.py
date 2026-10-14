@@ -29,6 +29,9 @@ network hiccup — closing the lid pauses the process, reopening resumes it:
   python3 scripts/abb-covers.py --server https://abs-shim.jderrick.app \
       --user root --quality 30 --loop
 
+A wharf node uses its node key instead (--node-key / ABS_SHIM_NODE_KEY, made
+in /admin → Catalogue → Node keys, 2026-10-14); then no user or password.
+
 Credentials: --pass, the ABS_SHIM_PASS env var, or the macOS Keychain
 (--keychain, default in --loop mode: asked once, stored under the service
 name "abs-shim-covers", read back on every start). The 30-day shim token
@@ -72,9 +75,12 @@ def log(msg):
 
 # ─── shim API ────────────────────────────────────────────────────────────────
 
-def api(server, token, path, method="GET", body=None, content_type="application/json"):
+def api(server, token, path, method="GET", body=None, content_type="application/json", node_key=None):
     req = urllib.request.Request(server + path, method=method)
-    req.add_header("Authorization", "Bearer " + token)
+    if node_key:
+        req.add_header("X-Node-Key", node_key)
+    else:
+        req.add_header("Authorization", "Bearer " + token)
     req.add_header("User-Agent", SHIM_UA)
     if body is not None:
         if isinstance(body, (dict, list)):
@@ -133,6 +139,20 @@ class Session:
             log("token rejected — logging in again")
             self.token = login(self.server, self.user, self.password)
             return api(self.server, self.token, path, method, body, content_type)
+
+
+class KeySession:
+    """A node's key instead of the owner's login: nothing to log in with, and
+    a 401 means the key was revoked, which retrying won't change."""
+
+    def __init__(self, server, key):
+        self.server, self.key = server, key
+
+    def call(self, path, method="GET", body=None, content_type="application/json"):
+        try:
+            return api(self.server, None, path, method, body, content_type, node_key=self.key)
+        except Unauthorized as e:
+            raise Unauthorized("the shim refused the node key (revoked?)") from e
 
 
 # ─── images ─────────────────────────────────────────────────────────────────
@@ -385,43 +405,8 @@ def one_pass(sess, args, quality, limit):
     return done, failed
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    # Env defaults so the wharf service (wharf-project/abbcrawl) can be
-    # configured entirely from the project .env with no args in project.toml.
-    ap.add_argument("--server", default=os.environ.get("ABS_SHIM_URL"), help="shim origin, e.g. https://abs-shim.jderrick.app")
-    ap.add_argument("--user", default=os.environ.get("ABS_SHIM_USER"))
-    # Sharding lets several runners share the backlog without doing the same
-    # covers twice: the shim hands back only posts where id % shards == shard.
-    # Defaults are one runner taking everything, which is what the Mac does.
-    # Purely a label: the shim counts covers per node so /admin can show the
-    # laptop's and each wharf node's progress side by side.
-    ap.add_argument("--node", default=os.environ.get("NODE_NAME"), help="name this runner reports as in /admin")
-    ap.add_argument("--shard", type=int, default=int(os.environ.get("ABS_SHIM_SHARD", "0")), help="this runner's index, 0-based")
-    ap.add_argument("--shards", type=int, default=int(os.environ.get("ABS_SHIM_SHARDS", "1")), help="how many runners share the backlog")
-    ap.add_argument("--pass", dest="password", default=os.environ.get("ABS_SHIM_PASS"))
-    ap.add_argument("--keychain", action="store_true", help="store/read the password in the macOS Keychain (default with --loop)")
-    ap.add_argument("--quality", default="30", help="webp quality 1-100; comma-separated list in --sample mode")
-    ap.add_argument("--max", type=int, default=500, help="fit inside this many px (default 500); smaller images are left as is")
-    ap.add_argument("--limit", type=int, default=100000, help="stop a pass after this many covers")
-    ap.add_argument("--batch", type=int, default=200, help="pending covers fetched per round")
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--sample", type=int, metavar="N", help="write N covers locally at each --quality and stop (no upload)")
-    ap.add_argument("--out", default="./cover-samples", help="--sample output directory")
-    ap.add_argument("--upload", action="store_true", help="one pass: PUT the webps to the shim")
-    ap.add_argument("--loop", action="store_true", help="keep running: a pass, then sleep --every minutes, forever")
-    ap.add_argument("--every", type=float, default=15, help="minutes between passes in --loop mode")
-    args = ap.parse_args()
-
-    if not (args.sample or args.upload or args.loop):
-        ap.error("pass --upload, --loop, or --sample N to preview quality first")
-    if not args.server or not args.user:
-        ap.error("--server and --user are required (or ABS_SHIM_URL / ABS_SHIM_USER in the environment)")
-    if args.shards < 1 or not (0 <= args.shard < args.shards):
-        ap.error(f"--shard must be 0..{max(args.shards - 1, 0)} with --shards {args.shards}")
-    server = args.server.rstrip("/")
-    qualities = [int(q) for q in str(args.quality).split(",")]
-
+def owner_session(args, server):
+    """Sign in as --user: the Mac's runner, and nodes without a key."""
     use_keychain = args.keychain or (args.loop and not args.password)
     password = args.password
     if not password and use_keychain:
@@ -436,8 +421,7 @@ def main():
     # A wrong password (401) throws the stored one away and asks again.
     while True:
         try:
-            sess = Session(server, args.user, password)
-            break
+            return Session(server, args.user, password)
         except urllib.error.HTTPError as e:
             if e.code == 401 and sys.stdin.isatty():
                 log("login failed: wrong password for " + args.user)
@@ -458,6 +442,51 @@ def main():
                 sys.exit(f"cannot reach {server}: {e}")
             log(f"cannot reach {server} ({e}); retrying in 60s")
             time.sleep(60)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Env defaults so the wharf service (wharf-project/abbcrawl) can be
+    # configured entirely from the project .env with no args in project.toml.
+    ap.add_argument("--server", default=os.environ.get("ABS_SHIM_URL"), help="shim origin, e.g. https://abs-shim.jderrick.app")
+    ap.add_argument("--user", default=os.environ.get("ABS_SHIM_USER"))
+    # Sharding lets several runners share the backlog without doing the same
+    # covers twice: the shim hands back only posts where id % shards == shard.
+    # Defaults are one runner taking everything, which is what the Mac does.
+    # Purely a label: the shim counts covers per node so /admin can show the
+    # laptop's and each wharf node's progress side by side.
+    ap.add_argument("--node", default=os.environ.get("NODE_NAME"), help="name this runner reports as in /admin")
+    ap.add_argument("--shard", type=int, default=int(os.environ.get("ABS_SHIM_SHARD", "0")), help="this runner's index, 0-based")
+    ap.add_argument("--shards", type=int, default=int(os.environ.get("ABS_SHIM_SHARDS", "1")), help="how many runners share the backlog")
+    ap.add_argument("--pass", dest="password", default=os.environ.get("ABS_SHIM_PASS"))
+    ap.add_argument("--node-key", default=os.environ.get("ABS_SHIM_NODE_KEY"), help="this node's key (replaces --user/--pass)")
+    ap.add_argument("--keychain", action="store_true", help="store/read the password in the macOS Keychain (default with --loop)")
+    ap.add_argument("--quality", default="30", help="webp quality 1-100; comma-separated list in --sample mode")
+    ap.add_argument("--max", type=int, default=500, help="fit inside this many px (default 500); smaller images are left as is")
+    ap.add_argument("--limit", type=int, default=100000, help="stop a pass after this many covers")
+    ap.add_argument("--batch", type=int, default=200, help="pending covers fetched per round")
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--sample", type=int, metavar="N", help="write N covers locally at each --quality and stop (no upload)")
+    ap.add_argument("--out", default="./cover-samples", help="--sample output directory")
+    ap.add_argument("--upload", action="store_true", help="one pass: PUT the webps to the shim")
+    ap.add_argument("--loop", action="store_true", help="keep running: a pass, then sleep --every minutes, forever")
+    ap.add_argument("--every", type=float, default=15, help="minutes between passes in --loop mode")
+    args = ap.parse_args()
+
+    if not (args.sample or args.upload or args.loop):
+        ap.error("pass --upload, --loop, or --sample N to preview quality first")
+    if not args.server or not (args.user or args.node_key):
+        ap.error("--server and --node-key or --user are required (or ABS_SHIM_URL and ABS_SHIM_NODE_KEY / ABS_SHIM_USER in the environment)")
+    if args.shards < 1 or not (0 <= args.shard < args.shards):
+        ap.error(f"--shard must be 0..{max(args.shards - 1, 0)} with --shards {args.shards}")
+    server = args.server.rstrip("/")
+    qualities = [int(q) for q in str(args.quality).split(",")]
+
+    if args.node_key:
+        sess = KeySession(server, args.node_key)
+        log(f"node={args.node} auth=node key")
+    else:
+        sess = owner_session(args, server)
 
     if args.sample:
         sample(sess, args, qualities)

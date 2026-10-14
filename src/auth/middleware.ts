@@ -15,6 +15,9 @@ export type AuthVars = {
   // without re-issuing the 30-day access token.
   tenantId: string;
   tenantRole: TenantRole;
+  // Set instead of all the above when a catalogue node sent its key
+  // (X-Node-Key, src/routes/abb.ts): the node's name from node_keys.
+  nodeName?: string;
 };
 
 // Requires a valid access token. We accept it from any of:

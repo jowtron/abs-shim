@@ -31,6 +31,7 @@ import { getSignupMode, getSetting, setSetting, membersCanAdd, setTenantSetting,
 import { createInvite, listOpenInvites, deleteInvite } from '../db/invites';
 import { createResetLink, discardOwnerLinks, resetUrl, linkOrigin, OWNER_LINK_TTL_MS } from '../lib/password-reset';
 import { listTenantMembers, removeMember } from '../db/tenants';
+import { createNodeKey, listNodeKeys, revokeNodeKey, NODE_NAME_RE } from '../db/node-keys';
 
 // Mounted at /api/admin from index.ts. The admin UI itself lives at /admin and
 // is served as an inline HTML page (src/lib/admin-html.ts).
@@ -1759,6 +1760,25 @@ adminRoutes.post('/users/:id/reset-link', requireInstanceOwner, async (c) => {
 adminRoutes.delete('/users/:id/reset-link', requireInstanceOwner, async (c) => {
   await discardOwnerLinks(c.env, c.req.param('id'));
   return c.body(null, 204);
+});
+
+// ─── Catalogue node keys (migration 0030, src/db/node-keys.ts) ──────────────
+// What a wharf node running abbcrawl/abbcovers signs in with, instead of the
+// owner's password. The key is in the POST's answer and nowhere else.
+
+adminRoutes.get('/node-keys', requireInstanceOwner, async (c) => c.json({ keys: await listNodeKeys(c.env) }));
+
+adminRoutes.post('/node-keys', requireInstanceOwner, async (c) => {
+  const body = await c.req.json().catch(() => ({})) as { name?: unknown };
+  const name = String(body.name ?? '').trim();
+  if (!NODE_NAME_RE.test(name)) {
+    return c.json({ error: 'A node name is up to 40 letters, digits, dots, dashes or underscores, e.g. stereo-nz' }, 400);
+  }
+  return c.json(await createNodeKey(c.env, name, c.get('userId')));
+});
+
+adminRoutes.delete('/node-keys/:id', requireInstanceOwner, async (c) => {
+  return (await revokeNodeKey(c.env, c.req.param('id'))) ? c.body(null, 204) : c.json({ error: 'No such key' }, 404);
 });
 
 // ─── helpers ────────────────────────────────────────────────────────────────

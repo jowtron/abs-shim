@@ -35,4 +35,4 @@ description = "One pass every 15 minutes over this node's shard of the un-cached
 command = "venv/bin/python3"
 args = ["handlers/abb-covers.py", "--loop", "--every", "15", "--workers", "2", "--batch", "60"]
 restart = "always"
-env_passthrough = ["ABS_SHIM_URL", "ABS_SHIM_USER", "ABS_SHIM_PASS", "ABS_SHIM_SHARD", "ABS_SHIM_SHARDS", "NODE_NAME"]
+env_passthrough = ["ABS_SHIM_URL", "ABS_SHIM_NODE_KEY", "ABS_SHIM_USER", "ABS_SHIM_PASS", "ABS_SHIM_SHARD", "ABS_SHIM_SHARDS", "NODE_NAME"]

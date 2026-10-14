@@ -293,6 +293,21 @@ export const ADMIN_HTML = String.raw`<!doctype html>
       <div id="abb-cat-tiles" class="cat-tiles"></div>
       <p id="abb-cat-explain" class="cat-note"></p>
       <table class="cat-workers"><tbody id="abb-cat-workers"></tbody></table>
+      <details id="abb-node-keys-box" style="margin-top:0.4rem; display:none">
+        <summary class="muted" style="font-size:0.82rem; cursor:pointer">Node keys <span id="abb-node-keys-count"></span></summary>
+        <p class="muted" style="font-size:0.8rem; margin:0.3rem 0">Each wharf node that crawls or resizes covers for the catalogue signs in with its own key, not your password. A key opens only the catalogue's node routes, and revoking it stops that node at once. A node has to be able to reach AudioBookBay, so nothing on the home connection (stereo-au, the Mac) can crawl.</p>
+        <table class="cat-workers"><tbody id="abb-node-keys"></tbody></table>
+        <div class="upload-row" style="margin-top:0.4rem">
+          <input id="abb-node-name" placeholder="node name, e.g. stereo-nz" autocapitalize="none" spellcheck="false" style="max-width:14rem">
+          <button class="secondary" id="abb-node-add">Make a key</button>
+        </div>
+        <div id="abb-node-new" style="display:none; margin-top:0.4rem">
+          <p class="ok" style="font-size:0.82rem; margin:0 0 0.3rem">Key for <b id="abb-node-new-name"></b>, shown this once. Put these lines in the node's two project .env files, then deploy both projects to it (wharf-project/README.md).</p>
+          <pre id="abb-node-new-env" style="white-space:pre-wrap; word-break:break-all; font-size:0.78rem; padding:0.5rem; border:1px solid rgba(127,127,127,0.4); border-radius:6px; margin:0 0 0.3rem"></pre>
+          <button class="secondary" id="abb-node-copy">Copy</button>
+          <button class="secondary" id="abb-node-done">Done</button>
+        </div>
+      </details>
       <div id="abb-catalog-status" class="muted" style="font-size:0.82rem; margin-top:0.5rem">Not loaded.</div>
       <div id="abb-catalog-said" class="ok" style="font-size:0.82rem; margin-top:0.3rem"></div>
       <details id="abb-cat-listings-box" style="margin-top:0.4rem">
@@ -2069,6 +2084,7 @@ function renderAbb(status, libraries) {
   // the owner's dashboard.
   card.style.display = target.options.length && status.canAdd ? 'block' : 'none';
   document.getElementById('abb-catalog').style.display = status.role === 'owner' ? '' : 'none';
+  document.getElementById('abb-node-keys-box').style.display = status.isInstanceOwner ? '' : 'none';
   audibleRender(status, libraries);
   if (abbWired) return;
   abbWired = true;
@@ -2088,6 +2104,16 @@ function renderAbb(status, libraries) {
   document.addEventListener('visibilitychange', abbCatalogPolling);
   for (const b of document.querySelectorAll('#abb-catalog [data-catalog]')) b.addEventListener('click', () => abbCatalogAction(b.dataset.catalog, b));
   document.getElementById('abb-budget').addEventListener('change', (ev) => abbCatalogAction('set-budget', ev.target, Number(ev.target.value)));
+  document.getElementById('abb-node-keys-box').addEventListener('toggle', (ev) => { if (ev.target.open) abbLoadNodeKeys(); });
+  document.getElementById('abb-node-add').addEventListener('click', abbMakeNodeKey);
+  document.getElementById('abb-node-name').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') abbMakeNodeKey(); });
+  document.getElementById('abb-node-copy').addEventListener('click', () => {
+    navigator.clipboard.writeText(document.getElementById('abb-node-new-env').textContent).catch(() => {});
+  });
+  document.getElementById('abb-node-done').addEventListener('click', () => {
+    document.getElementById('abb-node-new').style.display = 'none';
+    document.getElementById('abb-node-new-env').textContent = '';
+  });
   abbLoadCatalog();
   const q = document.getElementById('abb-q');
   const clear = document.getElementById('abb-clear');
@@ -2811,6 +2837,81 @@ function catEta(remaining, delta, ms) {
   if (mins < 90) return '~' + Math.round(mins) + ' min left';
   if (mins < 2880) return '~' + Math.round(mins / 60) + ' h left';
   return '~' + Math.round(mins / 1440) + ' days left';
+}
+
+// ─── Catalogue node keys (src/db/node-keys.ts, instance owner only) ───────
+// What a wharf node signs in with instead of the owner's password. The key
+// comes back once, from the POST, and is shown as the .env lines to paste.
+async function abbLoadNodeKeys() {
+  const tb = document.getElementById('abb-node-keys');
+  let data;
+  try {
+    data = await api('/api/admin/node-keys');
+  } catch (err) {
+    if (!(err instanceof UnauthorizedError)) tb.innerHTML = '<tr><td class="muted">' + escapeHtml(err.message) + '</td></tr>';
+    return;
+  }
+  document.getElementById('abb-node-keys-count').textContent = data.keys.length ? '(' + data.keys.length + ')' : '';
+  tb.innerHTML = '';
+  if (!data.keys.length) {
+    tb.innerHTML = '<tr><td class="muted">No keys yet. A node without one signs in with your password.</td></tr>';
+    return;
+  }
+  for (const k of data.keys) {
+    const tr = document.createElement('tr');
+    const td1 = document.createElement('td');
+    td1.className = 'who';
+    td1.textContent = k.name;
+    const td2 = document.createElement('td');
+    td2.className = 'muted';
+    td2.textContent = 'made ' + new Date(k.created_at).toLocaleDateString() + ' · last used ' + abbAgo(k.last_used_at);
+    const td3 = document.createElement('td');
+    const b = document.createElement('button');
+    b.className = 'secondary';
+    b.textContent = 'Revoke';
+    b.addEventListener('click', async () => {
+      if (!confirm('Revoke the key for ' + k.name + '? That node stops working for the catalogue at once.')) return;
+      b.disabled = true;
+      try { await api('/api/admin/node-keys/' + encodeURIComponent(k.id), { method: 'DELETE' }); }
+      catch (err) { showError('Revoke failed: ' + err.message); }
+      abbLoadNodeKeys();
+    });
+    td3.appendChild(b);
+    tr.append(td1, td2, td3);
+    tb.appendChild(tr);
+  }
+}
+
+async function abbMakeNodeKey() {
+  const input = document.getElementById('abb-node-name');
+  const name = input.value.trim();
+  if (!name) { input.focus(); return; }
+  const btn = document.getElementById('abb-node-add');
+  btn.disabled = true;
+  try {
+    const k = await api('/api/admin/node-keys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+    });
+    document.getElementById('abb-node-new-name').textContent = k.name;
+    document.getElementById('abb-node-new-env').textContent = [
+      '# /srv/wharf/projects/abbcrawl/.env',
+      'SHIM_URL=' + location.origin,
+      'SHIM_NODE_KEY=' + k.key,
+      'NODE_NAME=' + k.name,
+      '',
+      '# /srv/wharf/projects/abbcovers/.env (plus ABS_SHIM_SHARD / ABS_SHIM_SHARDS)',
+      'ABS_SHIM_URL=' + location.origin,
+      'ABS_SHIM_NODE_KEY=' + k.key,
+      'NODE_NAME=' + k.name,
+    ].join('\n');
+    document.getElementById('abb-node-new').style.display = '';
+    input.value = '';
+    abbLoadNodeKeys();
+  } catch (err) {
+    if (!(err instanceof UnauthorizedError)) showError('Could not make a key: ' + err.message);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function catWorkerRow(name, what, detail, lastSeen, now) {

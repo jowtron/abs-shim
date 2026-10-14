@@ -26,8 +26,10 @@ its lease back and sleeps for an exponentially growing spell rather than
 hammering a site that is already unhappy.
 
 Config (project .env):
-  SHIM_URL       https://abs-shim.jderrick.app
-  SHIM_USER      shim account (must be the tenant owner — the routes are owner-only)
+  SHIM_URL       https://rhapsode.jderrick.app
+  SHIM_NODE_KEY  this node's key, made in /admin → Catalogue → Node keys
+                 (2026-10-14). With it, SHIM_USER/SHIM_PASS aren't used.
+  SHIM_USER      without a key: the shim account (the tenant owner)
   SHIM_PASS      its password
   NODE_NAME      label shown in /admin (default: hostname)
   PACE_SECONDS   seconds between ABB fetches (default 8 → ~7/min)
@@ -50,6 +52,7 @@ SHIM_UA = "abb-detail-crawler/1.0"
 SHIM_URL = os.environ.get("SHIM_URL", "").rstrip("/")
 SHIM_USER = os.environ.get("SHIM_USER", "")
 SHIM_PASS = os.environ.get("SHIM_PASS", "")
+SHIM_NODE_KEY = os.environ.get("SHIM_NODE_KEY", "")
 NODE = os.environ.get("NODE_NAME") or socket.gethostname()
 PACE = float(os.environ.get("PACE_SECONDS", "8"))
 BATCH = int(os.environ.get("BATCH", "10"))
@@ -72,10 +75,12 @@ class Unauthorized(Exception):
 
 
 class Session:
-    """Shim API client; re-logs-in when the 30-day token is rejected."""
+    """Shim API client. With SHIM_NODE_KEY every request carries the key and
+    there is nothing to log in with; otherwise it signs in as the owner and
+    re-logs-in when the 30-day token is rejected."""
 
     def __init__(self):
-        self.token = self._login()
+        self.token = None if SHIM_NODE_KEY else self._login()
 
     def _login(self):
         req = urllib.request.Request(
@@ -89,7 +94,10 @@ class Session:
     def _once(self, path, body):
         req = urllib.request.Request(SHIM_URL + path, method="POST",
                                      data=json.dumps(body).encode())
-        req.add_header("Authorization", "Bearer " + self.token)
+        if SHIM_NODE_KEY:
+            req.add_header("X-Node-Key", SHIM_NODE_KEY)
+        else:
+            req.add_header("Authorization", "Bearer " + self.token)
         req.add_header("Content-Type", "application/json")
         req.add_header("User-Agent", SHIM_UA)
         try:
@@ -105,6 +113,9 @@ class Session:
         try:
             return self._once(path, body)
         except Unauthorized:
+            if SHIM_NODE_KEY:
+                # A revoked or mistyped key won't fix itself by retrying.
+                raise Unauthorized("the shim refused SHIM_NODE_KEY (revoked?)")
             log("shim token rejected — logging in again")
             self.token = self._login()
             return self._once(path, body)
@@ -122,9 +133,9 @@ def fetch_page(url):
 
 
 def main():
-    if not (SHIM_URL and SHIM_USER and SHIM_PASS):
-        sys.exit("SHIM_URL, SHIM_USER and SHIM_PASS must be set in the project .env")
-    log(f"node={NODE} shim={SHIM_URL} pace={PACE}s batch={BATCH}")
+    if not (SHIM_URL and (SHIM_NODE_KEY or (SHIM_USER and SHIM_PASS))):
+        sys.exit("SHIM_URL and SHIM_NODE_KEY (or SHIM_USER + SHIM_PASS) must be set in the project .env")
+    log(f"node={NODE} shim={SHIM_URL} auth={'node key' if SHIM_NODE_KEY else 'owner login'} pace={PACE}s batch={BATCH}")
     sess = Session()
     fails = 0
     backoff_level = 0

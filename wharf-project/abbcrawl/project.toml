@@ -14,7 +14,7 @@
 #
 # Layout:
 #   handlers/abb-detail-crawler.py   the service (see its docstring)
-#   .env                             SHIM_URL / SHIM_USER / SHIM_PASS / PACE_SECONDS
+#   .env                             SHIM_URL / SHIM_NODE_KEY / NODE_NAME / PACE_SECONDS
 #
 # Cover resizing is a SEPARATE project (../abbcovers): it needs Pillow and a
 # few hundred MB of peak RSS, and wharfd's cgroup is capped per box —
@@ -40,5 +40,5 @@ description = "Claims batches of un-fetched ABB posts from the shim, fetches eac
 command = "python3"
 args = ["handlers/abb-detail-crawler.py"]
 restart = "always"
-env_passthrough = ["SHIM_URL", "SHIM_USER", "SHIM_PASS", "NODE_NAME", "PACE_SECONDS", "BATCH", "IDLE_SLEEP"]
+env_passthrough = ["SHIM_URL", "SHIM_NODE_KEY", "SHIM_USER", "SHIM_PASS", "NODE_NAME", "PACE_SECONDS", "BATCH", "IDLE_SLEEP"]
 

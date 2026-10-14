@@ -42,7 +42,8 @@ capped separately (`systemd-run --scope`, e.g. audible's `max_memory_mb`), so
 they don't spend this budget; `[[services]]` processes do.
 
 The shim routes they use: `POST /api/admin/abb/catalog/details/{claim,submit}`
-(owner-only) and `GET/PUT /api/admin/abb/catalog/covers/*`.
+and `GET/PUT/POST /api/admin/abb/catalog/covers/*`, all opened by the node's
+key (`X-Node-Key`) or by the tenant owner's login.
 
 ## Nodes
 
@@ -94,8 +95,10 @@ Copies `project.toml` and the handlers, and for `abbcovers` the shim repo's
 `scripts/abb-covers.py` (copied, never forked — the Mac and the node run the
 same file) plus the venv Pillow needs, then reloads wharfd.
 
-Then the credentials, which deliberately never live in this repo — copy
-`env.example`, fill in the shim owner account and the node's shard, and:
+Then the key, which deliberately never lives in this repo. Make one per node
+in /admin → Catalogue → Node keys (shown once, with the `.env` lines for both
+projects), copy each project's `env.example`, fill in the key and the node's
+shard, and:
 
 ```sh
 scp <proj>.env <host>:/tmp/<proj>.env
@@ -104,9 +107,17 @@ ssh <host> "sudo install -o wharf -g wharf -m 600 /tmp/<proj>.env \
   sudo /srv/wharf/bin/wharf reload-projects"
 ```
 
-`SHIM_USER` must be the tenant **owner** for `abbcrawl`: `claim`/`submit` are
-owner-only, since a submission becomes catalogue content every tenant sees.
-`abbcovers` only needs a member (the cover routes aren't owner-gated).
+**Node keys (2026-10-14).** Until then both projects signed in as the owner
+with his username and password: the password sat in plain text on two
+servers, opened everything, and every change of it stopped both crawlers
+(Joseph reset it that day and they did). A key opens only the catalogue's
+node routes, names its node (a keyed request's `node` is the key's name,
+whatever the body says), is stored only as a hash (`node_keys`, migration
+0030), and is revoked in /admin. A running service reads its `.env` once, at
+start: after changing one, stop the service process and wharfd restarts it
+(`restart = "always"`). Both scripts still accept `SHIM_USER`/`SHIM_PASS`
+(`ABS_SHIM_USER`/`ABS_SHIM_PASS`) when there's no key; the Mac's cover runner
+signs in that way, from the Keychain.
 
 ## Watching it
 
