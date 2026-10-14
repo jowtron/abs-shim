@@ -51,4 +51,19 @@ export type Env = {
   VAPID_PUBLIC_KEY?: string;
   VAPID_PRIVATE_KEY?: string;
   VAPID_SUBJECT?: string;
+  // Cloudflare Email Sending (the send_email binding): password-reset links
+  // and the notices that go with them (src/lib/email.ts). jderrick.app is
+  // onboarded on this account (the PBX's voicemail mail uses it), so the
+  // From address must be on it. Loosely typed like cf-pbx's, and optional:
+  // without it "Forgot password?" says this server can't send email.
+  EMAIL?: { send(message: {
+    to: string | string[];
+    from: { email: string; name?: string };
+    replyTo?: string;
+    subject: string;
+    html?: string;
+    text?: string;
+  }): Promise<unknown> };
+  EMAIL_FROM?: string;
+  EMAIL_FROM_NAME?: string;
 };

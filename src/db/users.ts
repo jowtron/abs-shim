@@ -17,6 +17,10 @@ export type UserRow = {
   item_tags_selected: string;
   created_at: number;
   last_seen: number | null;
+  // ms epoch of the last "sign out everywhere" (migration 0029). Tokens carry
+  // the value they were issued under (`gen`) and requireAuth refuses any that
+  // doesn't match. NULL = never.
+  tokens_valid_after: number | null;
 };
 
 export const ROOT_PERMISSIONS = {
@@ -44,7 +48,7 @@ export async function findUserById(env: Env, id: string): Promise<UserRow | null
   return env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(id).first<UserRow>();
 }
 
-export async function insertUser(env: Env, row: UserRow): Promise<void> {
+export async function insertUser(env: Env, row: Omit<UserRow, 'tokens_valid_after'>): Promise<void> {
   await env.DB.prepare(
     `INSERT INTO users (
        id, username, email, type, password_hash, google_sub,

@@ -68,6 +68,19 @@ new_sqlite_classes = ["SignupRateLimitDO"]
 tag = "v3"
 new_sqlite_classes = ["ArchiveExtractDO"]
 
+# Password-reset email (src/lib/email.ts) through Cloudflare Email Sending.
+# jderrick.app is already onboarded on this account (`wrangler email sending
+# list`; cf-pbx's voicemail mail uses it), so no DNS change was needed. The
+# binding may only send as EMAIL_FROM. Remove both and "Forgot password?"
+# says this server can't send email; owner-made reset links still work.
+[[send_email]]
+name = "EMAIL"
+allowed_sender_addresses = ["audiobooks@jderrick.app"]
+
+[vars]
+EMAIL_FROM = "audiobooks@jderrick.app"
+EMAIL_FROM_NAME = "Audiobook server"
+
 # Serve the official ABS web client (Nuxt static build extracted from the
 # advplyr/audiobookshelf docker image) for any path the Worker doesn't claim.
 # The Worker runs first for every request — it falls through to env.ASSETS

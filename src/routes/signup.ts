@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { Env } from '../types';
-import { hashPassword } from '../auth/password';
+import { hashPassword, passwordProblem } from '../auth/password';
 import { findUserByUsername, insertUser } from '../db/users';
 import { getSignupMode } from '../db/settings';
 import { getRedeemableInvite } from '../db/invites';
@@ -60,13 +60,8 @@ signupRoutes.post('/register', async (c) => {
   if (!username || !password) {
     return c.json({ error: 'username and password are required' }, 400);
   }
-  // Password rules: ≥ 10 chars and not equal to the username.
-  if (password.length < 10) {
-    return c.json({ error: 'Password must be at least 10 characters.' }, 400);
-  }
-  if (password.toLowerCase() === username.toLowerCase()) {
-    return c.json({ error: 'Password must not match the username.' }, 400);
-  }
+  const problem = passwordProblem(password, username);
+  if (problem) return c.json({ error: problem }, 400);
 
   // ── Invite path: active immediately, joins the invite's tenant ──────────────
   if (inviteCode) {

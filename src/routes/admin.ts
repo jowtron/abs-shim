@@ -29,6 +29,7 @@ import { findCatalogCover, purgeCoverCache } from '../lib/cover-from-catalog';
 import { redactSecrets, safeJson } from '../lib/redact';
 import { getSignupMode, getSetting, setSetting, membersCanAdd, setTenantSetting, MEMBERS_CAN_ADD_KEY } from '../db/settings';
 import { createInvite, listOpenInvites, deleteInvite } from '../db/invites';
+import { createResetLink, discardOwnerLinks, resetUrl, linkOrigin, OWNER_LINK_TTL_MS } from '../lib/password-reset';
 import { listTenantMembers, removeMember } from '../db/tenants';
 
 // Mounted at /api/admin from index.ts. The admin UI itself lives at /admin and
@@ -1737,6 +1738,27 @@ adminRoutes.post('/users/:id/unlock', requireInstanceOwner, async (c) => {
   if (!u) return c.json({ error: 'User not found' }, 404);
   await c.env.DB.prepare('UPDATE users SET is_locked = 0 WHERE id = ?').bind(userId).run();
   return c.json({ ok: true, isLocked: false });
+});
+
+// A one-time password reset link for any account, to hand over by text
+// (src/lib/password-reset.ts). Instance owner only, like the rest of this
+// roster: the link IS the account. It replaces that user's earlier unused
+// hand-out link; DELETE throws it away (the /admin dialog's Cancel).
+adminRoutes.post('/users/:id/reset-link', requireInstanceOwner, async (c) => {
+  const userId = c.req.param('id');
+  const u = await c.env.DB.prepare(
+    'SELECT id, username, email, signup_status, is_locked FROM users WHERE id = ?',
+  ).bind(userId).first<{ id: string; username: string; email: string | null; signup_status: string; is_locked: number }>();
+  if (!u) return c.json({ error: 'User not found' }, 404);
+  if (u.signup_status !== 'active') return c.json({ error: 'This account is still awaiting approval' }, 409);
+  if (u.is_locked === 1) return c.json({ error: 'This account is locked: unlock it first' }, 409);
+  const { secret, expiresAt } = await createResetLink(c.env, u.id, c.get('userId'), OWNER_LINK_TTL_MS);
+  return c.json({ url: resetUrl(linkOrigin(c.env, c.req.url), secret), expiresAt, username: u.username });
+});
+
+adminRoutes.delete('/users/:id/reset-link', requireInstanceOwner, async (c) => {
+  await discardOwnerLinks(c.env, c.req.param('id'));
+  return c.body(null, 204);
 });
 
 // ─── helpers ────────────────────────────────────────────────────────────────

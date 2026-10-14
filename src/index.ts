@@ -28,6 +28,9 @@ import { runPodcastTick } from './lib/podcasts';
 import { runCatalogTick } from './lib/abb-catalog';
 import { signupRoutes } from './routes/signup';
 import { renderSignupHtml } from './lib/signup-html';
+import { passwordResetRoutes } from './routes/password-reset';
+import { accountRoutes } from './routes/account';
+import { renderResetHtml } from './lib/reset-html';
 import { listProgressForMe, getProgress, upsertProgress, progressToAbs, type EpisodeRules } from './db/progress';
 import { episodeFinishRemaining } from './db/podcasts';
 import { listSessionsByUser } from './db/sessions';
@@ -81,6 +84,9 @@ app.get('/status', async (c) => {
     authFormData: { authLoginCustomMessage: '' },
     ConfigPath: '/config',
     MetadataPath: '/metadata',
+    // Shim extra: where "Forgot password?" lives. Pholia links to it after a
+    // failed sign-in; strict clients ignore unknown keys.
+    passwordReset: '/reset',
   });
 });
 
@@ -216,7 +222,7 @@ app.post('/login', async (c) => {
     return c.json({ error: 'This account is inactive.' }, 403);
   }
 
-  const access = await issueAccessToken(c.env, { id: row.id, username: row.username });
+  const access = await issueAccessToken(c.env, row);
   const refresh = await issueRefreshToken();
   await insertRefreshToken(c.env, {
     id: crypto.randomUUID(),
@@ -265,7 +271,7 @@ app.post('/logout', (c) => {
 // the user is interacting with the player.
 app.post('/api/authorize', requireAuth, async (c) => {
   const row = c.get('user');
-  const access = await issueAccessToken(c.env, { id: row.id, username: row.username });
+  const access = await issueAccessToken(c.env, row);
   c.header('Set-Cookie', sessionCookie(access.token, c.req.url), { append: true });
   const progressRows = await listProgressForMe(c.env, row.id);
   const mediaProgress = await Promise.all(progressRows.map((p) => progressToAbs(c.env, p)));
@@ -517,6 +523,14 @@ app.route('/api/admin', adminRoutes);
 app.route('/api/signup', signupRoutes);
 app.get('/signup', (c) => c.html(renderSignupHtml(c.env.TURNSTILE_SITE_KEY)));
 app.get('/signup/', (c) => c.html(renderSignupHtml(c.env.TURNSTILE_SITE_KEY)));
+
+// Passwords (migration 0029, src/lib/password-reset.ts): the public
+// "Forgot password?" API and page, and the signed-in user's own email and
+// password (/api/me/account, plus ABS's PATCH /api/me/password).
+app.route('/api/password-reset', passwordResetRoutes);
+app.route('/api/me', accountRoutes);
+app.get('/reset', (c) => c.html(renderResetHtml(c.env.TURNSTILE_SITE_KEY), 200, { 'Referrer-Policy': 'no-referrer', 'Cache-Control': 'no-store' }));
+app.get('/reset/', (c) => c.html(renderResetHtml(c.env.TURNSTILE_SITE_KEY), 200, { 'Referrer-Policy': 'no-referrer', 'Cache-Control': 'no-store' }));
 
 // wharf nodes' hourly pCloud-token reports (ops/pcloud-health/), keyed by
 // the NODE_HEALTH_KEY secret rather than a user. See src/lib/node-health.ts.

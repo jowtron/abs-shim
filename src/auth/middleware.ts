@@ -36,6 +36,13 @@ export const requireAuth = createMiddleware<{ Bindings: Env; Variables: AuthVars
     if (!user || user.is_active !== 1 || user.is_locked === 1) {
       return c.json({ error: 'Unauthorized' }, 401);
     }
+    // "Sign out everywhere" (a password reset, or a change that asks for it):
+    // the tokens are stateless, so each carries the user's stamp from when it
+    // was issued (`gen`, src/auth/tokens.ts) and a stale one is refused here,
+    // including by /api/authorize, which can't then rotate it.
+    if ((claims.gen ?? 0) !== (user.tokens_valid_after ?? 0)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
 
     // Resolve the active tenant from membership. `?tenant=` lets a multi-tenant
     // user switch context for a single request (validated against membership).

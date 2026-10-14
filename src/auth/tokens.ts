@@ -17,6 +17,14 @@ export type AccessClaims = {
   type: 'access';
   iat: number;
   exp: number;
+  // The user's `tokens_valid_after` when the token was issued (0 for none).
+  // requireAuth refuses a token whose stamp no longer matches the user's, so
+  // "sign out everywhere" catches even a token minted in the instant around
+  // the change (an `iat` comparison couldn't: a /api/authorize that read the
+  // row just before a reset issued a token newer than the cut-off). Tokens
+  // from before 2026-10-14 have none, which reads as 0 and still matches a
+  // user who has never been signed out everywhere.
+  gen?: number;
 };
 
 function jwtSecret(env: Env): string {
@@ -31,7 +39,7 @@ function jwtSecret(env: Env): string {
 // analysis job gets two hours, src/lib/episode-analysis.ts).
 export async function issueAccessToken(
   env: Env,
-  user: { id: string; username: string },
+  user: { id: string; username: string; tokens_valid_after: number | null },
   ttlSeconds: number = ACCESS_TTL_SECONDS,
 ): Promise<{ token: string; expiresAt: number }> {
   const now = Math.floor(Date.now() / 1000);
@@ -42,6 +50,7 @@ export async function issueAccessToken(
     type: 'access',
     iat: now,
     exp,
+    gen: user.tokens_valid_after ?? 0,
   };
   const token = await sign(claims, jwtSecret(env), 'HS256');
   return { token, expiresAt: exp };

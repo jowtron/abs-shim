@@ -184,8 +184,8 @@ export function waitsForArchive(e: Pick<EpisodeRow, 'enclosure_url' | 'archive_s
 
 async function buildArgs(env: Env, e: EpisodeRow, origin: string) {
   const owner = await env.DB.prepare(
-    'SELECT u.id, u.username FROM tenants t JOIN users u ON u.id = t.owner_user_id WHERE t.id = ?',
-  ).bind(e.tenant_id).first<{ id: string; username: string }>();
+    'SELECT u.id, u.username, u.tokens_valid_after FROM tenants t JOIN users u ON u.id = t.owner_user_id WHERE t.id = ?',
+  ).bind(e.tenant_id).first<{ id: string; username: string; tokens_valid_after: number | null }>();
   if (!owner) throw new Error('the library has no owner to act as');
   // Never logged: it is a full access token (TOKEN_TTL_SECONDS).
   const { token } = await issueAccessToken(env, owner, TOKEN_TTL_SECONDS);

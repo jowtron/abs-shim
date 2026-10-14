@@ -5,6 +5,8 @@ import { issueAccessToken, issueRefreshToken } from '../auth/tokens';
 import { insertRefreshToken } from '../db/refresh';
 import { sessionCookie } from '../auth/cookie';
 import { findUserById, touchLastSeen } from '../db/users';
+import { verifyPassword } from '../auth/password';
+import { allow } from '../lib/password-reset';
 import {
   CHALLENGE_EXPIRY_MS, bytesToBase64Url, base64UrlToBytes, rpIdFor, isOriginTrusted,
   decodeCBOR, parseAttestationAuthData, verifyAssertion, signCountOf, labelFromUserAgent, rpIdHashMatches,
@@ -49,9 +51,23 @@ function readClientData(b64: string): { bytes: Uint8Array; data: ClientData } {
   return { bytes, data: JSON.parse(new TextDecoder().decode(bytes)) as ClientData };
 }
 
+// Body: { password } (the current one). A passkey is a lasting door into the
+// account, so adding one needs the password, as every account change does
+// (src/routes/account.ts): with only a signed-in token, someone could plant
+// one that outlives a password reset (a reset also removes them all). The
+// challenge this issues is bound to the user, so /register needs no check of
+// its own. Same 10-per-15-minutes budget as the account card.
 passkeyRoutes.post('/register-options', requireAuth, async (c) => {
   const userId = c.get('userId');
   const user = c.get('user');
+  if (user.password_hash !== null) {
+    const rl = await allow(c.env, `pw-check:${userId}`, 10, 15 * 60_000);
+    if (!rl.allowed) return c.json({ error: 'Too many attempts. Please try again later.' }, 429);
+    const body = await c.req.json().catch(() => null) as { password?: unknown } | null;
+    if (typeof body?.password !== 'string' || !(await verifyPassword(body.password, user.password_hash))) {
+      return c.json({ error: 'Enter your current password to add a passkey.' }, 403);
+    }
+  }
   const existing = await c.env.DB.prepare('SELECT id FROM webauthn_credentials WHERE user_id = ?').bind(userId).all<{ id: string }>();
   const challenge = await newChallenge(c.env, 'register', userId);
   return c.json({
@@ -149,7 +165,7 @@ passkeyRoutes.post('/authenticate', async (c) => {
   if (!row) return c.json({ error: 'Unknown user' }, 401);
   if (row.is_locked === 1) return c.json({ error: 'This account is locked.' }, 403);
   if (row.is_active !== 1) return c.json({ error: 'This account is inactive.' }, 403);
-  const access = await issueAccessToken(c.env, { id: row.id, username: row.username });
+  const access = await issueAccessToken(c.env, row);
   const refresh = await issueRefreshToken();
   await insertRefreshToken(c.env, {
     id: crypto.randomUUID(), userId: row.id, tokenHash: refresh.hash, expiresAt: refresh.expiresAt,

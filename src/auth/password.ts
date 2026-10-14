@@ -66,3 +66,13 @@ export async function verifyPassword(password: string, stored: string): Promise<
   for (let i = 0; i < actual.length; i++) diff |= actual[i]! ^ expected[i]!;
   return diff === 0;
 }
+
+// The rules for a NEW password, wherever one is chosen (signup, a change,
+// a reset): at least 10 characters and not the username. Existing shorter
+// passwords keep working; this only applies when one is set. Returns the
+// message to show, or null when the password is acceptable.
+export function passwordProblem(password: string, username: string): string | null {
+  if (password.length < 10) return 'Password must be at least 10 characters.';
+  if (password.toLowerCase() === username.toLowerCase()) return 'Password must not match the username.';
+  return null;
+}

@@ -207,15 +207,42 @@ export const ADMIN_HTML = String.raw`<!doctype html>
       <button type="submit">Sign in</button>
       <button type="button" class="secondary" id="login-passkey" style="display:none" title="Face ID / Touch ID / Windows Hello">Sign in with passkey</button>
     </form>
+    <p class="muted" style="margin:0.75rem 0 0; font-size:0.85rem"><a id="login-forgot" href="/reset" style="color: var(--accent)">Forgot password?</a></p>
+  </div>
+
+  <div id="account-card" class="card" style="display:none">
+    <details id="account-details">
+    <summary style="cursor:pointer; font-weight:600">👤 Your account <span id="account-summary" class="muted" style="font-weight:normal"></span></summary>
+    <p class="muted" style="margin-top:0.5rem">Your email is where a link goes if you forget your password. People who share your library can see it. <span id="account-email-note"></span></p>
+    <form id="account-form" autocomplete="on">
+      <input type="text" id="account-username" autocomplete="username" style="display:none" readonly />
+      <div class="upload-row">
+        <input type="email" id="account-email" placeholder="Email address" autocomplete="email" autocapitalize="none" spellcheck="false" style="flex:1; min-width:14rem" />
+      </div>
+      <div class="upload-row">
+        <input type="password" id="account-new" placeholder="New password (blank keeps it)" autocomplete="new-password" style="flex:1; min-width:12rem" />
+        <input type="password" id="account-new2" placeholder="New password again" autocomplete="new-password" style="flex:1; min-width:12rem" />
+      </div>
+      <label id="account-signout-row" class="muted" style="display:none; font-size:0.9rem; cursor:pointer; margin-bottom:0.5rem">
+        <input type="checkbox" id="account-signout"> Also sign out my other devices and apps
+      </label>
+      <div class="upload-row">
+        <input type="password" id="account-current" placeholder="Current password" autocomplete="current-password" required style="flex:1; min-width:12rem" />
+        <button type="submit" id="account-save">Save changes</button>
+      </div>
+      <div id="account-status" class="muted" style="font-size:0.85rem"></div>
+    </form>
+    </details>
   </div>
 
   <div id="passkeys-card" class="card" style="display:none">
     <details id="passkeys-details">
     <summary style="cursor:pointer; font-weight:600">🔑 Passkeys <span id="passkeys-count" class="muted" style="font-weight:normal"></span></summary>
-    <p class="muted" style="margin-top:0.5rem">Sign in to this admin page with Face ID, Touch ID or Windows Hello instead of the password. A passkey is tied to this hostname and to the account you're signed in as now.</p>
+    <p class="muted" style="margin-top:0.5rem">Sign in to this admin page with Face ID, Touch ID or Windows Hello instead of the password. A passkey is tied to this hostname and to the account you're signed in as now. Adding one asks for your current password, and a password reset removes them all.</p>
     <div id="passkeys-list" class="muted">Loading…</div>
     <div class="upload-row" style="margin-top:0.5rem">
       <input type="text" id="passkey-label" placeholder="Label (optional, e.g. iPhone)" style="max-width:16rem" />
+      <input type="password" id="passkey-password" placeholder="Current password" autocomplete="current-password" style="max-width:14rem" />
       <button class="secondary" id="passkey-add">Add a passkey for this device</button>
     </div>
     <div id="passkeys-status" class="muted" style="font-size:0.85rem"></div>
@@ -440,7 +467,7 @@ npx wrangler secret put PCLOUD_CLIENT_SECRET</pre>
 
   <div id="all-users-card" class="card" style="display:none">
     <h2>All users</h2>
-    <p class="muted">Every account across all libraries (instance owner only). Each approved signup gets its own isolated library; "Servers" are the storage backends attached to that library. Lock an account to block its sign-in without deleting anything.</p>
+    <p class="muted">Every account across all libraries (instance owner only). Each approved signup gets its own isolated library; "Servers" are the storage backends attached to that library. Lock an account to block its sign-in without deleting anything. "Reset link…" makes a one-time link to choose a new password, for someone who can't use "Forgot password?".</p>
     <div id="all-users-body" class="muted">Loading…</div>
   </div>
 
@@ -478,6 +505,7 @@ function showLoginForm() {
   document.getElementById('all-users-card').style.display = 'none';
   document.getElementById('household-card').style.display = 'none';
   document.getElementById('passkeys-card').style.display = 'none';
+  document.getElementById('account-card').style.display = 'none';
   document.getElementById('audible-card').style.display = 'none';
   document.getElementById('signout').style.display = 'none';
   passkeyOfferLogin();
@@ -487,6 +515,8 @@ function hideLoginForm() {
   document.getElementById('login-card').style.display = 'none';
   document.getElementById('passkeys-card').style.display = '';
   passkeysLoad();
+  document.getElementById('account-card').style.display = '';
+  accountLoad();
   document.getElementById('connections-card').style.display = '';
   document.getElementById('libraries-card').style.display = '';
   document.getElementById('cover-cache-card').style.display = '';
@@ -668,7 +698,15 @@ async function passkeyRegister() {
   btn.disabled = true;
   st.textContent = '';
   try {
-    const opts = await api('/api/auth/passkey/register-options', { method: 'POST' });
+    // The current password is required to add one (src/routes/passkeys.ts).
+    const optsRes = await fetch('/api/auth/passkey/register-options', {
+      method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: document.getElementById('passkey-password').value }),
+    });
+    if (optsRes.status === 401) { showLoginForm(); return; }
+    const opts = await optsRes.json().catch(() => ({}));
+    if (!optsRes.ok) throw new Error(opts.error || ('HTTP ' + optsRes.status));
+    document.getElementById('passkey-password').value = '';
     const cred = await navigator.credentials.create({ publicKey: {
       challenge: b64uToBytes(opts.challenge).buffer,
       rp: opts.rp,
@@ -697,6 +735,69 @@ async function passkeyRegister() {
 }
 
 document.getElementById('login-passkey').addEventListener('click', passkeySignIn);
+
+// ─── Your account: email + password (src/routes/account.ts) ─────────────────
+// Every change needs the current password. "Forgot password?" carries what was
+// typed in the username box to /reset (src/lib/reset-html.ts).
+
+document.getElementById('login-forgot').addEventListener('click', (e) => {
+  const u = document.getElementById('login-username').value.trim();
+  if (u) e.target.href = '/reset?u=' + encodeURIComponent(u);
+});
+
+async function accountLoad() {
+  const note = document.getElementById('account-email-note');
+  try {
+    const a = await api('/api/me/account');
+    document.getElementById('account-username').value = a.username;
+    document.getElementById('account-email').value = a.email || '';
+    document.getElementById('account-summary').textContent = '(' + a.username + (a.email ? '' : ' · no email yet') + ')';
+    note.textContent = a.emailEnabled ? '' : 'This server can\u2019t send email yet, so keep a passkey or ask the server owner for a reset link.';
+    // Open until the account has an email, like the passkeys card.
+    const d = document.getElementById('account-details');
+    if (!d.dataset.touched) d.open = !a.email;
+  } catch (e) {
+    if (!(e instanceof UnauthorizedError)) note.textContent = 'Couldn\'t load your account: ' + e.message;
+  }
+}
+
+document.getElementById('account-details').addEventListener('toggle', (ev) => { ev.target.dataset.touched = '1'; });
+document.getElementById('account-new').addEventListener('input', (ev) => {
+  document.getElementById('account-signout-row').style.display = ev.target.value ? 'block' : 'none';
+});
+
+document.getElementById('account-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const st = document.getElementById('account-status');
+  const btn = document.getElementById('account-save');
+  const email = document.getElementById('account-email').value.trim();
+  const newPassword = document.getElementById('account-new').value;
+  const again = document.getElementById('account-new2').value;
+  if (newPassword !== again) { st.className = 'warn'; st.textContent = 'The two new passwords don\u2019t match.'; return; }
+  const body = { currentPassword: document.getElementById('account-current').value, email: email || null };
+  if (newPassword) { body.newPassword = newPassword; body.signOutOthers = document.getElementById('account-signout').checked; }
+  btn.disabled = true; st.className = 'muted'; st.textContent = 'Saving\u2026';
+  try {
+    const res = await fetch('/api/me/account', {
+      method: 'PATCH', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (res.status === 401) { showLoginForm(); return; }
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) { st.className = 'warn'; st.textContent = d.error || ('HTTP ' + res.status); return; }
+    const bits = [];
+    bits.push(d.email ? 'Email: ' + d.email + '.' : 'No email on the account.');
+    if (d.passwordChanged) bits.push(body.signOutOthers ? 'Password changed, and your other devices are signed out.' : 'Password changed.');
+    st.className = 'ok'; st.textContent = '\u2713 Saved. ' + bits.join(' ');
+    ['account-new', 'account-new2', 'account-current'].forEach((id) => { document.getElementById(id).value = ''; });
+    document.getElementById('account-signout').checked = false;
+    document.getElementById('account-signout-row').style.display = 'none';
+    accountLoad();
+  } catch (err) {
+    st.className = 'warn'; st.textContent = 'Couldn\'t save: ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
 document.getElementById('passkeys-details').addEventListener('toggle', (ev) => { ev.target.dataset.touched = '1'; });
 document.getElementById('passkey-add').addEventListener('click', passkeyRegister);
 
@@ -1068,6 +1169,9 @@ async function loadAllUsers() {
     html += '<td>' + (u.bookCount || 0) + '</td>';
     html += '<td>' + status + '</td>';
     html += '<td style="white-space:nowrap">';
+    if (u.signupStatus !== 'pending' && !u.isLocked) {
+      html += '<button class="secondary" data-reset-link="' + escapeHtml(u.id) + '" data-username="' + escapeHtml(u.username) + '" data-has-email="' + (u.email ? '1' : '') + '" style="font-size:0.78rem;padding:0.2rem 0.55rem">Reset link\u2026</button> ';
+    }
     if (u.id !== data.selfId) {
       if (u.isLocked) {
         html += '<button class="secondary" data-unlock="' + escapeHtml(u.id) + '" style="font-size:0.78rem;padding:0.2rem 0.55rem">Unlock</button>';
@@ -1084,6 +1188,23 @@ async function loadAllUsers() {
     if (!confirm('Lock this account? They will be unable to sign in or stream until you unlock them. No data is deleted.')) return;
     try { await api('/api/admin/users/' + btn.dataset.lock + '/lock', { method: 'POST' }); loadAllUsers(); }
     catch (e) { if (!(e instanceof UnauthorizedError)) showError('Lock failed: ' + e.message); }
+  }));
+  // A one-time password reset link to hand over by text (24 hours). Like an
+  // invite, the dialog's Cancel throws it away.
+  body.querySelectorAll('[data-reset-link]').forEach((btn) => btn.addEventListener('click', async () => {
+    const name = btn.dataset.username;
+    const viaEmail = btn.dataset.hasEmail ? ' They can also use "Forgot password?" themselves, since their account has an email.' : '';
+    if (!confirm('Make a one-time link that lets whoever opens it choose a new password for ' + name + '? It works for 24 hours and signs ' + name + ' out everywhere when used.' + viaEmail)) return;
+    try {
+      const r = await api('/api/admin/users/' + encodeURIComponent(btn.dataset.resetLink) + '/reset-link', { method: 'POST' });
+      await navigator.clipboard.writeText(r.url).catch(() => {});
+      const kept = prompt('Password reset link for ' + name + ' (copied to clipboard). Send it only to them.\nOK keeps it; Cancel throws it away.', r.url);
+      if (kept === null) {
+        await api('/api/admin/users/' + encodeURIComponent(btn.dataset.resetLink) + '/reset-link', { method: 'DELETE' })
+          .catch((err) => showError('Could not discard the link: ' + err.message));
+        await navigator.clipboard.writeText('').catch(() => {});
+      }
+    } catch (e) { if (!(e instanceof UnauthorizedError)) showError('Reset link failed: ' + e.message); }
   }));
   body.querySelectorAll('[data-unlock]').forEach((btn) => btn.addEventListener('click', async () => {
     try { await api('/api/admin/users/' + btn.dataset.unlock + '/unlock', { method: 'POST' }); loadAllUsers(); }
