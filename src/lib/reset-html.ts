@@ -19,7 +19,7 @@ const RESET_HTML = String.raw`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Reset your password · ABS_shim</title>
+  <title>Reset your password · Rhapsode</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="no-referrer" />
   <style>

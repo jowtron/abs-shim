@@ -1,7 +1,7 @@
 {
-  "name": "ABS Shim",
-  "short_name": "ABS Shim",
-  "description": "Manage storage backends, libraries, and members for your serverless Audiobookshelf backend.",
+  "name": "Rhapsode",
+  "short_name": "Rhapsode",
+  "description": "Manage storage, libraries and members for your Rhapsode audiobook server.",
   "start_url": "/account",
   "scope": "/",
   "display": "standalone",

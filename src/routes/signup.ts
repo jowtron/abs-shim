@@ -90,7 +90,7 @@ signupRoutes.post('/register', async (c) => {
       c.env.DB.prepare('UPDATE invites SET used_by = ?, used_at = ? WHERE code = ?').bind(userId, now, invite.code),
     ]);
     c.executionCtx.waitUntil(sendPushover(c.env, {
-      title: 'ABS Shim — member joined',
+      title: 'Rhapsode — member joined',
       message: `${username} joined a shared library via invite.`,
     }));
     return c.json({ status: 'active', message: 'Your account is ready — you can sign in now.' });
@@ -133,9 +133,9 @@ signupRoutes.post('/register', async (c) => {
     // Ping the owner (best-effort, non-blocking). Only on a genuinely new
     // request, so a duplicate-username probe can't be used to spam pushes.
     c.executionCtx.waitUntil(sendPushover(c.env, {
-      title: 'ABS Shim — new access request',
+      title: 'Rhapsode — new access request',
       message: `${username}${email ? ` (${email})` : ''} requested an account.`,
-      url: 'https://abs-shim.jderrick.app/admin',
+      url: (c.env.PUBLIC_ORIGIN ?? 'https://rhapsode.jderrick.app') + '/admin',
       urlTitle: 'Review in admin',
       priority: 1, // high — surface it past quiet hours
     }));

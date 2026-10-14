@@ -136,7 +136,7 @@ export function analysisOrigin(env: Env, reqUrl?: string): string {
       if (u.protocol === 'https:' && !/^(localhost|127\.|\[::1\])/.test(u.hostname) && !u.hostname.endsWith('.ts.net')) return u.origin;
     } catch { /* fall through */ }
   }
-  return (env.PUBLIC_ORIGIN ?? 'https://abs-shim.jderrick.app').replace(/\/+$/, '');
+  return (env.PUBLIC_ORIGIN ?? 'https://rhapsode.jderrick.app').replace(/\/+$/, '');
 }
 
 function publisherChapters(e: EpisodeRow): Array<{ start: number; title: string }> {

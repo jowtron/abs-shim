@@ -797,6 +797,27 @@ export class ListeningSessionDO {
   }
 }
 
+// Renamed Rhapsode on 2026-10-14, at rhapsode.jderrick.app. The old hostname
+// keeps answering everything an APP asks, forever: saved logins in Pholia,
+// ShelfPlayer and other ABS apps, the wharf nodes' SHIM_URL, pcloud-health
+// reports. A redirect would break those, because fetch drops Authorization on
+// a cross-origin redirect, a CORS preflight can't follow one, and a POST
+// turned into a GET loses its body. Only a browser opening a PAGE there
+// (Sec-Fetch-Mode: navigate, which no app sends) is sent to the new name,
+// with the path, query and (kept by the browser) a /reset link's #fragment.
+// Not /ops: its Cloudflare Access application covers the old hostname only.
+const OLD_HOST = 'abs-shim.jderrick.app';
+const NEW_ORIGIN = 'https://rhapsode.jderrick.app';
+const NOT_PAGES = /^(\/audiobookshelf)?\/(api|public|ops|auth|socket\.io|feed)(\/|$)/;
+
+function oldHostRedirect(req: Request, u: URL): Response | null {
+  if (u.hostname !== OLD_HOST) return null;
+  if (req.method !== 'GET' && req.method !== 'HEAD') return null;
+  if (req.headers.get('sec-fetch-mode') !== 'navigate') return null;
+  if (NOT_PAGES.test(u.pathname)) return null;
+  return Response.redirect(NEW_ORIGIN + u.pathname + u.search, 301);
+}
+
 // The bundled Nuxt build hardcodes `/audiobookshelf/` as its router base, so
 // the web UI requests both static assets AND API routes under that prefix.
 // Strip the prefix at the outer fetch boundary so Hono's route matcher and
@@ -804,6 +825,8 @@ export class ListeningSessionDO {
 export default {
   fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> | Response {
     const u = new URL(req.url);
+    const moved = oldHostRedirect(req, u);
+    if (moved) return moved;
     // Marketing/landing page at the true site root. Checked BEFORE the
     // `/audiobookshelf` prefix-strip below, so the bundled Nuxt SPA (which is
     // hard-bound to the `/audiobookshelf/` base) keeps owning that path while

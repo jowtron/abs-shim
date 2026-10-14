@@ -69,7 +69,7 @@ passwordResetRoutes.post('/complete', async (c) => {
   const origin = linkOrigin(c.env, c.req.url);
   c.executionCtx.waitUntil(Promise.all([
     sendPasswordChangedNotice(c.env, r.user, origin, 'all'),
-    sendPushover(c.env, { title: 'ABS Shim — password reset', message: `${r.user.username} reset their password.` }),
+    sendPushover(c.env, { title: 'Rhapsode — password reset', message: `${r.user.username} reset their password.` }),
   ]).then(() => {}));
   return c.json({ ok: true, username: r.user.username });
 });

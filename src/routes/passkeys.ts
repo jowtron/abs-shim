@@ -28,7 +28,7 @@ import {
 
 export const passkeyRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
-const RP_NAME = 'ABS_shim';
+const RP_NAME = 'Rhapsode';
 
 // The RP ID is OUR hostname (from the request URL, never the Origin header —
 // a header anyone can set), and every authData is checked against its hash.

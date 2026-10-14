@@ -8,7 +8,7 @@ export const OPS_HTML = String.raw`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>ABS Shim · ops</title>
+  <title>Rhapsode · ops</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root{
@@ -39,7 +39,7 @@ export const OPS_HTML = String.raw`<!doctype html>
   </style>
 </head>
 <body>
-  <h1>ABS Shim · ops</h1>
+  <h1>Rhapsode · ops</h1>
   <div class="muted" id="subtitle">internal dashboard · loading…</div>
 
   <div id="error" class="err"></div>
@@ -55,7 +55,7 @@ export const OPS_HTML = String.raw`<!doctype html>
   <h2>Users</h2>
   <div class="card"><table id="users"><thead><tr><th>Username</th><th>Type</th><th>Created</th><th>Last seen</th></tr></thead><tbody></tbody></table></div>
 
-  <div class="foot">Read-only · gated by Cloudflare Access · ABS Shim <span id="ver"></span></div>
+  <div class="foot">Read-only · gated by Cloudflare Access · Rhapsode <span id="ver"></span></div>
 
   <script>
     const fmtBytes = (b) => { if(!b) return '0 B'; const u=['B','KB','MB','GB','TB']; let i=0; while(b>=1024&&i<u.length-1){b/=1024;i++} return b.toFixed(i?1:0)+' '+u[i]; };

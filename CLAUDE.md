@@ -6,6 +6,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ABS_shim — a 100% serverless Cloudflare-native backend that mimics the Audiobookshelf (ABS) API so official and third-party ABS clients (web UI, ShelfPlayer, Pholia, mobile apps) can talk to it without modification. Driver: resilience while the user's self-hosted ABS Docker server is down. Stack: Cloudflare Workers (Hono on TypeScript), D1 (SQLite), Durable Objects, Workers Cache API, optional R2.
 
+**Its public name is Rhapsode (since 2026-10-14), at `https://rhapsode.jderrick.app`.** Joseph: "it kind of sounds like it acts as something between a real abs server and the frontend". A rhapsode recited Homer; the word means "song-stitcher". Only what people SEE was renamed: page titles, /admin, the landing page (`src/lib/landing-html.ts`, his own gold headphones icon kept), `web/og.png`, `web/manifest.json`, Pushover titles, the passkey RP *name*, the email sender name. Everything nobody sees keeps the old name on purpose: the Worker `abs-shim`, D1 `abs-shim-db`, R2 `abs-shim-covers`, this folder, the GitHub repo, the memory directory. See "Two hostnames" below before touching routing.
+
+## Two hostnames (2026-10-14)
+
+Both `rhapsode.jderrick.app` (canonical) and `abs-shim.jderrick.app` (the old name) are custom domains of this one Worker (`wrangler.toml` `routes`). **The old hostname must keep answering apps indefinitely**: saved logins in Pholia, ShelfPlayer and other ABS apps, the wharf nodes' `SHIM_URL` (abbcrawl, abbcovers, still the old host), the pcloud-health timers' `REPORT_URL`, all point there. A blanket redirect would break every one of them: fetch drops `Authorization` on a cross-origin redirect, a CORS preflight can't follow a redirect, and a POST turned into a GET loses its body. So `oldHostRedirect()` in `src/index.ts` 301s only a browser opening a PAGE on the old host (GET/HEAD with `Sec-Fetch-Mode: navigate`, which apps never send), excluding `/api`, `/public`, `/ops`, `/auth`, `/socket.io`, `/feed` (with or without the `/audiobookshelf` prefix). An app hitting `/` without that header gets the landing page as before.
+
+Things bound to a hostname, and where each stands:
+- **/admin passkeys** have RP ID = the hostname, so the one made on `abs-shim.jderrick.app` doesn't work on the new name. Sign in with the password there and add a new one (needs the current password).
+- **Cookies** are per host: /admin on the new name needs a fresh sign-in.
+- **/ops** stays on the old hostname: its Cloudflare Access application covers that hostname only (and `requireOpsAccess` refuses a request with no Access JWT, so the new host's /ops is closed, not open).
+- **pCloud OAuth** builds `redirect_uri` from the request's origin, so connecting pCloud from /admin on the new name needs `https://rhapsode.jderrick.app/api/admin/storage/pcloud/callback` added to the pCloud app's redirect URIs (Joseph's, in pCloud's developer console). Not done as of 2026-10-14.
+- **Turnstile**: the widget's domains list gained `rhapsode.jderrick.app` on 2026-10-14 (API PUT preserving its other settings).
+- **`PUBLIC_ORIGIN`** (secret) is `https://rhapsode.jderrick.app` since 2026-10-14; the code's fallbacks say the same. It's what wharf jobs fetch audio from and what Pushover links open.
+- **Pholia's saved servers** (the `abs_servers` vault rows in `pholia-accounts`) were moved to the new host for all three rows on 2026-10-14 at Joseph's request. A device already signed in keeps its old `pholia_server` until it next signs in from the vault. Pholia's offline-audio cache keys include the host, so a device that switches finds its earlier downloads gone (they re-download; the old entries just take space).
+- **VAPID** `sub` stays `https://abs-shim.jderrick.app` (`DEFAULT_SUBJECT` in `src/lib/push.ts`): it's only a contact, subscriptions are bound to the key, and nothing gains from touching push.
+
 Storage backends are pluggable via `StorageAdapter`: filedn-public, S3-compat (R2/B2/AWS/Wasabi), WebDAV (NAS), pCloud OAuth. Multiple backends per library are supported.
 
 ## Common commands
@@ -187,7 +203,7 @@ Migrations in `migrations/`. Initial schema (0001) plus storage additions (0002)
 
 ## Production state
 
-- Deployed to a Cloudflare Worker (URL configured in `wrangler.toml`).
+- Deployed to a Cloudflare Worker, at `rhapsode.jderrick.app` and the old `abs-shim.jderrick.app` ("Two hostnames" above).
 - D1 `abs-shim-db` seeded via `npm run db:seed:local`. Real folders are added at runtime through the `/admin` UI rather than committed to the seed file.
 - Storage: pluggable via StorageAdapter (filedn-public, pCloud OAuth, S3-compat, WebDAV). Multiple backends per library are supported.
 - Required wrangler secrets: `JWT_SECRET` (mandatory), `SETTINGS_KEY` (32 random bytes, base64 — AES-GCM key for per-tenant secrets such as the AudioBookBay password and Real-Debrid token; see `src/lib/secret-box.ts`). Optional: `PCLOUD_CLIENT_ID`, `PCLOUD_CLIENT_SECRET` (only if using pCloud OAuth). S3 and WebDAV credentials are entered via the `/admin` UI and stored as plaintext JSON in D1 (`library_folders.config_json`); the `/api/admin/storage/status` response redacts them.

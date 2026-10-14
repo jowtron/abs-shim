@@ -15,7 +15,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>ABS_shim · admin</title>
+  <title>Rhapsode · admin</title>
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <!-- Installable as a home-screen web app from both /account and /admin (they
        serve this same HTML). iOS uses apple-touch-icon + the apple-* metas;
@@ -27,8 +27,8 @@ export const ADMIN_HTML = String.raw`<!doctype html>
   <link rel="manifest" href="/manifest.json" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-title" content="ABS Shim" />
-  <meta name="application-name" content="ABS Shim" />
+  <meta name="apple-mobile-web-app-title" content="Rhapsode" />
+  <meta name="application-name" content="Rhapsode" />
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fafafa" />
   <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0f0f10" />
@@ -186,7 +186,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
 </head>
 <body>
   <div class="row" style="justify-content: space-between; align-items: flex-start">
-    <h1>ABS_shim · admin</h1>
+    <h1>Rhapsode · admin</h1>
     <button id="signout" class="secondary" style="display:none">Sign out</button>
   </div>
   <p class="muted">

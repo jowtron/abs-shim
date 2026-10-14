@@ -631,7 +631,7 @@ async function maybeSendReport(env: Env, stats: CrawlStats, force = false): Prom
   await sendPushover(env, {
     title: `ABB catalogue: ${days}-day check-in`,
     message,
-    url: (env.PUBLIC_ORIGIN ?? 'https://abs-shim.jderrick.app') + '/admin',
+    url: (env.PUBLIC_ORIGIN ?? 'https://rhapsode.jderrick.app') + '/admin',
     urlTitle: 'Open /admin',
   });
   if (!force) stats.reportSentAt = Date.now();
@@ -686,7 +686,7 @@ export async function runCatalogTick(env: Env, opts: { force?: boolean } = {}): 
     await sendPushover(env, {
       title: 'ABB catalogue crawler backing off',
       message: `AudioBookBay stopped answering (${blocked}). Pausing the crawler for ${waitText} (episode ${stats.backoffLevel}). It resumes by itself; a real block shows up as repeated episodes.`,
-      url: (env.PUBLIC_ORIGIN ?? 'https://abs-shim.jderrick.app') + '/admin', urlTitle: 'Open /admin',
+      url: (env.PUBLIC_ORIGIN ?? 'https://rhapsode.jderrick.app') + '/admin', urlTitle: 'Open /admin',
     }).catch(() => undefined);
   } else if (t.fetches > 0 && t.blockSignals === 0) {
     stats.backoffLevel = 0;

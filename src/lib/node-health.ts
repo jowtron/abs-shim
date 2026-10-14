@@ -108,7 +108,7 @@ export async function recordReport(env: Env, r: NodeReport): Promise<{ alerted: 
   }
   await save(env, s);
   if (push) {
-    await sendPushover(env, { ...push, url: (env.PUBLIC_ORIGIN ?? 'https://abs-shim.jderrick.app') + '/admin', urlTitle: 'Open /admin' })
+    await sendPushover(env, { ...push, url: (env.PUBLIC_ORIGIN ?? 'https://rhapsode.jderrick.app') + '/admin', urlTitle: 'Open /admin' })
       .catch(() => undefined);
   }
   return { alerted: push?.title ?? null };

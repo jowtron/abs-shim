@@ -2,7 +2,11 @@ name = "abs-shim"
 main = "src/index.ts"
 compatibility_date = "2026-04-15"
 account_id = "41a62277421a452c6499884fd17b3c8d"
-routes = [{ pattern = "abs-shim.jderrick.app", custom_domain = true }]
+routes = [
+  { pattern = "rhapsode.jderrick.app", custom_domain = true },
+  # The old name: apps signed in there keep working; browser pages redirect (src/index.ts).
+  { pattern = "abs-shim.jderrick.app", custom_domain = true },
+]
 
 # Pure-JS only on Worker side — no nodejs_compat shims.
 
@@ -79,7 +83,7 @@ allowed_sender_addresses = ["audiobooks@jderrick.app"]
 
 [vars]
 EMAIL_FROM = "audiobooks@jderrick.app"
-EMAIL_FROM_NAME = "Audiobook server"
+EMAIL_FROM_NAME = "Rhapsode"
 
 # Serve the official ABS web client (Nuxt static build extracted from the
 # advplyr/audiobookshelf docker image) for any path the Worker doesn't claim.
