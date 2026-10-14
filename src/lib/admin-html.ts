@@ -898,7 +898,14 @@ function renderHousehold(status) {
         const inv = await api('/api/admin/invites', { method: 'POST' });
         note.textContent = '';
         await navigator.clipboard.writeText(inv.url).catch(() => {});
-        prompt('Share this single-use invite link (copied to clipboard):', inv.url);
+        // The link exists before this dialog opens, so Cancel has to undo it:
+        // it used to leave an unwanted open invite in the list.
+        const kept = prompt('Share this single-use invite link (copied to clipboard).\nOK keeps it; Cancel throws it away.', inv.url);
+        if (kept === null) {
+          await api('/api/admin/invites/' + encodeURIComponent(inv.code), { method: 'DELETE' })
+            .catch((err) => showError('Could not discard the invite (revoke it below): ' + err.message));
+          await navigator.clipboard.writeText('').catch(() => {});
+        }
         renderHousehold(status);
       } catch (err) { note.textContent = ''; showError('Could not create invite: ' + err.message); }
     });
