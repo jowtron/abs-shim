@@ -5,6 +5,7 @@ import { findUserByUsername, insertUser } from '../db/users';
 import { getSignupMode } from '../db/settings';
 import { getRedeemableInvite } from '../db/invites';
 import { verifyTurnstile, sendPushover } from '../lib/notify';
+import { plausibleEmail } from '../lib/password-reset';
 
 // Public, unauthenticated self-serve signup. Mounted at /api/signup.
 //
@@ -55,11 +56,16 @@ signupRoutes.post('/register', async (c) => {
 
   const username = body?.username?.trim();
   const password = body?.password;
-  const email = body?.email?.trim() || null;
+  const email = body?.email?.trim() ?? '';
   const inviteCode = body?.inviteCode?.trim();
   if (!username || !password) {
     return c.json({ error: 'username and password are required' }, 400);
   }
+  // Required since 2026-10-14 (Joseph: "yes to requiring email"): /login takes
+  // it in place of the username, and it is the only way "Forgot password?"
+  // can reach someone. Accounts made before then may still have none.
+  if (!email) return c.json({ error: 'An email address is required.' }, 400);
+  if (!plausibleEmail(email)) return c.json({ error: "That email address doesn't look right." }, 400);
   const problem = passwordProblem(password, username);
   if (problem) return c.json({ error: problem }, 400);
 

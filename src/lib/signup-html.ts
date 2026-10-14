@@ -59,8 +59,9 @@ const SIGNUP_HTML = String.raw`<!doctype html>
       <label for="username">Username</label>
       <input id="username" autocomplete="username" autocapitalize="none" spellcheck="false" required />
 
-      <label for="email">Email <span class="muted">(optional)</span></label>
-      <input id="email" type="email" autocomplete="email" autocapitalize="none" spellcheck="false" />
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="email" autocapitalize="none" spellcheck="false" required />
+      <div class="hint">You can sign in with this instead of your username, and it's where a password reset link goes.</div>
 
       <label for="password">Password</label>
       <input id="password" type="password" autocomplete="new-password" required />
