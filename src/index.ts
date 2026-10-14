@@ -2,11 +2,11 @@ import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import type { Env } from './types';
-import { hashPassword, verifyPassword } from './auth/password';
+import { hashPassword } from './auth/password';
 import { issueAccessToken, issueRefreshToken } from './auth/tokens';
 import { requireAuth, type AuthVars } from './auth/middleware';
 import {
-  countUsers, findUserByUsername, insertUser, toAbsUser, touchLastSeen,
+  countUsers, insertUser, toAbsUser, touchLastSeen,
   ROOT_PERMISSIONS,
 } from './db/users';
 import { insertRefreshToken } from './db/refresh';
@@ -29,6 +29,7 @@ import { runCatalogTick } from './lib/abb-catalog';
 import { signupRoutes } from './routes/signup';
 import { renderSignupHtml } from './lib/signup-html';
 import { passwordResetRoutes } from './routes/password-reset';
+import { findLoginAccount } from './auth/login';
 import { accountRoutes } from './routes/account';
 import { renderResetHtml } from './lib/reset-html';
 import { listProgressForMe, getProgress, upsertProgress, progressToAbs, type EpisodeRules } from './db/progress';
@@ -202,13 +203,14 @@ app.post('/login', async (c) => {
     return c.json({ error: 'username and password required' }, 400);
   }
 
-  const row = await findUserByUsername(c.env, body.username);
-  if (!row || row.password_hash === null) {
-    return c.json({ error: 'Invalid credentials' }, 401);
+  // `username` may also be the account's email address (src/auth/login.ts).
+  const match = await findLoginAccount(c.env, String(body.username), String(body.password));
+  if (!match.ok) {
+    return match.ambiguous
+      ? c.json({ error: 'More than one account uses this email address. Sign in with your username.' }, 409)
+      : c.json({ error: 'Invalid credentials' }, 401);
   }
-  if (!(await verifyPassword(body.password, row.password_hash))) {
-    return c.json({ error: 'Invalid credentials' }, 401);
-  }
+  const row = match.user;
   // Account-state gates run AFTER password verification so a pending/locked
   // message is only ever shown to someone who already proved the password —
   // i.e. it can't be used to enumerate which usernames exist.

@@ -202,7 +202,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
     <h2>Sign in</h2>
     <p class="muted">Cookie session expired or missing. Sign in to continue.</p>
     <form id="login-form" class="row">
-      <input id="login-username" placeholder="username" autocomplete="username webauthn" required />
+      <input id="login-username" placeholder="username or email" autocomplete="username webauthn" autocapitalize="none" spellcheck="false" required />
       <input id="login-password" placeholder="password" type="password" autocomplete="current-password" required />
       <button type="submit">Sign in</button>
       <button type="button" class="secondary" id="login-passkey" style="display:none" title="Face ID / Touch ID / Windows Hello">Sign in with passkey</button>
@@ -589,7 +589,10 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     });
-    if (!res.ok) throw new Error('Login failed: HTTP ' + res.status);
+    if (!res.ok) {
+      const d = await res.json().catch(() => null);
+      throw new Error(d && d.error ? d.error : 'Login failed: HTTP ' + res.status);
+    }
     hideLoginForm();
     document.getElementById('login-password').value = '';
     refresh();
