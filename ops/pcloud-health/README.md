@@ -1,6 +1,8 @@
 # pcloud-health: watching rclone's pCloud token
 
-One rclone pCloud token is shared by every box in `nodes.conf`: wharf-syd-1 (eastsidefm uploads) and stereo-au (the Audible sync). On 2026-10-05 pCloud revoked it (error 2095) and nothing said so. eastsidefm reported "Upload complete" while losing three episodes, and the Audible sync downloaded titles only to fail at the pCloud step.
+One rclone pCloud token is shared by every box in `nodes.conf`, today only wharf-syd-1 (eastsidefm uploads). On 2026-10-05 pCloud revoked it (error 2095) and nothing said so. eastsidefm reported "Upload complete" while losing three episodes, and the Audible sync on stereo-au downloaded titles only to fail at the pCloud step.
+
+**stereo-au no longer holds it (2026-10-15).** Audible books now reach storage through Rhapsode, using each library's own pCloud, S3 or WebDAV connection, so nothing on stereo-au wrote to pCloud any more. Its `[pcloud]` remote (and the one in `rclone.conf.bak-20261006`), its timer, script and `/etc/pcloud-health.env`, and its `node_health:pcloud-rclone:stereo-au` row in prod were removed that day. A node removed from `nodes.conf` must also lose its `server_settings` row, or the silence check pushes "nothing from <node>" every 12 h.
 
 ## What runs where
 
@@ -10,13 +12,12 @@ One rclone pCloud token is shared by every box in `nodes.conf`: wharf-syd-1 (eas
   - Any other failure (DNS, network) pushes after three hourly checks in a row.
   - A node with no report for 3 h pushes too: a dead timer would otherwise look like a healthy token.
   - The first good report after any of those pushes "OK again".
-- **The Audible sync** checks pCloud itself before downloading anything (`userinfo` with the same token), and stops the run at the first pCloud auth error instead of downloading every remaining title first.
 
 ## Fixing a revoked token
 
 ```sh
 ops/pcloud-health/pcloud-reauth.sh            # every node in nodes.conf
-ops/pcloud-health/pcloud-reauth.sh stereo-au  # just one ("mac" = this Mac's own rclone)
+ops/pcloud-health/pcloud-reauth.sh wharf-syd-1  # just one ("mac" = this Mac's own rclone)
 ```
 
 This opens pCloud's sign-in in the browser (`rclone authorize pcloud`). On each node it then:
@@ -31,7 +32,7 @@ This Mac's own `[pcloud]` remote gets the same token, with the same edit and che
 
 ```sh
 ops/pcloud-health/deploy.sh                       # update script and units on every node, keep each node's key
-ops/pcloud-health/deploy.sh stereo-au             # one node
+ops/pcloud-health/deploy.sh wharf-syd-1           # one node
 ops/pcloud-health/deploy.sh --key-file F [node]   # first install, or after rotating NODE_HEALTH_KEY
 ```
 
