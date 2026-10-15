@@ -4,8 +4,9 @@ description: "Download selected Audible titles (or all), decrypt/remux to m4b wi
 mode_allowed: [async]
 idempotent: true
 
-# Sequential per title, about 13 minutes each (download, decrypt, R2
-# stage; Rhapsode's pCloud pull runs alongside the next title). 48 h, not 6: the 6 h limit killed liz's 114-title
+# Sequential per title: about 13 minutes each while titles came as AAX,
+# ~5 since AAXC is asked for first (2026-10-16; the R2 upload is then the
+# slow step). Rhapsode's delivery runs alongside the next title. 48 h, not 6: the 6 h limit killed liz's 114-title
 # "all" sync at title 29 (2026-10-04). A re-run skips titles already in
 # data/synced/<account>.json, so a timeout costs time, not work.
 timeout_ms: 172800000

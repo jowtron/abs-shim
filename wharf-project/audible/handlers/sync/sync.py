@@ -10,7 +10,7 @@ stdout: {"ok": true, "done": [{asin, title, path, bytes}], "failed": [{asin, tit
 own names to these), `path_prefix` the library's folder for it.
 
 Per title, sequentially (~1 GB of scratch at a time):
-  1. audible-cli download: aaxc (with voucher) or aax fallback, 1215px
+  1. audible-cli download: aaxc (with voucher), else aax, 1215px
      cover, flat chapter JSON, into data/dl/<account>/<asin>/
   2. ffmpeg: decrypt (aaxc key/iv from the voucher, or the account's
      activation bytes for aax) and remux — no re-encode — to a fast-start
@@ -27,8 +27,9 @@ Per title, sequentially (~1 GB of scratch at a time):
 
 Progress goes to stderr (the shim tails the job log); the result JSON is
 the last line on stdout. Titles already in synced.json are skipped unless
-force=true. Audible's own download step is where time goes: a 20 h book
-is ~600 MB and Audible throttles, so budget minutes per title.
+force=true. A 20 h book is ~600 MB: about a minute to download as AAXC
+on stereo-au, ten as AAX; the R2 upload (stereo-au's ~14 Mbit/s up) is
+then the slow step.
 """
 import json
 import os
@@ -227,6 +228,12 @@ def activation_bytes(account):
     return ab
 
 
+def download_cmd(account, asin, fmt, quality, work):
+    return ["audible", "-P", account, "download", "--asin", asin, fmt, "--cover", "--cover-size", "1215",
+            "--chapter", "--chapter-type", "flat", "-q", quality, "-o", str(work), "-y",
+            "--filename-mode", "asin_ascii", "--timeout", "120"]
+
+
 def sync_one(account, item, deliver, path_prefix, quality):
     asin = item["asin"]
     work = L.DL_DIR / account / asin
@@ -241,10 +248,23 @@ def sync_one(account, item, deliver, path_prefix, quality):
         rc, out_tail = 0, ""
     else:
         L.log(f"[{asin}] downloading “{item.get('title')}”…")
-        cmd = ["audible", "-P", account, "download", "--asin", asin, "--aax-fallback", "--cover", "--cover-size", "1215",
-               "--chapter", "--chapter-type", "flat", "-q", quality, "-o", str(work), "-y",
-               "--filename-mode", "asin_ascii", "--timeout", "120"]
-        rc, out_tail = run_download(cmd, DOWNLOAD_TIMEOUT)
+        # AAXC first, AAX only when no .aaxc came back (a title not offered
+        # as AAXC, or one whose licence is plain MP3, as podcasts' are).
+        # Audible's AAX server gives ~12 Mbit/s per connection from any box
+        # (2026-10-15: 9.2 Mbit/s over 109 titles on stereo-au, 11.9 on a
+        # 1 Gbit/s VPS) while its AAXC CDN gave 70 on stereo-au and 134 on
+        # the VPS, so audible-cli's --aax-fallback (AAX first) cost ~6 min a
+        # title. audible-cli has no AAXC-then-AAX flag, hence two runs.
+        # A download lands under its final name only when complete (.tmp /
+        # .resume until then), so an .aaxc here is a whole file.
+        rc, out_tail = run_download(download_cmd(account, asin, "--aaxc", quality, work), DOWNLOAD_TIMEOUT)
+        if not any(p.suffix.lower() == ".aaxc" for p in work.iterdir()):
+            for p in work.iterdir():
+                if p.suffix.lower() in (".mp3", ".voucher"):
+                    p.unlink()
+            why = (out_tail.strip().splitlines() or [f"exit {rc}"])[-1][-200:]
+            L.log(f"[{asin}] no AAXC ({why}); trying AAX…")
+            rc, out_tail = run_download(download_cmd(account, asin, "--aax", quality, work), DOWNLOAD_TIMEOUT)
         audio = [p for p in work.iterdir() if p.suffix.lower() in AUDIO_EXTS]
     if rc != 0 and not audio:
         raise RuntimeError(f"download failed: {out_tail[-400:]}")
