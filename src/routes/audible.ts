@@ -8,7 +8,8 @@ import { runAndWait, runAsync, getJob, getJobLog, cancelJob, wharfConfigured, ty
 // Audible library backup — mounted at /api/admin/audible. The work runs on
 // wharf (project "audible", see wharf-project/audible/ in this repo); the
 // shim only drives it and shows progress. Accounts on the wharf project are
-// instance-wide (one box serves every tenant). The surface follows the
+// instance-wide, so only the instance owner's tenant may use it (the gate
+// below). Within that tenant the surface follows the
 // tenant's members_can_add switch (2026-09-05): the owner sees every
 // account; a member who may add books sees, syncs and unlinks only the
 // accounts they linked themselves (recorded in tenant_settings
@@ -31,6 +32,18 @@ export const audibleRoutes = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 audibleRoutes.use('*', requireAuth);
 audibleRoutes.use('*', async (c, next) => {
   if (!(await canAddBooks(c))) return c.json({ error: 'The library owner has not enabled adding books for members' }, 403);
+  // Only the instance owner's own tenant, until the node delivers into each
+  // tenant's own storage (2026-10-15). Accounts on the node are one
+  // instance-wide list that accountAllowed() lets ANY tenant owner use, so
+  // another tenant's owner could list, sync or unlink Joseph's Audible
+  // accounts, and every sync uploads with the instance owner's pCloud token,
+  // so their own books would land in his pCloud. 403 hides the /admin card.
+  const owner = await c.env.DB.prepare(
+    `SELECT u.type FROM tenants t JOIN users u ON u.id = t.owner_user_id WHERE t.id = ?`,
+  ).bind(c.get('tenantId')).first<{ type: string }>();
+  if (owner?.type !== 'root' && owner?.type !== 'admin') {
+    return c.json({ error: "Audible import isn't available on this library yet" }, 403);
+  }
   if (!wharfConfigured(c.env)) return c.json({ error: 'Audible import is not configured on this shim (needs the wharf-router binding and ROUTER_TOKEN)' }, 503);
   await next();
 });
