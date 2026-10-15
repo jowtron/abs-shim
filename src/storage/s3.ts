@@ -1,5 +1,5 @@
-import { presignGet, signRequestHeaders, type S3Creds } from './sigv4';
-import { isAudiobookFile, type RemoteEntry, type ResolvedUrl, type StorageAdapter } from './adapter';
+import { presignGet, signRequestHeaders, objectUrl, sha256HexOf, type S3Creds } from './sigv4';
+import { isAudiobookFile, StorageWriteError, sendStream, QUICK_MS, type RemoteEntry, type ResolvedUrl, type StorageAdapter, type StoredFile } from './adapter';
 
 // S3-compat adapter. Works against:
 //   - AWS S3                — endpoint: https://s3.<region>.amazonaws.com
@@ -128,6 +128,79 @@ export class S3Adapter implements StorageAdapter {
     return out;
   }
 
+  // ─── Writes, for Audible delivery (src/lib/audible-delivery.ts) ───────────
+  // A multipart upload, one part per call, so a book can be sent a few parts
+  // per cron tick and resumed from the parts already sent. The object only
+  // appears at its key when the upload completes, so nothing ever sees half
+  // a book. Every part but the last is the same size (R2 requires that).
+
+  private objectUrl(relPath: string, query: Record<string, string> = {}): URL {
+    const url = objectUrl(this.config.endpoint, this.config.bucket, this.absoluteKey(relPath));
+    for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
+    return url;
+  }
+
+  private async send(method: 'HEAD' | 'POST' | 'DELETE', url: URL, init: {
+    body?: string; payloadHash?: string; headers?: Record<string, string>; timeoutMs?: number;
+  } = {}): Promise<Response> {
+    const signed = await signRequestHeaders({
+      method, url, creds: this.creds, ...(init.payloadHash ? { payloadHash: init.payloadHash } : {}),
+    });
+    return fetch(url.toString(), {
+      method, headers: { ...signed, ...(init.headers ?? {}) }, body: init.body ?? null,
+      signal: AbortSignal.timeout(init.timeoutMs ?? QUICK_MS),
+    });
+  }
+
+  async stat(relPath: string): Promise<StoredFile | null> {
+    const res = await this.send('HEAD', this.objectUrl(relPath));
+    if (res.status === 404) return null;
+    if (!res.ok) throw s3Error('HEAD', res.status, '');
+    const modified = Date.parse(res.headers.get('Last-Modified') ?? '');
+    return { size: Number(res.headers.get('Content-Length') ?? '0'), modifiedAt: Number.isFinite(modified) ? modified : null, isDir: false };
+  }
+
+  async createMultipart(relPath: string, contentType: string): Promise<string> {
+    const res = await this.send('POST', this.objectUrl(relPath, { uploads: '' }), { headers: { 'Content-Type': contentType } });
+    const xml = await res.text().catch(() => '');
+    if (!res.ok) throw s3Error('CreateMultipartUpload', res.status, xml);
+    const id = unxml(/<UploadId>([\s\S]*?)<\/UploadId>/.exec(xml)?.[1]);
+    if (!id) throw new StorageWriteError(res.status, '', 'S3 CreateMultipartUpload answered without an UploadId');
+    return id;
+  }
+
+  // `body` is streamed as it is (an R2 read). UNSIGNED-PAYLOAD, because
+  // hashing it would mean reading it twice.
+  async uploadPart(relPath: string, uploadId: string, partNumber: number, body: ReadableStream, length: number, timeoutMs: number): Promise<string> {
+    const url = this.objectUrl(relPath, { partNumber: String(partNumber), uploadId });
+    const signed = await signRequestHeaders({ method: 'PUT', url, creds: this.creds, payloadHash: 'UNSIGNED-PAYLOAD' });
+    const res = await sendStream(url.toString(), { method: 'PUT', headers: signed }, body, length, timeoutMs);
+    const text = await res.text().catch(() => '');
+    if (!res.ok) throw s3Error(`UploadPart ${partNumber}`, res.status, text);
+    const etag = res.headers.get('ETag');
+    if (!etag) throw new StorageWriteError(res.status, '', `S3 UploadPart ${partNumber} answered without an ETag`);
+    return etag;
+  }
+
+  async completeMultipart(relPath: string, uploadId: string, etags: string[]): Promise<void> {
+    const body = '<CompleteMultipartUpload>' + etags.map((e, i) =>
+      `<Part><PartNumber>${i + 1}</PartNumber><ETag>${e.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</ETag></Part>`,
+    ).join('') + '</CompleteMultipartUpload>';
+    // Assembling a big object can take a while on some servers.
+    const res = await this.send('POST', this.objectUrl(relPath, { uploadId }), {
+      body, payloadHash: await sha256HexOf(body), headers: { 'Content-Type': 'application/xml' }, timeoutMs: 5 * QUICK_MS,
+    });
+    const xml = await res.text().catch(() => '');
+    // S3 can answer 200 and put the failure in the body.
+    if (!res.ok || /<Error>/.test(xml)) throw s3Error('CompleteMultipartUpload', res.ok ? 500 : res.status, xml);
+  }
+
+  // Frees the parts already sent. Best effort: an unknown upload is fine.
+  async abortMultipart(relPath: string, uploadId: string): Promise<void> {
+    const res = await this.send('DELETE', this.objectUrl(relPath, { uploadId }));
+    if (!res.ok && res.status !== 404) throw s3Error('AbortMultipartUpload', res.status, await res.text().catch(() => ''));
+  }
+
   // Combine bucket-level prefix from config with the per-call rel path.
   private absoluteKey(relPath: string): string {
     const cfgPrefix = this.config.prefix.replace(/^\/+|\/+$/g, '');
@@ -171,6 +244,12 @@ function parseListObjectsXml(xml: string, prefix: string): { entries: RemoteEntr
     if (tok) next = unxml(tok);
   }
   return { entries, next };
+}
+
+function s3Error(op: string, status: number, xml: string): StorageWriteError {
+  const code = unxml(/<Code>([\s\S]*?)<\/Code>/.exec(xml)?.[1]);
+  const msg = unxml(/<Message>([\s\S]*?)<\/Message>/.exec(xml)?.[1]);
+  return new StorageWriteError(status, code, `S3 ${op} HTTP ${status}${code ? ' ' + code : ''}${msg ? ': ' + msg : ''}`);
 }
 
 function unxml(s: string | undefined): string {

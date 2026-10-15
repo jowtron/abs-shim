@@ -20,7 +20,7 @@ import { abbRoutes } from './routes/abb';
 import { passkeyRoutes } from './routes/passkeys';
 import { audibleRoutes } from './routes/audible';
 import { audibleNodeRoutes } from './routes/audible-node';
-import { serveStaged, audibleDeliveryPump } from './lib/audible-delivery';
+import { serveStaged, audibleDeliveryPump, audiblePushPump } from './lib/audible-delivery';
 import { podcastRoutes, podcastSearchRoutes } from './routes/podcasts';
 import { playlistRoutes } from './routes/playlists';
 import { pushRoutes } from './routes/push';
@@ -881,11 +881,18 @@ export default {
         .then((log) => { if (log.length) console.log('[podcasts] ' + log.join(' | ')); })
         .catch((e: Error) => console.error('[podcasts] tick failed: ' + e.message)),
     );
-    // Audible titles staged by the node, into each library's own storage.
+    // Audible titles staged by the node, into each library's own storage:
+    // pCloud pulls, and S3/WebDAV pushes, which run for up to ~10 minutes of
+    // this invocation's 15 and so start alongside everything else here.
     ctx.waitUntil(
       audibleDeliveryPump(env)
         .then((log) => { if (log.length) console.log('[audible] ' + log.join(' | ')); })
         .catch((e: Error) => console.error('[audible] pump failed: ' + e.message)),
+    );
+    ctx.waitUntil(
+      audiblePushPump(env)
+        .then((log) => { if (log.length) console.log('[audible] push: ' + log.join(' | ')); })
+        .catch((e: Error) => console.error('[audible] push failed: ' + e.message)),
     );
     // A node that stopped reporting on rclone's pCloud token is as quiet as
     // a revoked one.

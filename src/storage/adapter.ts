@@ -73,3 +73,42 @@ export function isAudiobookFile(name: string): boolean {
   const ext = name.slice(dot + 1).toLowerCase();
   return (AUDIOBOOK_EXTENSIONS as readonly string[]).includes(ext);
 }
+
+// A write the storage refused or failed, from the methods Audible delivery
+// uses (S3Adapter / WebDAVAdapter writes). `code` is S3's error code when
+// there is one ('AccessDenied', 'NoSuchUpload'); for WebDAV, the method
+// ('PATCH', 'MOVE').
+export class StorageWriteError extends Error {
+  constructor(readonly status: number, readonly code: string, message: string) {
+    super(message);
+    this.name = 'StorageWriteError';
+  }
+}
+
+// What a delivery needs to know about a path before and after writing it.
+export type StoredFile = { size: number; modifiedAt: number | null; isDir: boolean };
+
+// PUT/PATCH a stream of known length (an R2 read), never buffered: a Worker
+// has 128 MB. If the server answers before reading it all (a refusal) or the
+// fetch throws, the pipe is abandoned rather than awaited: a server that
+// neither reads nor closes would otherwise hold it until the invocation dies.
+export async function sendStream(url: string, init: { method: string; headers: Record<string, string> },
+  body: ReadableStream, length: number, timeoutMs: number): Promise<Response> {
+  const stop = new AbortController();
+  const { readable, writable } = new FixedLengthStream(length);
+  const piped = body.pipeTo(writable, { signal: stop.signal }).then(() => null, (e: unknown) => e);
+  let res: Response;
+  try {
+    res = await fetch(url, { ...init, body: readable, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    stop.abort();
+    throw e;
+  }
+  if (!res.ok) stop.abort();
+  else await piped;
+  return res;
+}
+
+// Calls that move no body get a minute; a server that never answers mustn't
+// hold a cron invocation (and its lease) for its whole 15 minutes.
+export const QUICK_MS = 60_000;

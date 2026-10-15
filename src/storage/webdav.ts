@@ -1,5 +1,5 @@
 import type { Env } from '../types';
-import { isAudiobookFile, type RemoteEntry, type ResolvedUrl, type StorageAdapter } from './adapter';
+import { isAudiobookFile, StorageWriteError, sendStream, QUICK_MS, type RemoteEntry, type ResolvedUrl, type StorageAdapter, type StoredFile } from './adapter';
 import { signProxyUrl } from './proxy-url';
 
 // WebDAV adapter. Talks to any RFC 4918 server: Synology DSM, TrueNAS, QNAP,
@@ -167,6 +167,112 @@ export class WebDAVAdapter implements StorageAdapter {
     return res.text();
   }
 
+  // ─── Writes, for Audible delivery (src/lib/audible-delivery.ts) ───────────
+  // A book goes up under a temporary name and is MOVEd into place when it is
+  // whole. Cloudflare refuses a single upload over 100 MB to a host it
+  // proxies (Free/Pro plans), which is how most home NASes are reached (a
+  // Tunnel), so a big file is sent in pieces wherever the server can append:
+  // dufs and sabre/dav servers take `PATCH` with `X-Update-Range: append`.
+  // Elsewhere it is one streamed PUT.
+
+  private authHeader(): string {
+    return 'Basic ' + btoa(`${this.config.username}:${this.config.password}`);
+  }
+
+  async stat(relPath: string): Promise<StoredFile | null> {
+    const res = await fetch(this.absoluteUrl(relPath), {
+      method: 'PROPFIND',
+      headers: { Authorization: this.authHeader(), Depth: '0', 'Content-Type': 'application/xml; charset=utf-8' },
+      body: `<?xml version="1.0" encoding="utf-8"?>
+<propfind xmlns="DAV:"><prop><resourcetype/><getcontentlength/><getlastmodified/></prop></propfind>`,
+      signal: AbortSignal.timeout(QUICK_MS),
+    });
+    if (res.status === 404) return null;
+    const xml = await res.text().catch(() => '');
+    if (res.status !== 207 && res.status !== 200) throw davError('PROPFIND', res.status, xml);
+    // Depth 0: the first response is the path itself.
+    const block = /<\s*(?:\w+:)?response[^>]*>([\s\S]*?)<\s*\/\s*(?:\w+:)?response\s*>/.exec(xml)?.[1] ?? '';
+    const isDir = /<\s*(?:\w+:)?resourcetype[^>]*>[\s\S]*?<\s*(?:\w+:)?collection\s*\/?>/i.test(block);
+    const size = Number(/<\s*(?:\w+:)?getcontentlength[^>]*>([\s\S]*?)</i.exec(block)?.[1]?.trim() ?? '0');
+    const modified = Date.parse(/<\s*(?:\w+:)?getlastmodified[^>]*>([\s\S]*?)</i.exec(block)?.[1]?.trim() ?? '');
+    return { size: Number.isFinite(size) ? size : 0, modifiedAt: Number.isFinite(modified) ? modified : null, isDir };
+  }
+
+  // Each level of a folder path, top first. "Already there" is 405 (RFC
+  // 4918); other refusals are left for the PUT to report, except a plain
+  // "you may not write here".
+  async ensureDir(relDir: string): Promise<void> {
+    const parts = relDir.split('/').filter(Boolean);
+    for (let i = 1; i <= parts.length; i++) {
+      const res = await fetch(this.absoluteUrl(parts.slice(0, i).join('/')) + '/', {
+        method: 'MKCOL', headers: { Authorization: this.authHeader() }, signal: AbortSignal.timeout(QUICK_MS),
+      });
+      if (res.status === 401 || res.status === 403 || res.status === 507) {
+        throw davError('MKCOL', res.status, await res.text().catch(() => ''));
+      }
+      await res.body?.cancel();
+    }
+  }
+
+  // Whether the server takes appended pieces: dufs lists PATCH in Allow;
+  // sabre/dav's PartialUpdate plugin names its feature in the DAV header (and
+  // its format in Accept-Patch). A refusal throws rather than answering "no":
+  // a NAS asleep or a Cloudflare 52x must not look like a server that can't
+  // append.
+  async supportsAppend(): Promise<boolean> {
+    const res = await fetch(this.absoluteUrl(''), {
+      method: 'OPTIONS', headers: { Authorization: this.authHeader() }, signal: AbortSignal.timeout(QUICK_MS),
+    });
+    await res.body?.cancel();
+    if (!res.ok) throw davError('OPTIONS', res.status, '');
+    const allow = (res.headers.get('Allow') ?? '').toUpperCase().split(/\s*,\s*/);
+    const feature = /sabredav-partialupdate/i;
+    return allow.includes('PATCH') || feature.test(res.headers.get('DAV') ?? '') || feature.test(res.headers.get('Accept-Patch') ?? '');
+  }
+
+  async put(relPath: string, body: ReadableStream, length: number, timeoutMs: number): Promise<void> {
+    await this.sendBody('PUT', relPath, body, length, { 'Content-Type': 'audio/mp4' }, timeoutMs);
+  }
+
+  async append(relPath: string, body: ReadableStream, length: number, timeoutMs: number): Promise<void> {
+    await this.sendBody('PATCH', relPath, body, length, {
+      'Content-Type': 'application/x-sabredav-partialupdate', 'X-Update-Range': 'append',
+    }, timeoutMs);
+  }
+
+  private async sendBody(method: 'PUT' | 'PATCH', relPath: string, body: ReadableStream, length: number,
+    headers: Record<string, string>, timeoutMs: number): Promise<void> {
+    const res = await sendStream(this.absoluteUrl(relPath), { method, headers: { Authorization: this.authHeader(), ...headers } }, body, length, timeoutMs);
+    const text = await res.text().catch(() => '');
+    if (res.status !== 200 && res.status !== 201 && res.status !== 204) throw davError(method, res.status, text);
+  }
+
+  // Destination is an absolute URL (RFC 4918). Apache's mod_dav behind a
+  // TLS proxy or tunnel compares its scheme and port with its own and answers
+  // 502, but takes a bare path; so a 502 or 400 is tried once more that way.
+  async move(fromRel: string, toRel: string, overwrite: boolean): Promise<void> {
+    const dest = this.absoluteUrl(toRel);
+    const once = (destination: string) => fetch(this.absoluteUrl(fromRel), {
+      method: 'MOVE', signal: AbortSignal.timeout(2 * QUICK_MS),
+      headers: { Authorization: this.authHeader(), Destination: destination, Overwrite: overwrite ? 'T' : 'F' },
+    });
+    let res = await once(dest);
+    if (res.status === 502 || res.status === 400) {
+      await res.body?.cancel();
+      res = await once(new URL(dest).pathname);
+    }
+    const text = await res.text().catch(() => '');
+    if (res.status !== 201 && res.status !== 204 && res.status !== 200) throw davError('MOVE', res.status, text);
+  }
+
+  async remove(relPath: string): Promise<void> {
+    const res = await fetch(this.absoluteUrl(relPath), {
+      method: 'DELETE', headers: { Authorization: this.authHeader() }, signal: AbortSignal.timeout(QUICK_MS),
+    });
+    await res.body?.cancel();
+    if (!res.ok && res.status !== 404) throw davError('DELETE', res.status, '');
+  }
+
   private absoluteUrl(relPath: string): string {
     const base = this.config.baseUrl.endsWith('/') ? this.config.baseUrl : this.config.baseUrl + '/';
     const root = this.config.rootPath.replace(/^\/+|\/+$/g, '');
@@ -174,6 +280,11 @@ export class WebDAVAdapter implements StorageAdapter {
     const path = [root, rel].filter(Boolean).map((seg) => seg.split('/').map(encodeURIComponent).join('/')).join('/');
     return new URL(path, base).toString();
   }
+}
+
+function davError(op: string, status: number, body: string): StorageWriteError {
+  const hint = body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+  return new StorageWriteError(status, op, `WebDAV ${op} HTTP ${status}${hint ? ': ' + hint : ''}`);
 }
 
 // A PROPFIND that the server rejected. `depthRefused` marks the specific

@@ -6,7 +6,7 @@ import { recordBookAsins } from '../lib/book-asins';
 import { runAndWait, runAsync, getJob, getJobLog, cancelJob, wharfConfigured, type WharfJob } from '../lib/wharf';
 import {
   audibleAllowed, audibleOrigin, tenantAccounts, accountByName, adoptLegacyAccounts, newNodeName,
-  createSync, setSyncJob, dropSync, deliveryTallies, redeliver, audibleDeliveryPump, latestDeliveries, type AudibleAccountRow,
+  createSync, setSyncJob, dropSync, deliveryTallies, redeliver, audibleDeliveryPump, latestDeliveries, deliveryFolder, type AudibleAccountRow,
 } from '../lib/audible-delivery';
 
 // Audible library backup — mounted at /api/admin/audible. The work runs on
@@ -231,11 +231,11 @@ audibleRoutes.get('/library', async (c) => {
 });
 
 // The node stages each finished m4b and posts it back (deliver.url, with a
-// token good only for this sync); Rhapsode copies it into the library's
-// first pCloud folder, under Audible/<account>/<Title - Author>/, and adds
-// it as a book. S3 and WebDAV libraries aren't delivered to yet.
+// token good only for this sync); Rhapsode copies it into the folder chosen
+// here (`folderId`, else the library's first pCloud, S3 or WebDAV folder),
+// under Audible/<account>/<Title - Author>/, and adds it as a book.
 audibleRoutes.post('/sync', async (c) => {
-  const body = await c.req.json().catch(() => ({})) as { account?: string; asins?: string[] | 'all'; libraryId?: string; force?: boolean; quality?: string };
+  const body = await c.req.json().catch(() => ({})) as { account?: string; asins?: string[] | 'all'; libraryId?: string; folderId?: string; force?: boolean; quality?: string };
   const name = String(body.account ?? '').trim().toLowerCase();
   const row = await accountFor(c, name);
   if (!row) return c.json({ error: 'Not found' }, 404);
@@ -243,10 +243,10 @@ audibleRoutes.post('/sync', async (c) => {
   const asins = body.asins === 'all' ? 'all' : (Array.isArray(body.asins) ? body.asins.filter((a) => typeof a === 'string' && /^[A-Z0-9]{10}$/.test(a)).slice(0, 500) : []);
   if (asins !== 'all' && !asins.length) return c.json({ error: 'pick at least one title' }, 400);
   const libraryId = String(body.libraryId ?? '');
-  const folder = await c.env.DB.prepare(
-    "SELECT id FROM library_folders WHERE library_id = ? AND tenant_id = ? AND provider = 'pcloud_oauth' ORDER BY added_at ASC LIMIT 1",
-  ).bind(libraryId, c.get('tenantId')).first<{ id: string }>();
-  if (!folder) return c.json({ error: 'That library has no pCloud folder to sync into' }, 400);
+  const folder = await deliveryFolder(c.env, c.get('tenantId'), libraryId, body.folderId ? String(body.folderId) : null);
+  if (!folder) {
+    return c.json({ error: body.folderId ? "That storage isn't one of this library's pCloud, S3 or WebDAV folders" : 'That library has no pCloud, S3 or WebDAV folder to sync into' }, 400);
+  }
   // Titles the node handed over but whose copy failed: the node counts them
   // as synced, so they are named for it to do again.
   const failed = [...(await latestDeliveries(c.env, c.get('tenantId'), row.node_name))]
@@ -311,7 +311,8 @@ audibleRoutes.post('/jobs/:id/redeliver', async (c) => {
   const r = await jobRecord(c, c.req.param('id'));
   if (!r?.syncId) return c.json({ error: 'Not found' }, 404);
   const n = await redeliver(c.env, r.syncId);
-  if (n) c.executionCtx.waitUntil(audibleDeliveryPump(c.env).catch(() => []));
+  // Starts pCloud pulls only (30 s here); S3/WebDAV go on the next cron tick.
+  if (n) c.executionCtx.waitUntil(audibleDeliveryPump(c.env, { checkPulls: false }).catch(() => []));
   return c.json({ ok: true, requeued: n });
 });
 

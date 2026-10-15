@@ -332,7 +332,7 @@ export const ADMIN_HTML = String.raw`<!doctype html>
 
   <div id="audible-card" class="card" style="display:none">
     <h2>Audible</h2>
-    <p class="muted" style="margin-top:0">Back up Audible purchases into the library. Each account signs in through Amazon's own page in your browser (2-factor and all) — nothing but a one-time code reaches the server. Books are downloaded, decrypted and remuxed to m4b with chapters and cover on a wharf node, then uploaded to the library's pCloud folder.</p>
+    <p class="muted" style="margin-top:0">Back up Audible purchases into the library. Each account signs in through Amazon's own page in your browser (2-factor and all) — nothing but a one-time code reaches the server. Books are downloaded, decrypted and remuxed to m4b with chapters and cover on a wharf node, then copied into the library's own storage: pCloud, S3 or WebDAV (pick which in the list beside the account).</p>
     <div id="audible-accounts" class="muted">Loading…</div>
     <details id="audible-add" style="margin-top:0.5rem">
       <summary>Add an Audible account</summary>
@@ -1232,7 +1232,7 @@ async function loadAllUsers() {
   body.querySelectorAll('[data-audible]').forEach((btn) => btn.addEventListener('click', async () => {
     const on = !btn.dataset.on;
     const name = btn.dataset.username;
-    if (on && !confirm('Let ' + name + ' import from Audible? Their Audible sign-in (a registered Amazon device) will be kept on your Audible wharf server, and their books are copied into their own pCloud.')) return;
+    if (on && !confirm('Let ' + name + ' import from Audible? Their Audible sign-in (a registered Amazon device) will be kept on your Audible wharf server, and their books are copied into their own storage.')) return;
     if (!on && !confirm('Turn Audible import off for ' + name + '? Their linked accounts stay on the server until they are removed; the Audible card just disappears for them.')) return;
     try { await api('/api/admin/tenants/' + encodeURIComponent(btn.dataset.audible) + '/audible', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: on }) }); loadAllUsers(); }
     catch (e) { if (!(e instanceof UnauthorizedError)) showError('Audible switch failed: ' + e.message); }
@@ -2355,14 +2355,31 @@ function audibleRender(status, libraries) {
   const target = document.getElementById('audible-target');
   const prev = target.value;
   target.innerHTML = '';
-  for (const f of status.folders || []) {
-    if (f.provider !== 'pcloud_oauth') continue;
+  // Every folder a sync can copy into (pCloud, S3, WebDAV), pCloud first as
+  // the server picks when none is named.
+  const rank = { pcloud_oauth: 0, s3: 1, webdav: 2 };
+  const writable = (status.folders || []).filter((f) => f.provider in rank)
+    .sort((a, b) => rank[a.provider] - rank[b.provider]);
+  for (const f of writable) {
+    const cfg = f.config || {};
+    const trim = (v) => String(v || '').replace(/^\/+|\/+$/g, '');
+    let where;
+    if (f.provider === 'pcloud_oauth') where = 'pCloud /' + trim(cfg.rootPath);
+    else if (f.provider === 's3') where = 'S3 ' + [trim(cfg.bucket), trim(cfg.prefix)].filter(Boolean).join('/');
+    else {
+      let host = String(cfg.baseUrl || '');
+      try { host = new URL(/^https?:/i.test(host) ? host : 'https://' + host).host; } catch (e) { /* show as typed */ }
+      where = 'WebDAV ' + [host, trim(cfg.rootPath)].filter(Boolean).join('/');
+    }
     const opt = document.createElement('option');
-    opt.value = f.libraryId;
-    opt.textContent = 'into ' + (f.libraryName || f.libraryId) + ' (pCloud ' + ((f.config && f.config.rootPath) || '/') + ')';
+    opt.value = f.id;
+    opt.dataset.library = f.libraryId;
+    opt.textContent = 'into ' + (f.libraryName || f.libraryId) + ' (' + where + ')';
     target.appendChild(opt);
   }
-  if (prev) target.value = prev;
+  // A remembered choice only if it is still offered (it was a library id
+  // before S3/WebDAV folders were listed).
+  if (prev && [...target.options].some((o) => o.value === prev)) target.value = prev;
   if (!target.options.length) return;
   if (!audibleWired) {
     audibleWired = true;
@@ -2567,9 +2584,11 @@ async function audibleSync(asins) {
   const st = document.getElementById('audible-lib-status');
   if (!asins.length) { st.textContent = 'Nothing selected.'; return; }
   const account = document.getElementById('audible-lib-account').value;
-  const libraryId = document.getElementById('audible-target').value;
+  const target = document.getElementById('audible-target');
+  const folderId = target.value;
+  const libraryId = target.selectedOptions[0] ? target.selectedOptions[0].dataset.library : '';
   try {
-    const r = await api('/api/admin/audible/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ account, asins, libraryId }) });
+    const r = await api('/api/admin/audible/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ account, asins, libraryId, folderId }) });
     st.textContent = 'Sync job started (' + asins.length + ' title' + (asins.length === 1 ? '' : 's') + ').';
     audibleSelected = new Set();
     document.getElementById('audible-sync-selected').textContent = 'Sync selected';
@@ -2594,7 +2613,7 @@ async function audibleLoadJobs() {
     list.innerHTML = '';
     audibleLogEls.clear();
     // A job that delivers through Rhapsode (j.delivery) is still busy after
-    // the node finishes while pCloud pulls its last books.
+    // the node finishes while its last books are copied into storage.
     const delivering = (j) => !!(j.delivery && (j.delivery.queued || j.delivery.fetching));
     const activeJobs = r.jobs.filter((j) => j.state === 'running' || j.state === 'pending' || delivering(j));
     count.textContent = r.jobs.length ? '(' + activeJobs.length + ' active)' : '';
@@ -2681,7 +2700,7 @@ const audibleDelivered = new Map(); // job id → books Rhapsode has put in the 
 function audibleDeliveryText(d) {
   const parts = [];
   if (d.done) parts.push(d.done + ' in the library');
-  if (d.fetching) parts.push(d.fetching + ' copying to pCloud');
+  if (d.fetching) parts.push(d.fetching + ' copying');
   if (d.queued) parts.push(d.queued + ' waiting');
   if (d.error) parts.push(d.error + ' failed (' + d.errors.map((e) => (e.title || e.asin) + ': ' + (e.error || '')).join('; ').slice(0, 300) + ')');
   return parts.join(', ');

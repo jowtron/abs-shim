@@ -67,10 +67,9 @@ export async function presignGet(opts: {
   // Optional response-header overrides (e.g. force inline disposition).
   responseContentType?: string;
 }): Promise<string> {
-  const url = new URL(opts.endpoint);
   // Path style or virtual-hosted? R2 + most S3-compat use path-style with the
   // bucket as the first path segment, which is what we generate here.
-  url.pathname = `/${opts.bucket}/${uriEncode(opts.key, false)}`;
+  const url = objectUrl(opts.endpoint, opts.bucket, opts.key);
 
   const now = new Date();
   const amzDate = isoBasic(now);              // 20260507T120000Z
@@ -116,18 +115,34 @@ export async function presignGet(opts: {
   return url.toString();
 }
 
-// Sign an arbitrary GET request (used by ListObjectsV2). Returns the headers
-// to attach. Body is empty for the operations we use.
+// Path-style URL of one object, its key encoded the way SigV4's canonical
+// URI wants it, so the path sent and the path signed are the same string.
+// An endpoint with a path (a MinIO behind a prefix) keeps it, as the
+// listing does.
+export function objectUrl(endpoint: string, bucket: string, key: string): URL {
+  const url = new URL(endpoint);
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/${bucket}/${uriEncode(key, false)}`;
+  return url;
+}
+
+export const sha256HexOf = (data: string | Uint8Array) => sha256Hex(data);
+
+// Sign a request with headers (ListObjectsV2, and the writes Audible
+// delivery makes). Returns the headers to attach. `payloadHash` is the
+// body's SHA-256 hex, or 'UNSIGNED-PAYLOAD' for a streamed body (a part
+// read from R2 can't be hashed without reading it twice); an empty body
+// when omitted.
 export async function signRequestHeaders(opts: {
-  method: 'GET' | 'HEAD';
+  method: 'GET' | 'HEAD' | 'PUT' | 'POST' | 'DELETE';
   url: URL;
   creds: S3Creds;
+  payloadHash?: string;
 }): Promise<Record<string, string>> {
   const now = new Date();
   const amzDate = isoBasic(now);
   const dateStamp = amzDate.slice(0, 8);
   const credentialScope = `${dateStamp}/${opts.creds.region}/${SERVICE}/aws4_request`;
-  const payloadHash = await sha256Hex('');
+  const payloadHash = opts.payloadHash ?? await sha256Hex('');
 
   const headers: Record<string, string> = {
     host: opts.url.host,
