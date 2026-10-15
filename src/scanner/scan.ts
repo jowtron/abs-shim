@@ -835,11 +835,18 @@ export async function addBookByPath(
   libraryId: string,
   relPath: string,
   tenantId: string,
-  hints?: { sizeBytes?: number },
+  hints?: { sizeBytes?: number; folderId?: string },
 ): Promise<{ added: boolean; itemId?: string; reason?: string }> {
-  const folderRow = await env.DB.prepare(
-    `SELECT * FROM library_folders WHERE library_id = ? AND tenant_id = ? ORDER BY added_at ASC LIMIT 1`,
-  ).bind(libraryId, tenantId).first<FolderRow>();
+  // Without folderId, the library's first folder: a library with several
+  // backends needs the caller to say which one the file is on (the Audible
+  // delivery pump does; it writes into the library's first pCloud folder).
+  const folderRow = hints?.folderId
+    ? await env.DB.prepare(
+        `SELECT * FROM library_folders WHERE id = ? AND library_id = ? AND tenant_id = ?`,
+      ).bind(hints.folderId, libraryId, tenantId).first<FolderRow>()
+    : await env.DB.prepare(
+        `SELECT * FROM library_folders WHERE library_id = ? AND tenant_id = ? ORDER BY added_at ASC LIMIT 1`,
+      ).bind(libraryId, tenantId).first<FolderRow>();
   if (!folderRow) return { added: false, reason: 'No folder configured for library' };
 
   // Idempotency: skip if a row already covers this path (item dir or file).

@@ -20,6 +20,8 @@ import { probeM4b } from '../prober/m4b';
 import { probeMp3 } from '../prober/mp3';
 import { resolveProbeUrl } from '../storage/resolve';
 import type { OAuthProfileRow } from '../storage/factory';
+import { loadPcloudFolder, joinPcloudPath } from '../storage/pcloud-folder';
+import { AUDIBLE_ALLOWED_KEY } from '../lib/audible-delivery';
 import { S3Adapter } from '../storage/s3';
 import { WebDAVAdapter, normalizeWebdavBaseUrl } from '../storage/webdav';
 import { PcloudOAuthAdapter } from '../storage/pcloud';
@@ -801,43 +803,6 @@ adminRoutes.post('/books/add-by-path', requireCanAdd, async (c) => {
 // upload hosts is not browser-friendly. The proxy adds one extra hop but is
 // simple, observable, and works today.
 
-// Load a pCloud-OAuth folder + its profile. Returns the same Response shape
-// as a Hono handler when the lookup fails so callers can `return` directly.
-async function loadPcloudFolder(env: Env, folderId: string, tenantId: string): Promise<
-  { ok: true; folder: NonNullable<Awaited<ReturnType<typeof getFolderById>>>; profile: PcloudProfile; rootPath: string }
-  | { ok: false; status: number; error: string }
-> {
-  const folder = await getFolderById(env, folderId, tenantId);
-  if (!folder) return { ok: false, status: 404, error: 'Folder not found' };
-  if (folder.provider !== 'pcloud_oauth') {
-    return { ok: false, status: 400, error: 'Upload is only supported on pcloud_oauth folders' };
-  }
-  if (!folder.profile_id) return { ok: false, status: 400, error: 'Folder has no profile_id' };
-  const profileRow = await env.DB.prepare(
-    'SELECT * FROM oauth_profiles WHERE id = ? AND tenant_id = ?',
-  ).bind(folder.profile_id, tenantId).first<OAuthProfileRow>();
-  if (!profileRow) return { ok: false, status: 404, error: 'pCloud profile missing' };
-  const apiHost = profileRow.api_host ?? 'api.pcloud.com';
-  const profile: PcloudProfile = { accessToken: profileRow.access_token, apiHost };
-  let rootPath = '/';
-  try {
-    const cfg = JSON.parse(folder.config_json ?? '{}') as { rootPath?: string };
-    rootPath = cfg.rootPath ?? '/';
-  } catch { /* default */ }
-  return { ok: true, folder, profile, rootPath };
-}
-
-// Build an absolute pCloud path from a folder's rootPath + a user-supplied
-// relPath. Defends against path-traversal (../) so a compromised browser
-// can't write outside the configured audiobook root.
-function joinPcloudPath(rootPath: string, relPath: string): string {
-  const cleanRoot = rootPath.replace(/\/+$/, '') || '/';
-  const cleanRel = relPath.replace(/^\/+/, '').replace(/\\/g, '/');
-  if (cleanRel.split('/').some((seg) => seg === '..' || seg === '')) {
-    throw new Error(`Invalid relPath: ${relPath}`);
-  }
-  return cleanRoot === '/' ? `/${cleanRel}` : `${cleanRoot}/${cleanRel}`;
-}
 
 // Step 1: create a pCloud upload session.
 // Body: { relPath: string }  (relPath is informational here; the actual save
@@ -1699,6 +1664,11 @@ adminRoutes.get('/users', requireInstanceOwner, async (c) => {
   }
   const bookByTenant: Record<string, number> = {};
   for (const b of books.results) bookByTenant[b.tenant_id] = b.book_count ?? 0;
+  // Libraries the instance owner has let use the Audible importer (his own
+  // always can; src/lib/audible-delivery.ts).
+  const audibleOn = new Set((await c.env.DB.prepare(
+    `SELECT tenant_id FROM tenant_settings WHERE key = ? AND value = '1'`,
+  ).bind(AUDIBLE_ALLOWED_KEY).all<{ tenant_id: string }>()).results.map((r) => r.tenant_id));
 
   return c.json({
     selfId: c.get('userId'),
@@ -1717,8 +1687,22 @@ adminRoutes.get('/users', requireInstanceOwner, async (c) => {
       role: u.role,
       servers: u.tenant_id ? (serversByTenant[u.tenant_id] ?? []) : [],
       bookCount: u.tenant_id ? (bookByTenant[u.tenant_id] ?? 0) : 0,
+      audibleAllowed: !!u.tenant_id && audibleOn.has(u.tenant_id),
     })),
   });
+});
+
+// Let a library use the Audible importer (instance owner only). Each linked
+// Audible account is a registered Amazon device whose sign-in lives on the
+// node, so this is a choice per person, off by default. Turning it off
+// leaves their linked accounts on the node; it only closes the card.
+adminRoutes.post('/tenants/:id/audible', requireInstanceOwner, async (c) => {
+  const tenantId = c.req.param('id');
+  const t = await c.env.DB.prepare('SELECT id FROM tenants WHERE id = ?').bind(tenantId).first<{ id: string }>();
+  if (!t) return c.json({ error: 'Library not found' }, 404);
+  const body = await c.req.json().catch(() => ({})) as { enabled?: unknown };
+  await setTenantSetting(c.env, tenantId, AUDIBLE_ALLOWED_KEY, body.enabled === true ? '1' : '0');
+  return c.json({ ok: true, enabled: body.enabled === true });
 });
 
 // Lock / unlock an account (instance owner only). Locking is the reversible

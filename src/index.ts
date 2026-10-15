@@ -19,6 +19,8 @@ import { adminRoutes } from './routes/admin';
 import { abbRoutes } from './routes/abb';
 import { passkeyRoutes } from './routes/passkeys';
 import { audibleRoutes } from './routes/audible';
+import { audibleNodeRoutes } from './routes/audible-node';
+import { serveStaged, audibleDeliveryPump } from './lib/audible-delivery';
 import { podcastRoutes, podcastSearchRoutes } from './routes/podcasts';
 import { playlistRoutes } from './routes/playlists';
 import { pushRoutes } from './routes/push';
@@ -518,6 +520,7 @@ app.route('/api/authors', authorRoutes);
 app.route('/api/auth/passkey', passkeyRoutes);
 app.route('/api/admin/abb', abbRoutes);
 app.route('/api/admin/audible', audibleRoutes);
+app.route('/api/audible-node', audibleNodeRoutes);
 app.route('/api/admin', adminRoutes);
 
 // Public self-serve signup (approval-gated). The API lives under /api/signup;
@@ -576,6 +579,10 @@ app.get('/public/abb-cover/:file', async (c) => {
   c.executionCtx.waitUntil(cache.put(key, res.clone()));
   return res;
 });
+
+// A staged Audible m4b, for pCloud to pull into a library (signed, 24 h;
+// src/lib/audible-delivery.ts).
+app.on(['GET', 'HEAD'], '/public/audible-staged/:id', (c) => serveStaged(c.env, c.req.raw, c.req.param('id')));
 
 app.get('/public/proxy/:folderId/*', async (c) => {
   const folderId = c.req.param('folderId');
@@ -873,6 +880,12 @@ export default {
       runPodcastTick(env)
         .then((log) => { if (log.length) console.log('[podcasts] ' + log.join(' | ')); })
         .catch((e: Error) => console.error('[podcasts] tick failed: ' + e.message)),
+    );
+    // Audible titles staged by the node, into each library's own storage.
+    ctx.waitUntil(
+      audibleDeliveryPump(env)
+        .then((log) => { if (log.length) console.log('[audible] ' + log.join(' | ')); })
+        .catch((e: Error) => console.error('[audible] pump failed: ' + e.message)),
     );
     // A node that stopped reporting on rclone's pCloud token is as quiet as
     // a revoked one.

@@ -48,6 +48,13 @@ migrations_dir = "migrations"
 binding = "COVERS"
 bucket_name = "abs-shim-covers"
 
+# Where the audible wharf node stages each finished m4b. The Worker serves it
+# to pCloud (a signed /public/audible-staged URL) and deletes it once it has
+# landed in the library's storage (src/lib/audible-delivery.ts).
+[[r2_buckets]]
+binding = "AUDIBLE_STAGING"
+bucket_name = "abs-shim-audible-staging"
+
 [[durable_objects.bindings]]
 name = "SESSION"
 class_name = "ListeningSessionDO"

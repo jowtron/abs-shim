@@ -1190,6 +1190,11 @@ async function loadAllUsers() {
     if (u.signupStatus !== 'pending' && !u.isLocked) {
       html += '<button class="secondary" data-reset-link="' + escapeHtml(u.id) + '" data-username="' + escapeHtml(u.username) + '" data-has-email="' + (u.email ? '1' : '') + '" style="font-size:0.78rem;padding:0.2rem 0.55rem">Reset link\u2026</button> ';
     }
+    // Audible import for someone else's library: off until you allow it,
+    // because their Audible sign-in would be kept on your wharf server.
+    if (u.role === 'owner' && u.tenantId && u.type !== 'root' && u.type !== 'admin' && u.signupStatus !== 'pending') {
+      html += '<button class="secondary" data-audible="' + escapeHtml(u.tenantId) + '" data-on="' + (u.audibleAllowed ? '1' : '') + '" data-username="' + escapeHtml(u.username) + '" style="font-size:0.78rem;padding:0.2rem 0.55rem">' + (u.audibleAllowed ? 'Audible: on' : 'Audible: off') + '</button> ';
+    }
     if (u.id !== data.selfId) {
       if (u.isLocked) {
         html += '<button class="secondary" data-unlock="' + escapeHtml(u.id) + '" style="font-size:0.78rem;padding:0.2rem 0.55rem">Unlock</button>';
@@ -1223,6 +1228,14 @@ async function loadAllUsers() {
         await navigator.clipboard.writeText('').catch(() => {});
       }
     } catch (e) { if (!(e instanceof UnauthorizedError)) showError('Reset link failed: ' + e.message); }
+  }));
+  body.querySelectorAll('[data-audible]').forEach((btn) => btn.addEventListener('click', async () => {
+    const on = !btn.dataset.on;
+    const name = btn.dataset.username;
+    if (on && !confirm('Let ' + name + ' import from Audible? Their Audible sign-in (a registered Amazon device) will be kept on your Audible wharf server, and their books are copied into their own pCloud.')) return;
+    if (!on && !confirm('Turn Audible import off for ' + name + '? Their linked accounts stay on the server until they are removed; the Audible card just disappears for them.')) return;
+    try { await api('/api/admin/tenants/' + encodeURIComponent(btn.dataset.audible) + '/audible', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: on }) }); loadAllUsers(); }
+    catch (e) { if (!(e instanceof UnauthorizedError)) showError('Audible switch failed: ' + e.message); }
   }));
   body.querySelectorAll('[data-unlock]').forEach((btn) => btn.addEventListener('click', async () => {
     try { await api('/api/admin/users/' + btn.dataset.unlock + '/unlock', { method: 'POST' }); loadAllUsers(); }
@@ -2532,7 +2545,9 @@ function audibleTable(items) {
     tr.querySelector('.aud-title').textContent = it.title + (it.subtitle ? ': ' + it.subtitle : '');
     const hrs = it.runtime_min ? Math.round(it.runtime_min / 6) / 10 + ' h' : null;
     tr.querySelector('.aud-sub').textContent = [(it.authors || []).join(', '), (it.narrators || []).length ? 'read by ' + it.narrators.join(', ') : null, it.series ? it.series + (it.series_sequence ? ' #' + it.series_sequence : '') : null, hrs, it.purchase_date ? 'bought ' + it.purchase_date.slice(0, 10) : null].filter(Boolean).join(' · ');
-    if (it.synced) { const s = document.createElement('span'); s.className = 'aud-synced'; s.textContent = '✓ backed up'; s.title = it.synced.path; tr.children[3].appendChild(s); }
+    if (it.synced && it.delivering) { const s = document.createElement('span'); s.className = 'muted'; s.style.fontSize = '0.8rem'; s.textContent = 'copying to your storage…'; s.title = it.synced.path; tr.children[3].appendChild(s); }
+    else if (it.synced) { const s = document.createElement('span'); s.className = 'aud-synced'; s.textContent = '✓ backed up'; s.title = it.synced.path; tr.children[3].appendChild(s); }
+    else if (it.deliveryError) { const s = document.createElement('span'); s.className = 'warn'; s.style.fontSize = '0.8rem'; s.textContent = 'copy failed, sync again'; s.title = it.deliveryError; tr.children[3].appendChild(s); }
     else if (it.content_type === 'Podcast') { tr.children[3].innerHTML = '<span class="muted" style="font-size:0.8rem">podcast</span>'; cb.disabled = true; }
     else if (it.downloadable === false) {
       // Audible's customer_rights says streaming-only (Originals marked
@@ -2578,7 +2593,10 @@ async function audibleLoadJobs() {
     const r = await api('/api/admin/audible/jobs');
     list.innerHTML = '';
     audibleLogEls.clear();
-    const activeJobs = r.jobs.filter((j) => j.state === 'running' || j.state === 'pending');
+    // A job that delivers through Rhapsode (j.delivery) is still busy after
+    // the node finishes while pCloud pulls its last books.
+    const delivering = (j) => !!(j.delivery && (j.delivery.queued || j.delivery.fetching));
+    const activeJobs = r.jobs.filter((j) => j.state === 'running' || j.state === 'pending' || delivering(j));
     count.textContent = r.jobs.length ? '(' + activeJobs.length + ' active)' : '';
     // A sync in progress is the thing you came back to look at: open the
     // section the first time one shows up — but only once, or closing it by
@@ -2603,20 +2621,33 @@ async function audibleLoadJobs() {
       });
       list.appendChild(log);
       if (show) audibleTailLog(j.id, log, running ? j : undefined);
+      const dl = j.delivery ? audibleDeliveryText(j.delivery) : '';
+      if (j.delivery) audibleNoteDelivered(j);
+      if (j.delivery && j.delivery.error) {
+        row.addButton('Retry failed', async () => {
+          try { const rr = await api('/api/admin/audible/jobs/' + encodeURIComponent(j.id) + '/redeliver', { method: 'POST' }); if (!rr.requeued) showError('Nothing to retry: the staged copies are gone, so sync those titles again.'); }
+          catch (e) { showError('Retry failed: ' + e.message); }
+          audibleLoadJobs();
+        });
+      }
       if (j.state === 'succeeded') {
         const res = j.result || {};
-        const tally = (res.done || []).length + ' backed up, ' + (res.failed || []).length + ' failed, ' + (res.skipped || []).length + ' already there';
+        const tally = (res.done || []).length + (j.delivery ? ' downloaded, ' : ' backed up, ') + (res.failed || []).length + ' failed, ' + (res.skipped || []).length + ' already there';
         // A sync stops early when pCloud refuses rclone's token: every later
         // title would download for minutes and then fail the same way.
         if (res.stopped) row.fail('Stopped (' + tally + '): ' + String(res.stopped).slice(0, 200));
-        else row.complete('Done: ' + tally);
-        if (!j.scanned) audibleAfterSync(j);
+        else if (delivering(j)) row.setStatus('Downloaded (' + tally + ') · ' + dl);
+        else if (j.delivery && j.delivery.error) row.fail('Done: ' + tally + ' · ' + dl);
+        else row.complete('Done: ' + tally + (dl ? ' · ' + dl : ''));
+        // Delivered books register one by one as they land; only the older
+        // jobs, which uploaded to pCloud themselves, need a scan.
+        if (!j.scanned && !j.delivery) audibleAfterSync(j);
       } else if (j.state === 'failed' || j.state === 'cancelled' || j.state === 'interrupted') {
         // The handler's own reason (e.g. the pCloud preflight) is in its result; wharf's error is often just the exit status.
         const why = (j.result && j.result.error) || j.error;
         row.fail(j.state + (why ? ': ' + String(why).split('\n')[0].slice(0, 200) : ''));
       } else {
-        row.setStatus(j.state + '…');
+        row.setStatus(j.state + '…' + (dl ? ' · ' + dl : ''));
         row.addButton('Cancel', async () => { await api('/api/admin/audible/jobs/' + encodeURIComponent(j.id) + '/cancel', { method: 'POST' }); audibleLoadJobs(); });
       }
     }
@@ -2645,6 +2676,23 @@ function audibleWatch(activeJobs) {
 }
 
 const audibleLanded = new Map(); // job id → books seen landing (from "done →" log lines)
+const audibleDelivered = new Map(); // job id → books Rhapsode has put in the library
+
+function audibleDeliveryText(d) {
+  const parts = [];
+  if (d.done) parts.push(d.done + ' in the library');
+  if (d.fetching) parts.push(d.fetching + ' copying to pCloud');
+  if (d.queued) parts.push(d.queued + ' waiting');
+  if (d.error) parts.push(d.error + ' failed (' + d.errors.map((e) => (e.title || e.asin) + ': ' + (e.error || '')).join('; ').slice(0, 300) + ')');
+  return parts.join(', ');
+}
+
+// Refresh the library views when another delivered book has landed.
+function audibleNoteDelivered(j) {
+  const seen = audibleDelivered.get(j.id);
+  audibleDelivered.set(j.id, j.delivery.done);
+  if (seen != null && j.delivery.done > seen) { audibleLoadLibrary(false); refresh(); }
+}
 
 async function audibleTailLog(id, el, job) {
   try {
@@ -2655,7 +2703,8 @@ async function audibleTailLog(id, el, job) {
     if (el.textContent !== text) { el.textContent = text; el.scrollTop = el.scrollHeight; }
     // Scan the library as each book lands (the handler logs "done →" per
     // title), not only when the whole job ends — so they show up one by one.
-    if (job) {
+    // Delivered jobs register each book as it lands, so they need no scan.
+    if (job && !job.delivery) {
       const landed = ((r.content || '').match(/\] done → /g) || []).length;
       if (landed > (audibleLanded.get(id) || 0)) {
         audibleLanded.set(id, landed);

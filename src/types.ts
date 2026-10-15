@@ -7,6 +7,7 @@ export type Env = {
   ARCHIVE_EXTRACT: DurableObjectNamespace;
   ASSETS: Fetcher; // Cloudflare static-assets binding for the bundled ABS web UI.
   COVERS: R2Bucket; // Persistent cover cache — see src/routes/items.ts.
+  AUDIBLE_STAGING?: R2Bucket; // Audible node's staged m4b files — src/lib/audible-delivery.ts.
   // wharf-router service binding + its bearer (secret) — the Audible
   // importer submits jobs through it; see src/lib/wharf.ts. Optional: the
   // Audible routes answer 503 when either is missing.

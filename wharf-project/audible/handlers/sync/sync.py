@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""sync — back up Audible titles into the pCloud audiobook library.
+"""sync — back up Audible titles into a Rhapsode library's own storage.
 
-stdin:  {"account": "joseph", "asins": ["B0..", ...] | "all",
-         "dest_root": "Public Folder/audiobooks", "force": false, "quality": "best"}
+stdin:  {"account": "t-3f2a…", "asins": ["B0..", ...] | "all", "force": false, "quality": "best",
+         "path_prefix": "Audible/mum",
+         "deliver": {"url": "https://rhapsode…/api/audible-node/staged", "sync": "as_…", "token": "…"}}
 stdout: {"ok": true, "done": [{asin, title, path, bytes}], "failed": [{asin, title, error}], "skipped": [asin...]}
 
-Per title, sequentially (one slot, ~1 GB of scratch at a time):
+`account` is the node's name for the account (Rhapsode maps each library's
+own names to these), `path_prefix` the library's folder for it.
+
+Per title, sequentially (~1 GB of scratch at a time):
   1. audible-cli download: aaxc (with voucher) or aax fallback, 1215px
      cover, flat chapter JSON, into data/dl/<account>/<asin>/
   2. ffmpeg: decrypt (aaxc key/iv from the voucher, or the account's
@@ -13,8 +17,13 @@ Per title, sequentially (one slot, ~1 GB of scratch at a time):
      m4b with the library's tags, chapters written as an ffmetadata file
      (so they land as a Nero chpl atom, which the shim's prober reads),
      and the cover attached
-  3. rclone copyto → pcloud:<dest_root>/Audible/<account>/<Title - Author>/<Title>.m4b
-  4. record in data/synced/<account>.json, delete the working dir
+  3. rclone copyto → r2:abs-shim-audible-staging/<account>/<asin>/<Title>.m4b
+  4. POST it to deliver.url; Rhapsode copies it into the library's own
+     storage with the library's own credentials, registers it and deletes
+     the staged copy (ABS_shim src/lib/audible-delivery.ts). Until
+     2026-10-15 this step was a pCloud pull with the instance owner's rclone
+     token, which put every library's books in his pCloud.
+  5. record in data/synced/<account>.json, delete the working dir
 
 Progress goes to stderr (the shim tails the job log); the result JSON is
 the last line on stdout. Titles already in synced.json are skipped unless
@@ -28,7 +37,7 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.parse
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -161,108 +170,51 @@ def rclone_has_remote(name):
         return False
 
 
-def pcloud_token():
-    """OAuth access token from the rclone pcloud remote (rclone stores the
-    token as a JSON blob on the `token = ` line)."""
-    for line in Path(L.RCLONE_CONF).read_text().splitlines():
-        if line.startswith("token = "):
-            return json.loads(line[len("token = "):]).get("access_token")
-    raise RuntimeError("no pcloud token in rclone.conf")
+STAGING_BUCKET = "abs-shim-audible-staging"
+# Cloudflare in front of the shim refuses Python-urllib's own User-Agent.
+UA = "rhapsode-audible-node/1"
 
 
-PCLOUD_API = "https://api.pcloud.com"
-# 1000 log in required, 2000 log in failed, 2094 invalid token, 2095 revoked.
-PCLOUD_AUTH_ERRORS = {1000, 2000, 2094, 2095}
+class DeliveryRefused(RuntimeError):
+    """Rhapsode answered 4xx: retrying the same notice won't help."""
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
 
 
-class PcloudAuthError(RuntimeError):
-    """pCloud refused rclone's token. Every later title would fail the same
-    way, after its whole Audible download, so the run stops."""
-
-
-def pcloud_api(method, params, token, timeout=60):
-    q = urllib.parse.urlencode(params)
-    req = urllib.request.Request(f"{PCLOUD_API}/{method}?{q}", headers={"Authorization": f"Bearer {token}"})
-    for attempt in range(4):
+def post_deliver(deliver, payload, timeout=60):
+    """POST a notice to Rhapsode; retries a dropped connection or a 5xx."""
+    body = json.dumps({"sync": deliver["sync"], **payload}).encode()
+    req = urllib.request.Request(deliver["url"], data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {deliver['token']}", "User-Agent": UA,
+    })
+    for attempt in range(5):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                d = json.load(r)
-            break
-        except Exception as e:  # noqa: BLE001 — pCloud's API sits behind Cloudflare and 5xx/drops now and then
-            if attempt == 3:
-                raise RuntimeError(f"pCloud {method}: {e}") from e
-            time.sleep(2 ** attempt)
-    if d.get("result") in PCLOUD_AUTH_ERRORS:
-        raise PcloudAuthError(f"pCloud refused rclone's token ({d.get('result')} {d.get('error', '')}). "
-                              "Re-authorise with ops/pcloud-health/pcloud-reauth.sh on the Mac, then sync again.")
-    return d
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            if 400 <= e.code < 500:
+                raise DeliveryRefused(e.code, f"Rhapsode refused it ({e.code}): {detail}") from e
+            last = f"HTTP {e.code}: {detail}"
+        except Exception as e:  # noqa: BLE001 — network: retry
+            last = str(e)
+        if attempt < 4:
+            time.sleep(5 * 2 ** attempt)
+    raise RuntimeError(f"couldn't reach Rhapsode: {last}")
 
 
-def pcloud_ensure_folder(token, abs_path):
-    """createfolderifnotexists only creates the leaf: walk the path. Returns folderid."""
-    folderid = 0
-    cur = ""
-    for seg in [p for p in abs_path.split("/") if p]:
-        cur += "/" + seg
-        d = pcloud_api("createfolderifnotexists", {"path": cur}, token)
-        if d.get("result") != 0:
-            raise RuntimeError(f"pCloud createfolderifnotexists {cur}: {d.get('result')} {d.get('error', '')}")
-        folderid = d["metadata"]["folderid"]
-    return folderid
-
-
-def pcloud_stat_size(token, abs_path):
-    d = pcloud_api("stat", {"path": abs_path}, token, timeout=90)
-    if d.get("result") == 2009 or d.get("result") == 2055:   # not found
-        return None
-    if d.get("result") != 0:
-        raise RuntimeError(f"pCloud stat {abs_path}: {d.get('result')} {d.get('error', '')}")
-    return d["metadata"].get("size")
-
-
-def upload_via_r2(account, asin, out, dest_root, folder, expected):
-    """Stage the m4b in R2 (fast from anywhere), then have pCloud pull it
-    from a signed URL — its servers fetch at datacentre speed, so the slow
-    box→pCloud leg (37 KB/s from stereo-au, 2026-09-03) never happens."""
-    key = f"abs-shim-audible-staging/{account}/{asin}/{out.name}"
+def stage_and_deliver(deliver, account, asin, item, out, folder):
+    """Stage the m4b in R2 (fast from anywhere) and hand it to Rhapsode,
+    which has the library's own storage credentials; the slow box→pCloud
+    leg (37 KB/s from stereo-au, 2026-09-03) never happens."""
+    key = f"{account}/{asin}/{out.name}"
+    size = out.stat().st_size
     L.log(f"[{asin}] staging in R2…")
-    rc, tail = run_rclone(["copyto", str(out), f"r2:{key}", "--s3-upload-concurrency", "4", "--s3-chunk-size", "16M", "--retries", "5"], 3 * 3600, "R2")
+    rc, tail = run_rclone(["copyto", str(out), f"r2:{STAGING_BUCKET}/{key}", "--s3-upload-concurrency", "4", "--s3-chunk-size", "16M", "--retries", "5"], 3 * 3600, "R2")
     if rc != 0:
         raise RuntimeError(f"R2 upload failed: {tail[-300:]}")
-    r = L.run(["rclone", "link", f"r2:{key}", "--expire", "12h"], timeout=60)
-    url = (r.stdout or "").strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else ""
-    if not url.startswith("http"):
-        raise RuntimeError(f"could not presign the R2 object: {(r.stderr or '').strip()[-200:]}")
-    token = pcloud_token()
-    abs_dir = f"/{dest_root.strip('/')}/{folder}"
-    abs_path = f"{abs_dir}/{out.name}"
-    folderid = pcloud_ensure_folder(token, abs_dir)
-    have = pcloud_stat_size(token, abs_path)
-    if have == expected:
-        L.log(f"[{asin}] already on pCloud with the same size")
-    else:
-        L.log(f"[{asin}] asking pCloud to pull {expected / 1024 / 1024:.0f} MB…")
-        # `target` is double-encoded on pCloud's side (verified in the shim's fetch-url flow).
-        d = pcloud_api("downloadfileasync", {"url": url, "folderid": folderid, "target": urllib.parse.quote(out.name)}, token)
-        if d.get("result") != 0:
-            raise RuntimeError(f"pCloud downloadfileasync: {d.get('result')} {d.get('error', '')}")
-        # No progress API for async pulls (uploadprogress never reports them):
-        # stat the target until its size matches. stat can block for a while
-        # mid-write, hence the generous per-call timeout above.
-        t0, last, last_log = time.time(), -1, 0.0
-        while True:
-            time.sleep(10)
-            size = pcloud_stat_size(token, abs_path)
-            if size == expected:
-                break
-            if size is not None and size != last:
-                last = size
-                if time.time() - last_log > 30:
-                    L.log(f"  pCloud {size * 100 // expected:>3}% · {size / 1024 / 1024:.0f} / {expected / 1024 / 1024:.0f} MB")
-                    last_log = time.time()
-            if time.time() - t0 > 2 * 3600:
-                raise RuntimeError("pCloud pull didn't finish within 2 h")
-    L.run(["rclone", "deletefile", f"r2:{key}"], timeout=120)
+    return post_deliver(deliver, {"asin": asin, "title": item.get("title"), "folder": folder, "file": out.name, "key": key, "bytes": size})
 
 
 def activation_bytes(account):
@@ -275,7 +227,7 @@ def activation_bytes(account):
     return ab
 
 
-def sync_one(account, item, dest_root, quality):
+def sync_one(account, item, deliver, path_prefix, quality):
     asin = item["asin"]
     work = L.DL_DIR / account / asin
     work.mkdir(parents=True, exist_ok=True)
@@ -337,25 +289,22 @@ def sync_one(account, item, dest_root, quality):
         raise RuntimeError(f"ffmpeg failed: {(r.stderr or '').strip()[-400:]}")
     L.log(f"[{asin}] m4b ready ({out.stat().st_size / 1024 / 1024:.0f} MB, {len(chapters)} chapters); uploading…")
 
-    # Keep Audible backups apart from everything else in the library:
+    # Audible backups sit apart from everything else in the library:
     # <root>/Audible/<account>/<Title - Author>/<Title>.m4b (Joseph's ask,
-    # 2026-09-02). The scanner walks subfolders, so the nesting is free.
-    rel_dir = f"Audible/{account}/{folder}"
-    if rclone_has_remote("r2"):
-        upload_via_r2(account, asin, out, dest_root, rel_dir, out.stat().st_size)
-    else:
-        dest = f"pcloud:{dest_root.strip('/')}/{rel_dir}/{out.name}"
-        rc, tail = run_rclone(["copyto", str(out), dest, "--retries", "5", "--low-level-retries", "20"], 6 * 3600, "pCloud")
-        if rc != 0:
-            raise RuntimeError(f"rclone upload failed: {tail[-300:]}")
-    rel = f"{rel_dir}/{out.name}"
-    rec = {"path": rel, "bytes": out.stat().st_size, "at": int(time.time() * 1000), "chapters": len(chapters)}
+    # 2026-09-02); Rhapsode builds that path from `folder` and the file name.
+    r = stage_and_deliver(deliver, account, asin, item, out, folder)
+    # Rhapsode may add the ASIN to the folder name when another title of the
+    # library already has "Title - Author".
+    rel = r.get("relPath") or f"{path_prefix}/{folder}/{out.name}"
+    rec = {"path": rel, "bytes": out.stat().st_size, "at": int(time.time() * 1000), "chapters": len(chapters), "delivery": r.get("id")}
     synced_path = L.SYNCED_DIR / f"{account}.json"
     synced = L.load_json(synced_path, {})
     synced[asin] = rec
     L.save_json(synced_path, synced)
     shutil.rmtree(work, ignore_errors=True)
-    L.log(f"[{asin}] done → {rel}")
+    # Not "done →": the old /admin scanned the library on that line, and the
+    # book isn't in the library until Rhapsode's copy lands.
+    L.log(f"[{asin}] handed to Rhapsode → {rel}")
     return rec
 
 
@@ -363,11 +312,19 @@ args = L.read_args()
 account = L.check_account(args.get("account"))
 if account not in L.accounts():
     L.fail(f"unknown account '{account}'")
-dest_root = str(args.get("dest_root") or "").strip("/ ")
-if not dest_root:
-    L.fail("dest_root required (pCloud path of the audiobook library, e.g. 'Public Folder/audiobooks')")
+deliver = args.get("deliver") or {}
+if not all(isinstance(deliver.get(k), str) and deliver.get(k) for k in ("url", "sync", "token")):
+    L.fail("deliver {url, sync, token} required (this handler only hands books to Rhapsode)")
+path_prefix = str(args.get("path_prefix") or "").strip("/ ")
+if not path_prefix:
+    L.fail("path_prefix required")
+if not rclone_has_remote("r2"):
+    L.fail("no r2 remote in data/rclone.conf (books are staged there)")
 quality = args.get("quality") or "best"
 force = bool(args.get("force"))
+# Titles Rhapsode accepted earlier but couldn't copy into storage: synced
+# here, not there, so they go again.
+redo = {a for a in (args.get("redo") or []) if isinstance(a, str)}
 lib = L.load_json(L.LIBRARY_DIR / f"{account}.json", {})
 by_asin = {i["asin"]: i for i in lib.get("items", []) if i.get("asin")}
 if not by_asin:
@@ -376,27 +333,24 @@ want = args.get("asins")
 asins = list(by_asin) if want == "all" or want is None else [a for a in want if isinstance(a, str)]
 synced = L.load_json(L.SYNCED_DIR / f"{account}.json", {})
 
-# Check pCloud before downloading anything. On 2026-10-05 pCloud revoked
-# rclone's token (2095) and each title spent ~13 min downloading from Audible
-# before failing at the pCloud step; this fails the job in seconds instead.
-if any(force or a not in synced for a in asins):
+# Check Rhapsode will take the books before downloading anything: a title
+# costs ~13 minutes of download before it gets to hand anything over.
+if any(force or a not in synced or a in redo for a in asins):
     try:
-        info = pcloud_api("userinfo", {}, pcloud_token(), timeout=30)
-    except RuntimeError as e:   # PcloudAuthError included
-        L.fail(f"pCloud preflight: {e}")
-    if info.get("result") != 0:
-        L.fail(f"pCloud preflight: {info.get('result')} {info.get('error', '')}")
-    L.log("pCloud token OK")
+        post_deliver(deliver, {"ping": True}, timeout=30)
+    except RuntimeError as e:
+        L.fail(f"Rhapsode delivery check: {e}")
+    L.log("Rhapsode delivery OK")
 
 done, failed, skipped = [], [], []
 stopped = None
-L.log(f"sync {account}: {len(asins)} title(s) → pcloud:{dest_root}")
+L.log(f"sync: {len(asins)} title(s) → {path_prefix}")
 for n, asin in enumerate(asins, 1):
     item = by_asin.get(asin)
     if not item:
         failed.append({"asin": asin, "title": None, "error": "not in this account's library"})
         continue
-    if asin in synced and not force:
+    if asin in synced and not force and asin not in redo:
         skipped.append(asin)
         continue
     if item.get("content_type") == "Podcast":
@@ -404,20 +358,21 @@ for n, asin in enumerate(asins, 1):
         continue
     L.log(f"({n}/{len(asins)})")
     try:
-        rec = sync_one(account, item, dest_root, quality)
+        rec = sync_one(account, item, deliver, path_prefix, quality)
         done.append({"asin": asin, "title": item.get("title"), **rec})
     except subprocess.TimeoutExpired:
         failed.append({"asin": asin, "title": item.get("title"), "error": "timed out"})
         L.log(f"[{asin}] timed out")
-    except PcloudAuthError as e:
+    except DeliveryRefused as e:
+        # A refused sync token refuses every later title too.
         failed.append({"asin": asin, "title": item.get("title"), "error": str(e)[:400]})
-        stopped = str(e)
         L.log(f"[{asin}] FAILED: {e}")
-        L.log(f"stopping: {len(asins) - n} title(s) not attempted")
-        break
+        if e.code == 401:
+            stopped = str(e)
+            L.log(f"stopping: {len(asins) - n} title(s) not attempted")
+            break
     except Exception as e:  # noqa: BLE001
         failed.append({"asin": asin, "title": item.get("title"), "error": str(e)[:400]})
         L.log(f"[{asin}] FAILED: {e}")
-L.log(f"finished: {len(done)} synced, {len(failed)} failed, {len(skipped)} already there")
-# `stopped` still succeeds the job, so /admin scans the titles that did land.
+L.log(f"finished: {len(done)} handed over, {len(failed)} failed, {len(skipped)} already there")
 L.emit({"ok": True, "account": account, "done": done, "failed": failed, "skipped": skipped, "stopped": stopped})

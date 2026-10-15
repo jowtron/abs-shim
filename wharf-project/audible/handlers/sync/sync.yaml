@@ -1,11 +1,11 @@
 name: sync
-description: "Download selected Audible titles (or all), decrypt/remux to m4b with chapters + cover, upload into the pCloud audiobook library. Long-running; progress in the job log."
+description: "Download selected Audible titles (or all), decrypt/remux to m4b with chapters + cover, stage each in R2 and hand it to Rhapsode, which copies it into the library's own storage. Long-running; progress in the job log."
 
 mode_allowed: [async]
 idempotent: true
 
 # Sequential per title, about 13 minutes each (download, decrypt, R2
-# stage, pCloud pull). 48 h, not 6: the 6 h limit killed liz's 114-title
+# stage; Rhapsode's pCloud pull runs alongside the next title). 48 h, not 6: the 6 h limit killed liz's 114-title
 # "all" sync at title 29 (2026-10-04). A re-run skips titles already in
 # data/synced/<account>.json, so a timeout costs time, not work.
 timeout_ms: 172800000
@@ -20,10 +20,11 @@ env_passthrough: []
 input_schema:
   type: object
   additionalProperties: false
-  required: ["account", "dest_root"]
+  required: ["account", "deliver", "path_prefix"]
   properties:
     account:
       type: string
+      description: "The node's name for the account (Rhapsode maps each library's names to these)."
       pattern: "^[a-z0-9][a-z0-9-]{0,31}$"
     asins:
       description: "ASINs to sync, or the string \"all\"."
@@ -33,9 +34,24 @@ input_schema:
           maxItems: 500
         - type: string
           enum: ["all"]
-    dest_root:
+    path_prefix:
       type: string
-      description: "pCloud path of the audiobook library root, e.g. \"Public Folder/audiobooks\"."
+      description: "The book's folder in the library, recorded in synced.json: \"Audible/<library's account name>\"."
+      pattern: "^Audible/[a-z0-9][a-z0-9-]{0,31}$"
+    redo:
+      type: array
+      description: "ASINs to download again although synced.json has them (Rhapsode couldn't copy them into storage)."
+      items: { type: string }
+      maxItems: 500
+    deliver:
+      type: object
+      description: "Where each staged book is posted: Rhapsode's /api/audible-node/staged, with a token good only for this sync."
+      additionalProperties: false
+      required: ["url", "sync", "token"]
+      properties:
+        url: { type: string, pattern: "^https?://" }
+        sync: { type: string, pattern: "^as_[0-9a-f]{16}$" }
+        token: { type: string, pattern: "^[0-9a-f]{64}$" }
     force:
       type: boolean
       default: false
