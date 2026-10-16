@@ -2,6 +2,7 @@ import type { Env } from '../types';
 import type { AudioFileRow, LibraryFolderRow } from '../db/library';
 import { resolveStreamUrl, audioContentType, fetchWithHeaderTimeout } from './resolve';
 import { parseRange } from './moov-cache';
+import { fetchLink } from './link-fetch';
 
 // Opportunistic R2 cache of arbitrary audio byte ranges. Complements
 // moov-cache.ts: that one targets the small `moov` atom (fixes iOS's
@@ -194,7 +195,7 @@ export async function warmByteChunk(
     const streamUrl = await resolveStreamUrl(env, folder, audio);
     // Best-effort background warm: bound the WHOLE fetch (headers + 4 MiB
     // body) so a pCloud hang can't pin the waitUntil for minutes.
-    const upstream = await fetch(streamUrl.url, {
+    const upstream = await fetchLink(streamUrl.url, {
       headers: { Range: `bytes=${chunk.start}-${chunk.end}` },
       signal: AbortSignal.timeout(30_000),
     });
@@ -241,7 +242,7 @@ export async function streamAndCache(
     const fwd = new Headers();
     const range = req.headers.get('Range');
     if (range) fwd.set('Range', range);
-    const upstream = await fetch(stream.url, { headers: fwd });
+    const upstream = await fetchLink(stream.url, { headers: fwd });
     const respHeaders = new Headers(upstream.headers);
     respHeaders.delete('access-control-allow-origin');
     respHeaders.set('content-type', audioContentType(audio));
@@ -256,7 +257,7 @@ export async function streamAndCache(
   const fwd = new Headers();
   const range = req.headers.get('Range');
   if (range) fwd.set('Range', range);
-  const upstream = await fetch(stream.url, { headers: fwd });
+  const upstream = await fetchLink(stream.url, { headers: fwd });
 
   if (!upstream.body || (upstream.status !== 200 && upstream.status !== 206)) {
     const respHeaders = new Headers(upstream.headers);

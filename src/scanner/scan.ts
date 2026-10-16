@@ -8,6 +8,7 @@ import { probeWebm } from '../prober/webm';
 import { probeMp3, type Mp3Probe } from '../prober/mp3';
 import { deriveSeries } from '../lib/series';
 import { invalidateIdMap } from '../lib/ids';
+import { fetchLink } from '../storage/link-fetch';
 
 // Scanner: walk a library's folder via its storage adapter, probe each new
 // audiobook file, and upsert library_items + book_metadata + audio_files +
@@ -405,7 +406,7 @@ async function probeM4bBook(args: SingleFileArgs): Promise<'added' | 'skipped'> 
   // non-fast-start files without the cancel-retry stall loop.
   try {
     const last = probe.moovOffset + probe.moovSize - 1;
-    const moovRes = await fetch(probeUrl.url, {
+    const moovRes = await fetchLink(probeUrl.url, {
       headers: { Range: `bytes=${probe.moovOffset}-${last}` },
     });
     if (moovRes.status === 206 || moovRes.status === 200) {
@@ -649,7 +650,7 @@ export async function reprobeItem(env: Env, itemId: string, tenantId: string): P
   // file may have been re-muxed (different moov offset/size).
   try {
     const last = probe.moovOffset + probe.moovSize - 1;
-    const moovRes = await fetch(probeUrl.url, {
+    const moovRes = await fetchLink(probeUrl.url, {
       headers: { Range: `bytes=${probe.moovOffset}-${last}` },
     });
     if (moovRes.status === 206 || moovRes.status === 200) {

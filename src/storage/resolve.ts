@@ -2,6 +2,7 @@ import type { Env } from '../types';
 import { EPISODE_AUDIO_UA } from '../lib/podcast-shapes';
 import type { AudioFileRow, LibraryFolderRow } from '../db/library';
 import { getAdapter, type FolderRow } from './factory';
+import { fetchLink } from './link-fetch';
 
 // Glue for the existing routes: given the folder + audio_file rows we already
 // load, return a stream URL. Handles the legacy/no-rel_path case (filedn_url
@@ -60,7 +61,7 @@ export async function fetchWithHeaderTimeout(
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(new Error('upstream header timeout')), timeoutMs);
   try {
-    return await fetch(url, { headers, signal: ctrl.signal });
+    return await fetchLink(url, { headers, signal: ctrl.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -83,8 +84,9 @@ export async function streamAudio(
     if (range) fwd.set('Range', range);
     // One retry on hang/5xx. A pCloud TTFB hang used to propagate to the
     // client as a ~40s dead wait, which iOS turns into a fatal error 4.
-    // Retrying the SAME url is right for hangs; expired-link failures come
-    // back fast as 4xx and pass through unchanged, as before.
+    // Retrying the SAME url is right for hangs. A 410 (the link was minted
+    // from another of Cloudflare's IPs) is retried with a fresh link inside
+    // fetchLink; other 4xx come back fast and pass through unchanged.
     let upstream: Response;
     try {
       upstream = await fetchWithHeaderTimeout(stream.url, fwd);

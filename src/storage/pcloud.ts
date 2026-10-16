@@ -1,4 +1,5 @@
 import { type RemoteEntry, type ResolvedUrl, type StorageAdapter, isAudiobookFile } from './adapter';
+import { registerLinkRefresher } from './link-fetch';
 
 // pCloud OAuth adapter. Uses the user's access token to:
 //   - resolve `getfilelink` for streaming (server-mediated, short-lived URL)
@@ -55,11 +56,12 @@ type PcloudListFolder = PcloudApiResult & {
 // requests within a Worker isolate's lifetime (which is "many seconds, often
 // minutes" under steady traffic; aggressively evicted under idle).
 //
-// Why this is safe wrt pCloud's IP-binding: getfilelink URLs are bound to the
-// IP that *called* getfilelink — which is this Worker's egress IP. The cached
-// URL is fetched again by the same Worker, so the egress IP matches. Cache
-// scope is naturally per-isolate, which is per-POP, so we won't accidentally
-// reuse a URL across a different egress IP boundary.
+// pCloud's IP-binding: getfilelink URLs only work from the IP that *called*
+// getfilelink. This used to say a per-isolate cache keeps that IP, and it
+// doesn't: a Worker's subrequests can leave from different IPs, even within
+// one invocation (2026-10-17: a link minted and probed straight away got
+// 410). Every minted link therefore registers a refresher, and fetchLink
+// (link-fetch.ts) mints a fresh one when a fetch of it answers 410.
 //
 // Why we keep the access token out of the key: cache keys live in memory only
 // and are never logged, but using the first 12 chars (enough to disambiguate
@@ -146,7 +148,18 @@ export class PcloudOAuthAdapter implements StorageAdapter {
     const expiresAt = data.expires ? Date.parse(data.expires) : now + 60 * 60_000;
     const entry: CachedStreamUrl = { url, expiresAt };
     streamUrlCache.set(key, entry);
+    registerLinkRefresher(url, () => this.freshLink(key, url, relPath, providerFileId));
     return entry;
+  }
+
+  // The link to use instead of `stale`, which a fetch just answered 410:
+  // the cached one when another request already replaced it, otherwise a
+  // freshly minted one (resolveUrl, so concurrent 410s share one call).
+  private async freshLink(key: string, stale: string, relPath: string, providerFileId?: string | null): Promise<string> {
+    const cur = streamUrlCache.get(key);
+    if (cur && cur.url !== stale && cur.expiresAt > Date.now() + CACHE_SAFETY_MARGIN_MS) return cur.url;
+    if (cur?.url === stale) streamUrlCache.delete(key);
+    return (await this.resolveUrl(relPath, providerFileId)).url;
   }
 
   resolveProbeUrl(relPath: string, providerFileId?: string | null): Promise<ResolvedUrl> {
@@ -530,7 +543,10 @@ export async function pcloudFileLink(profile: PcloudProfile, absPath: string): P
   if (data.result !== 0 || !data.hosts?.length || !data.path) {
     throw new Error(`pCloud getfilelink(${absPath}) result=${data.result} ${data.error ?? ''}`);
   }
-  return `https://${data.hosts[0]}${data.path}`;
+  const link = `https://${data.hosts[0]}${data.path}`;
+  // IP-bound like the adapter's links: fetchLink mints another on a 410.
+  registerLinkRefresher(link, () => pcloudFileLink(profile, absPath));
+  return link;
 }
 
 // Non-recursive on purpose: only removes the folder if nothing is left in

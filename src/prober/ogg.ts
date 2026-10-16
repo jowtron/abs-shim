@@ -14,6 +14,8 @@
 // subtracted from the final granulepos. Vorbis granules are in the
 // stream's own sample rate.
 
+import { fetchLink } from '../storage/link-fetch';
+
 export type OggProbe = {
   codec: 'opus' | 'vorbis';
   durationSeconds: number | null;
@@ -32,7 +34,7 @@ const TAIL_BYTES = 64 * 1024;
 const OGGS = 0x5367674f; // "OggS" little-endian u32
 
 async function rangeGet(url: string, start: number, end?: number, headers?: Record<string, string>): Promise<{ bytes: Uint8Array; total: number | null; status: number }> {
-  const res = await fetch(url, { headers: { ...headers, Range: end == null ? `bytes=${start}` : `bytes=${start}-${end}` } });
+  const res = await fetchLink(url, { headers: { ...headers, Range: end == null ? `bytes=${start}` : `bytes=${start}-${end}` } });
   if (res.status !== 206 && res.status !== 200) throw new Error(`Range fetch failed: HTTP ${res.status}`);
   const cr = res.headers.get('Content-Range');
   const total = cr ? Number(/\/(\d+)$/.exec(cr)?.[1]) : Number(res.headers.get('Content-Length'));

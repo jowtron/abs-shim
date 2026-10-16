@@ -30,6 +30,8 @@
 //   MPEG2/.5 stereo: 21   MPEG2/.5 mono: 13
 // VBRI is at a fixed offset of 36 from frame start, regardless of channel mode.
 
+import { fetchLink } from '../storage/link-fetch';
+
 const PREFIX_BYTES = 256 * 1024;
 const MAX_ID3V2_BYTES = 4 * 1024 * 1024;
 
@@ -444,7 +446,7 @@ function parseVbri(bytes: Uint8Array, frameOff: number, hdr: MpegHeader): number
 async function rangeFetch(
   url: string, start: number, endInclusive: number, headers?: Record<string, string>,
 ): Promise<{ bytes: Uint8Array; totalSize: number | null }> {
-  const res = await fetch(url, { headers: { ...headers, Range: `bytes=${start}-${endInclusive}` } });
+  const res = await fetchLink(url, { headers: { ...headers, Range: `bytes=${start}-${endInclusive}` } });
   if (res.status !== 206 && res.status !== 200) {
     throw new Error(`Range fetch failed: ${res.status} ${res.statusText}`);
   }

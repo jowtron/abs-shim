@@ -24,6 +24,7 @@ import {
 } from '../storage/pcloud';
 import { readZipDirectory, zipEntryDataOffset, inflateZipEntry, type ZipEntry } from '../archive/zip';
 import { addBookByPath, runScan } from '../scanner/scan';
+import { fetchLink } from '../storage/link-fetch';
 
 export type ExtractJobStart = {
   tenantId: string;
@@ -133,7 +134,7 @@ export class ArchiveExtractDO {
   private async list(job: Job): Promise<void> {
     try {
       const link = await pcloudFileLink(job.profile, this.abs(job, job.archiveRelPath));
-      const head = await fetch(link, { method: 'HEAD' });
+      const head = await fetchLink(link, { method: 'HEAD' });
       const total = Number(head.headers.get('content-length') ?? '');
       if (!head.ok || !Number.isFinite(total) || total <= 0) {
         throw new Error(`Could not size the archive (HTTP ${head.status})`);
@@ -192,7 +193,7 @@ export class ArchiveExtractDO {
     try {
       const link = await pcloudFileLink(job.profile, this.abs(job, job.archiveRelPath));
       const dataOff = await zipEntryDataOffset((s, e) => rangeRead(link, s, e), entry.zip);
-      const res = await fetch(link, {
+      const res = await fetchLink(link, {
         headers: { Range: `bytes=${dataOff}-${dataOff + entry.zip.compressedSize - 1}` },
       });
       if (res.status !== 206 || !res.body) throw new Error(`Range read failed: HTTP ${res.status}`);
@@ -273,7 +274,7 @@ export class ArchiveExtractDO {
 }
 
 async function rangeRead(link: string, start: number, end: number): Promise<Uint8Array> {
-  const res = await fetch(link, { headers: { Range: `bytes=${start}-${end - 1}` } });
+  const res = await fetchLink(link, { headers: { Range: `bytes=${start}-${end - 1}` } });
   if (res.status !== 206) throw new Error(`Range read failed: HTTP ${res.status}`);
   const buf = new Uint8Array(await res.arrayBuffer());
   if (buf.byteLength !== end - start) throw new Error(`Range read short: got ${buf.byteLength}, wanted ${end - start}`);

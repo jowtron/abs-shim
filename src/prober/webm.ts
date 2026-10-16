@@ -26,6 +26,8 @@
 // This prober is kept and is correct — verified in production against the
 // remuxed book (24 chapters, exact duration).
 
+import { fetchLink } from '../storage/link-fetch';
+
 export type WebmProbe = {
   codec: 'opus' | 'vorbis' | 'unknown';
   durationSeconds: number | null;
@@ -76,7 +78,7 @@ async function rangeGet(
   end: number,
   headers?: Record<string, string>,
 ): Promise<{ bytes: Uint8Array; total: number | null }> {
-  const res = await fetch(url, { headers: { ...headers, Range: `bytes=${start}-${end}` } });
+  const res = await fetchLink(url, { headers: { ...headers, Range: `bytes=${start}-${end}` } });
   if (res.status !== 206 && res.status !== 200) throw new Error(`Range fetch failed: HTTP ${res.status}`);
   const cr = res.headers.get('Content-Range');
   const total = cr ? Number(/\/(\d+)$/.exec(cr)?.[1]) : Number(res.headers.get('Content-Length'));

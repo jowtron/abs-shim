@@ -2,6 +2,7 @@ import type { Env } from '../types';
 import type { AudioFileRow, LibraryFolderRow } from '../db/library';
 import { resolveProbeUrl, resolveStreamUrl, audioContentType } from './resolve';
 import { probeM4b } from '../prober/m4b';
+import { fetchLink } from './link-fetch';
 
 // Server-side cache of the m4b `moov` atom bytes in R2, keyed by audio_files.id.
 //
@@ -57,7 +58,7 @@ export async function warmMoovCache(env: Env, folder: LibraryFolderRow, audio: A
     const last = audio.moov_offset + audio.moov_size - 1;
     // Bounded: moov atoms run up to ~10 MB; a pCloud hang shouldn't pin the
     // waitUntil for minutes. Best-effort, so a mid-body abort is fine.
-    const upstream = await fetch(streamUrl.url, {
+    const upstream = await fetchLink(streamUrl.url, {
       headers: { Range: `bytes=${audio.moov_offset}-${last}` },
       signal: AbortSignal.timeout(60_000),
     });

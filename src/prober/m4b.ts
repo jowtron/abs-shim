@@ -17,6 +17,8 @@
 //   4. If `mdat` size is 0 or extends to EOF, `moov` must be before it (handled
 //      in steps 1-3) — otherwise the file is malformed and we error.
 
+import { fetchLink } from '../storage/link-fetch';
+
 const PREFIX_BYTES = 64 * 1024;          // first range request size
 const MOOV_MAX_BYTES = 16 * 1024 * 1024; // hard cap; real moov atoms are <2MB
 
@@ -64,7 +66,7 @@ function readBox(view: DataView, viewStart: number, offset: number): Box | null 
 // can read Content-Length, etc.) — important: Cloudflare's fetch from inside
 // a Worker honours `Range` and CDNs return 206 normally.
 async function rangeFetch(url: string, start: number, endInclusive: number, headers?: Record<string, string>): Promise<{ bytes: Uint8Array; totalSize: number | null }> {
-  const res = await fetch(url, { headers: { ...headers, Range: `bytes=${start}-${endInclusive}` } });
+  const res = await fetchLink(url, { headers: { ...headers, Range: `bytes=${start}-${endInclusive}` } });
   if (res.status !== 206 && res.status !== 200) {
     throw new Error(`Range fetch failed: ${res.status} ${res.statusText}`);
   }
