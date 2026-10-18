@@ -1,6 +1,7 @@
 import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
+import { redactUrlSecrets } from './lib/redact';
 import type { Env } from './types';
 import { hashPassword } from './auth/password';
 import { issueAccessToken, issueRefreshToken } from './auth/tokens';
@@ -58,7 +59,9 @@ export { ArchiveExtractDO } from './do/archive-extract';
 
 const app = new Hono<{ Bindings: Env; Variables: AuthVars }>();
 
-app.use('*', logger());
+// Every request line is logged, but never a token or signature in its query
+// (src/lib/redact.ts redactUrlSecrets).
+app.use('*', logger((msg, ...rest) => console.log(redactUrlSecrets(msg), ...rest)));
 app.use('*', cors({
   origin: (origin) => origin ?? '*',
   // No `credentials: true`: reflecting arbitrary origins WITH credentials

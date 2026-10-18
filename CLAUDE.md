@@ -230,6 +230,7 @@ Migrations in `migrations/`. Initial schema (0001) plus storage additions (0002)
 ## Conventions
 
 - Hono routes are thin; logic lives in `src/lib/`, `src/db/`, `src/storage/`, `src/scanner/`.
+- **Never log a raw request URL.** Clients put secrets in the query (`?token=` on nearly every Pholia request, `sig=` on signed file links, `code=` on the pCloud callback), and Workers Logs keeps what is logged. The request logger blanks them (`redactUrlSecrets`, `src/lib/redact.ts`, since 2026-10-19; until then every 30-day access token went into the logs whole); log a pathname, or pass a URL through that function.
 - Don't introduce new runtime dependencies casually; current dep list is just `hono`.
 - **The account is on Workers Paid ($5/month), not Free** (checked 2026-10-06 via the subscriptions API: `workers_paid`). So a request gets 30 s of CPU, not 10 ms, and far more than 50 subrequests. Older notes in this file that reason from Free-plan limits (the R2 usage walk's 20-page cap) were written under that assumption; the code still works, it is just more conservative than it needs to be.
 - Don't add `nodejs_compat` — pure-JS only on the Worker side.

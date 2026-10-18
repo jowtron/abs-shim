@@ -18,3 +18,15 @@ export function redactSecrets(config: unknown): unknown {
   }
   return out;
 }
+
+// Query parameters that carry a secret, blanked in anything logged. `token`
+// is an access token (Pholia and the bundled UI authenticate with ?token=, so
+// it is on nearly every request, 30-day JWTs included); `sig` signs a
+// /public/proxy or /public/audible-staged link, which is a pass to that file;
+// `code` is pCloud's OAuth authorisation code on the callback. Until
+// 2026-10-19 hono's logger wrote every URL whole into Workers Logs.
+const SECRET_QUERY = /([?&](?:token|sig|code)=)[^&\s]*/gi;
+
+export function redactUrlSecrets(s: string): string {
+  return s.replace(SECRET_QUERY, '$1…');
+}
