@@ -30,6 +30,7 @@ export type PodcastRow = {
   finish_remaining_seconds: number | null; // migration 0019; NULL = the library's setting
   skip_json: string | null;        // migration 0020: intro/outro skipping, see normalizeSkip
   analyse: string | null;          // migration 0025: episode analysis, NULL = auto, 'on', 'off'
+  previewed_at: number | null;     // migration 0033: stored for a look, never followed (NULL otherwise)
   feed_etag: string | null;
   feed_last_modified: string | null;
   last_episode_check: number | null;

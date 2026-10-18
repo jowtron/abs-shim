@@ -415,14 +415,16 @@ async function nextCandidate(env: Env, now: number): Promise<(Candidate & { reas
   //    are a couple of minutes away, so the rest of this listen is right.
   //    CROSS JOIN pins the loop order (SQLite never reorders one), so
   //    idx_progress_user (user_id, last_update) is used per user instead of
-  //    a scan of every progress row, every two minutes.
+  //    a scan of every progress row, every two minutes. Not a show someone
+  //    is only trying out (previewed_at, migration 0033): following it is
+  //    the sign it'll be listened to.
   const played = await env.DB.prepare(
     `SELECT e.*, p.analyse AS show_analyse
        FROM users u
        CROSS JOIN media_progress mp ON mp.user_id = u.id AND mp.last_update > ?
        JOIN podcast_episodes e ON e.id = mp.episode_id
        JOIN podcasts p ON p.library_item_id = e.library_item_id
-      WHERE mp.is_finished = 0 AND e.size_bytes > 0 AND e.chapters_checked_at IS NOT NULL
+      WHERE mp.is_finished = 0 AND e.size_bytes > 0 AND e.chapters_checked_at IS NOT NULL AND p.previewed_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM episode_analysis a WHERE a.episode_id = e.id AND a.size_bytes = e.size_bytes)
       ORDER BY mp.last_update DESC LIMIT 10`,
   ).bind(now - PLAYING_MS).all<Candidate>();

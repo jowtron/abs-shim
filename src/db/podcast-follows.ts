@@ -55,8 +55,10 @@ export async function followShow(env: Env, userId: string, itemId: string, tenan
     'INSERT OR IGNORE INTO podcast_follows (user_id, library_item_id, tenant_id, created_at) VALUES (?, ?, ?, ?)',
   ).bind(userId, itemId, tenantId, now).run();
   const added = (r.meta.changes ?? 0) > 0;
+  // A show only ever looked at (migration 0033) is an ordinary one from its
+  // first follow: listed in "On this server", never pruned.
   if (added && wasIdle) {
-    await env.DB.prepare('UPDATE podcasts SET next_check_at = ? WHERE library_item_id = ?').bind(now, itemId).run();
+    await env.DB.prepare('UPDATE podcasts SET next_check_at = ?, previewed_at = NULL WHERE library_item_id = ?').bind(now, itemId).run();
   }
   return { added };
 }

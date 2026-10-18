@@ -12,7 +12,7 @@
 // progress changes when it's archived.
 
 import type { Env } from '../types';
-import type { LibraryFolderRow } from '../db/library';
+import { itemDeleteStatements, type LibraryFolderRow } from '../db/library';
 import type { EpisodeRow, PodcastRow } from '../db/podcasts';
 import { decodeFeedBytes, episodeKey, parseFeed, type FeedEpisode, type ParsedFeed, type TranscriptLink } from './rss';
 import { cuesToServed, currentAnalysis, episodeExt, EPISODE_AUDIO_UA, hasDynamicAds } from './podcast-shapes';
@@ -277,6 +277,11 @@ export type CreateArgs = {
   // fill it, so a 60-feed import doesn't fetch 60 feeds in one request.
   deferFetch?: boolean;
   titleHint?: string;
+  // false: store the show without following it, so it can be looked at
+  // (Pholia opens a podcast-directory search result this way). It is idle
+  // like any show nobody follows, marked `previewed_at`, kept out of "On
+  // this server", and deleted after 30 days unused (prunePreviews).
+  follow?: boolean;
 };
 
 function safeName(s: string): string {
@@ -285,7 +290,7 @@ function safeName(s: string): string {
 
 // `existing`: the library already had this feed, so the caller now follows
 // that show (no fetch, no second copy); `followed`: this call added the
-// caller's follow (false when they already followed it).
+// caller's follow (false when they already followed it, or asked not to).
 export type CreateResult = { itemId: string; existing: boolean; followed: boolean };
 
 export async function createPodcast(env: Env, a: CreateArgs): Promise<CreateResult> {
@@ -311,9 +316,17 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<CreateResu
   // to add a feed follows the stored show: same episodes, same archive, same
   // analysis, no second poll.
   if (dupe) {
+    if (a.follow === false) {
+      // Looking at a show the library has: nothing to store. A show only
+      // ever looked at counts this as use, so it isn't pruned while wanted.
+      await env.DB.prepare('UPDATE podcasts SET previewed_at = ? WHERE library_item_id = ? AND previewed_at IS NOT NULL')
+        .bind(Date.now(), dupe.library_item_id).run();
+      return { itemId: dupe.library_item_id, existing: true, followed: false };
+    }
     const { added } = await followShow(env, a.userId, dupe.library_item_id, a.tenantId);
     return { itemId: dupe.library_item_id, existing: true, followed: added };
   }
+  const follow = a.follow !== false;
 
   const feed = a.deferFetch ? null : await fetchAndParse(a.feedUrl);
   const m = a.metadata ?? {};
@@ -352,8 +365,9 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<CreateResu
     env.DB.prepare(
       `INSERT INTO podcasts (library_item_id, tenant_id, feed_url, title, author, description, release_date, genres,
          image_url, cover_url, itunes_page_url, itunes_id, itunes_artist_id, explicit, language, podcast_type,
-         auto_download, max_new_episodes_to_download, archive, next_check_at, parse_version, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         auto_download, max_new_episodes_to_download, archive, next_check_at, parse_version, created_at, updated_at,
+         previewed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       itemId, a.tenantId, a.feedUrl, title,
       feed?.metadata.author || str('author') || itunes?.artistName || null,
@@ -370,25 +384,29 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<CreateResu
       feed?.metadata.type || str('type'),
       a.autoDownload === false ? 0 : 1,
       0,   // max_new_episodes_to_download: 0 = every new episode lands on the show (migration 0023)
-      a.archive ? 1 : 0,
-      a.deferFetch ? now : now + POLL_EVERY_MS,
+      a.archive && follow ? 1 : 0,
+      // A show nobody follows is parked (unfollowShow does the same);
+      // followShow makes it due the moment someone follows.
+      !follow ? null : a.deferFetch ? now : now + POLL_EVERY_MS,
       // The feed was just read by this parser, so its first poll is an
       // ordinary one. Left at 0 (as it was until 2026-10-13) that poll was a
       // full re-read, and one that counts as a reparse can't announce a new
       // episode (refreshPodcast). A deferred OPML show hasn't been read: 0.
       feed ? PARSE_VERSION : 0,
       now, now,
+      follow ? null : now,
     ),
-    // Whoever adds a show follows it, or it would be idle from birth.
-    env.DB.prepare('INSERT INTO podcast_follows (user_id, library_item_id, tenant_id, created_at) VALUES (?, ?, ?, ?)')
-      .bind(a.userId, itemId, a.tenantId, now),
+    // Whoever adds a show follows it, or it would be idle from birth;
+    // unless they only wanted to look at it.
+    ...(follow ? [env.DB.prepare('INSERT INTO podcast_follows (user_id, library_item_id, tenant_id, created_at) VALUES (?, ?, ?, ?)')
+      .bind(a.userId, itemId, a.tenantId, now)] : []),
   ]);
 
   if (feed) {
     const p = await env.DB.prepare('SELECT * FROM podcasts WHERE library_item_id = ?').bind(itemId).first<PodcastRow>();
     await storeEpisodes(env, p!, feed.episodes, { initial: true });
   }
-  return { itemId, existing: false, followed: true };
+  return { itemId, existing: false, followed: follow };
 }
 
 // ─── Episodes ────────────────────────────────────────────────────────────────
@@ -737,6 +755,37 @@ export async function runPodcastTick(env: Env): Promise<string[]> {
   } catch (e) {
     log.push(`analysis pump: ${(e as Error).message}`);
   }
+  log.push(...await prunePreviews(env));
+  return log;
+}
+
+// A show stored only so someone could look at it (createPodcast's
+// `follow: false`, migration 0033) and then left: nobody followed it, and
+// for 30 days nobody opened it from search (previewed_at) or played any of
+// it. Its rows go, as the owner's delete would take them. Kept, whatever
+// its age, while anything of it is in pCloud or on its way there (deleting
+// rows would orphan the files), or on a playlist. A few per tick; the scan
+// is of the podcasts table alone, which holds tens of rows.
+const PREVIEW_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
+
+export async function prunePreviews(env: Env): Promise<string[]> {
+  const cutoff = Date.now() - PREVIEW_KEEP_MS;
+  const stale = await env.DB.prepare(
+    `SELECT p.library_item_id, p.title FROM podcasts p
+      WHERE p.previewed_at IS NOT NULL AND p.previewed_at < ?
+        AND NOT EXISTS (SELECT 1 FROM podcast_follows f WHERE f.library_item_id = p.library_item_id)
+        AND NOT EXISTS (SELECT 1 FROM media_progress mp WHERE mp.library_item_id = p.library_item_id AND mp.last_update > ?)
+        AND NOT EXISTS (SELECT 1 FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id
+                          AND e.archive_state IN ('done', 'queued', 'fetching'))
+        AND NOT EXISTS (SELECT 1 FROM playlist_items pi WHERE pi.library_item_id = p.library_item_id)
+      LIMIT 3`,
+  ).bind(cutoff, cutoff).all<{ library_item_id: string; title: string | null }>();
+  const log: string[] = [];
+  for (const r of stale.results) {
+    await env.DB.batch(itemDeleteStatements(env, r.library_item_id));
+    try { await env.COVERS.delete(`covers/${r.library_item_id}`); } catch { /* non-fatal */ }
+    log.push(`preview pruned: ${r.title ?? r.library_item_id}`);
+  }
   return log;
 }
 
@@ -903,11 +952,16 @@ export async function ensureEpisodeChapters(env: Env, e: EpisodeRow): Promise<Ch
   }
 }
 
+// Only shows someone follows: a show stored just to be looked at (migration
+// 0033) arrives with up to 500 unchecked episodes, and probing each one's
+// audio at its publisher would be work for nobody. Playing one still looks
+// its chapters up (the play route's ensureEpisodeChapters).
 export async function chapterPump(env: Env): Promise<string[]> {
   const due = await env.DB.prepare(
     `SELECT * FROM podcast_episodes
       WHERE in_library = 1 AND (chapters_checked_at IS NULL
          OR (chapters = '[]' AND chapters_checked_at < ? AND published_at > ?))
+        AND EXISTS (SELECT 1 FROM podcast_follows f WHERE f.library_item_id = podcast_episodes.library_item_id)
       ORDER BY chapters_checked_at IS NOT NULL, published_at DESC LIMIT ?`,
   ).bind(Date.now() - CHAPTERS_RECHECK_MS, Date.now() - 30 * 86400_000, CHAPTERS_PER_TICK).all<EpisodeRow>();
   let found = 0;

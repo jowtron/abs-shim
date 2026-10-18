@@ -40,7 +40,10 @@ function fail(c: C, e: unknown) {
 // library's pCloud). A feed the library already has is followed instead
 // (createPodcast): no fetch, and the answer is that show's item, as a
 // create's would be, with the shim extra `followedExisting: true`. Any
-// member: a podcast list is personal.
+// member: a podcast list is personal. Shim extra `follow: false` (top
+// level): store the show to look at without following it (Pholia opens a
+// podcast-directory result this way; createPodcast's `follow`), or answer
+// the stored one; `followedExisting` is then false.
 podcastRoutes.post('/', async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const media = (body['media'] ?? {}) as Record<string, unknown>;
@@ -50,14 +53,16 @@ podcastRoutes.post('/', async (c) => {
   const libraryId = String(body['libraryId'] ?? '');
   if (!libraryId) return c.json({ error: 'libraryId required' }, 400);
   const tenantId = c.get('tenantId');
+  const follow = body['follow'] !== false;
   try {
     const r = await createPodcast(c.env, {
       tenantId, userId: c.get('userId'), libraryId, feedUrl, metadata,
       folderId: typeof body['folderId'] === 'string' ? body['folderId'] : null,
       autoDownload: media['autoDownloadEpisodes'] !== false,
       archive: media['archive'] === true && await canAddBooks(c),
+      follow,
     });
-    return c.json({ ...await expandedItem(c, r.itemId), followedExisting: r.existing });
+    return c.json({ ...await expandedItem(c, r.itemId), followedExisting: r.existing && follow });
   } catch (e) { return fail(c, e); }
 });
 
@@ -118,6 +123,8 @@ podcastRoutes.post('/opml/create', async (c) => {
 // podcast library, followed by the caller or not, for Pholia's "On this
 // server" list: {shows: [{id, title, author, feedUrl, numEpisodes,
 // following, followers}]}. Covers come from /api/items/:id/cover as usual.
+// Not a show someone only looked at (`previewed_at`, migration 0033): a
+// stranger's browsing isn't a recommendation.
 podcastRoutes.get('/shows', async (c) => {
   const tenantId = c.get('tenantId');
   const scope = await resolveLibraryScope(c.env, c.req.query('libraryId') ?? '', tenantId);
@@ -130,7 +137,7 @@ podcastRoutes.get('/shows', async (c) => {
             (SELECT COUNT(*) FROM podcast_follows f WHERE f.library_item_id = p.library_item_id) AS followers,
             EXISTS (SELECT 1 FROM podcast_follows f WHERE f.user_id = ? AND f.library_item_id = p.library_item_id) AS following
        FROM podcasts p JOIN library_items li ON li.id = p.library_item_id
-      WHERE li.library_id = ? AND p.tenant_id = ?${view.sql}
+      WHERE li.library_id = ? AND p.tenant_id = ? AND p.previewed_at IS NULL${view.sql}
       ORDER BY p.title COLLATE NOCASE`,
   ).bind(c.get('userId'), scope.library.id, tenantId, ...view.binds).all<{
     id: string; title: string | null; author: string | null; feed_url: string; num_episodes: number; followers: number; following: number;

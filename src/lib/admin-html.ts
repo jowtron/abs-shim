@@ -1890,9 +1890,12 @@ async function podImportOpml(libId, inp, body) {
 
 // Who follows a show (migration 0028). Nobody: the show is idle, kept but
 // not polled, archived or analysed until someone follows it again. The
-// usernames come only to the owner.
+// usernames come only to the owner. A show stored only because someone
+// opened it from Pholia's search (previewed_at, migration 0033) says so: it
+// goes by itself 30 days after it was last opened or played.
 function podFollowersLine(p) {
   const n = Number(p.followers) || 0;
+  if (!n && p.previewed_at) return '<span class="muted">only looked at, nobody follows (removed after 30 days unused)</span>';
   if (!n) return '<span class="warn">idle, nobody follows</span>';
   const names = p.follower_names && p.follower_names.length ? ': ' + p.follower_names.map(escapeHtml).join(', ') : '';
   return n + ' follower' + (n === 1 ? '' : 's') + names + (p.following ? ' (you follow it)' : '');

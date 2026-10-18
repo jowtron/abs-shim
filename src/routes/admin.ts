@@ -10,7 +10,7 @@ import {
   pcloudDeleteFile, pcloudDeleteEmptyFolder,
 } from '../storage/pcloud';
 import { runScan, addBookByPath, reprobeItem, type ScanReport } from '../scanner/scan';
-import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem, getBookMetadata } from '../db/library';
+import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem, getBookMetadata, itemDeleteStatements } from '../db/library';
 import { resolveLibraryScope, viewFilter, type LibraryViewRow } from '../db/library-views';
 import type { PodcastRow } from '../db/podcasts';
 import { refreshPodcast } from '../lib/podcasts';
@@ -245,7 +245,7 @@ adminRoutes.get('/libraries/:libId/podcasts', async (c) => {
   const tenantId = c.get('tenantId');
   const r = await c.env.DB.prepare(
     `SELECT p.library_item_id, p.title, p.author, p.feed_url, p.archive, p.auto_download, p.last_episode_check,
-            p.next_check_at, p.last_error, p.check_failures, li.rel_path,
+            p.next_check_at, p.last_error, p.check_failures, li.rel_path, p.previewed_at,
             (SELECT COUNT(*) FROM podcast_follows f WHERE f.library_item_id = p.library_item_id) AS followers,
             EXISTS (SELECT 1 FROM podcast_follows f WHERE f.user_id = ? AND f.library_item_id = p.library_item_id) AS following,
             (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.in_library = 1) AS on_show,
@@ -1423,22 +1423,7 @@ adminRoutes.delete('/items/:itemId', requireTenantOwner, async (c) => {
       }
     }
   }
-  await c.env.DB.batch([
-    c.env.DB.prepare('DELETE FROM chapters WHERE library_item_id = ?').bind(itemId),
-    c.env.DB.prepare('DELETE FROM audio_files WHERE library_item_id = ?').bind(itemId),
-    c.env.DB.prepare('DELETE FROM book_metadata WHERE library_item_id = ?').bind(itemId),
-    c.env.DB.prepare('DELETE FROM media_progress WHERE library_item_id = ?').bind(itemId),
-    c.env.DB.prepare('DELETE FROM bookmarks WHERE library_item_id = ?').bind(itemId),
-    c.env.DB.prepare('DELETE FROM listening_sessions WHERE library_item_id = ?').bind(itemId),
-    c.env.DB.prepare('DELETE FROM playlist_items WHERE library_item_id = ?').bind(itemId),
-    c.env.DB.prepare('DELETE FROM podcast_episodes WHERE library_item_id = ?').bind(itemId),
-    c.env.DB.prepare('DELETE FROM podcasts WHERE library_item_id = ?').bind(itemId),
-    // Everyone's follows and hidden episodes of a deleted show (the
-    // library_items cascade would take them too; said here like the rest).
-    c.env.DB.prepare('DELETE FROM podcast_follows WHERE library_item_id = ?').bind(itemId),
-    c.env.DB.prepare('DELETE FROM podcast_episode_hidden WHERE library_item_id = ?').bind(itemId),
-    c.env.DB.prepare('DELETE FROM library_items WHERE id = ?').bind(itemId),
-  ]);
+  await c.env.DB.batch(itemDeleteStatements(c.env, itemId));
   try { await c.env.COVERS.delete(`covers/${itemId}`); } catch { /* non-fatal */ }
   if (!deleteFiles) return c.body(null, 204);
   const out: { deleted: true; filesDeleted: number; folderDeleted: boolean; reason?: string } = { deleted: true, filesDeleted, folderDeleted };

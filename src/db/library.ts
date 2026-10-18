@@ -172,6 +172,28 @@ export async function getItem(env: Env, id: string, tenantId: string): Promise<L
   return env.DB.prepare('SELECT * FROM library_items WHERE id = ? AND tenant_id = ?').bind(id, tenantId).first<LibraryItemRow>();
 }
 
+// Every row an item owns, book or show, as one batch's statements: the
+// admin delete route and prunePreviews (src/lib/podcasts.ts) both run it.
+// Deletes nothing in storage, nor the R2 cover (covers/<id>).
+export function itemDeleteStatements(env: Env, itemId: string): D1PreparedStatement[] {
+  return [
+    env.DB.prepare('DELETE FROM chapters WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM audio_files WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM book_metadata WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM media_progress WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM bookmarks WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM listening_sessions WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM playlist_items WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM podcast_episodes WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM podcasts WHERE library_item_id = ?').bind(itemId),
+    // Everyone's follows and hidden episodes of a deleted show (the
+    // library_items cascade would take them too; said here like the rest).
+    env.DB.prepare('DELETE FROM podcast_follows WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM podcast_episode_hidden WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM library_items WHERE id = ?').bind(itemId),
+  ];
+}
+
 export async function getBookMetadata(env: Env, itemId: string, tenantId: string): Promise<BookMetadataRow | null> {
   return env.DB.prepare(
     'SELECT * FROM book_metadata WHERE library_item_id = ? AND tenant_id = ?',

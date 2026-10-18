@@ -126,7 +126,10 @@ const originOf = (url: string) => new URL(url).origin;
 // switch, canDelete is owner-only. canSubscribe (2026-10-14): subscribing to
 // podcasts is open to every member, since a podcast list is personal
 // (migration 0028); Pholia shows the podcast "+" on it, falling back to
-// canGrab for a shim without it.
+// canGrab for a shim without it. canPreview (2026-10-18): POST
+// /api/podcasts takes `follow: false`, so a podcast-directory result can be
+// opened as a show page without following it; Pholia then searches the
+// directory from its ordinary search and drops the "+".
 abbRoutes.get('/settings', async (c) => {
   const creds = await loadCreds(c.env, c.get('tenantId'));
   const isOwner = c.get('tenantRole') === 'owner';
@@ -139,6 +142,7 @@ abbRoutes.get('/settings', async (c) => {
     canGrab: isOwner || membersMayAdd,
     canDelete: isOwner,
     canSubscribe: true,
+    canPreview: true,
     membersCanAdd: membersMayAdd,
     encryptionConfigured: secretsConfigured(c.env),
   });
