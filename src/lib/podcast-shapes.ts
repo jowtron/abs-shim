@@ -519,5 +519,10 @@ export async function buildPodcastOld(item: LibraryItemRow, p: PodcastRow) {
     tags: JSON.parse(p.tags || '[]') as string[],
     episodes: [] as unknown[],
     ...settings(p),
+    // Shim extra: the show's intro/outro and ad skipping. Pholia's Latest
+    // tab builds the show its rows play from this object; without it (until
+    // 2026-10-21) an episode started from Latest skipped nothing, neither
+    // the intro chapters nor, under "all ads", anything but inserted ones.
+    skip: parseSkip(p.skip_json),
   };
 }
