@@ -80,6 +80,8 @@ function shimFields(p: PodcastRow, folder?: LibraryFolderRow) {
     skip: parseSkip(p.skip_json),
     // Episode analysis on wharf (migration 0025): null = auto, 'on', 'off'.
     analyse: p.analyse ?? null,
+    // Listed only to its followers (migration 0035, PUT /api/podcasts/:id/private).
+    private: p.private === 1,
     // Whether archiving can work at all: only a pCloud library can take
     // copies (src/lib/podcasts.ts). Known only where the folder is loaded.
     ...(folder ? { canArchive: folder.provider === 'pcloud_oauth' } : {}),

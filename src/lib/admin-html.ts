@@ -1933,6 +1933,12 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
       + (p.analysis_last_error ? '<br><span class="warn">' + escapeHtml(p.analysis_last_error) + '</span>' : '') + '</span></div>';
     h += '<button class="secondary" data-pod-follow="' + id + '" data-pod-following="' + (p.following ? '1' : '') + '" data-pod-title="' + escapeHtml(p.title || '') + '">'
       + (p.following ? 'Unfollow' : 'Follow') + '</button>';
+    // Private (migration 0035): listed only to its followers. The server lets
+    // the owner and anyone who follows the show change it, and a member never
+    // sees a private show they don't follow.
+    if (owner || p.following) {
+      h += '<label class="muted" style="font-size:0.85rem" title="Only people who follow this show see it in their lists, not other members of the library"><input type="checkbox" data-pod-private="' + id + '"' + (p.private ? ' checked' : '') + '> Private</label>';
+    }
     if (canAdd) {
       h += '<select data-pod-analyse="' + id + '" title="Transcribe new episodes on the Mac: align chapters and transcripts, find inserted ads">'
         + [['', 'Analysis: auto'], ['on', 'Analysis: on'], ['off', 'Analysis: off']]
@@ -1962,6 +1968,16 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
     } catch (e) {
       b.disabled = false;
       showError((following ? 'Unfollow' : 'Follow') + ' failed: ' + e.message);
+    }
+  }));
+  panel.querySelectorAll('[data-pod-private]').forEach((box) => box.addEventListener('change', async () => {
+    try {
+      await api('/api/podcasts/' + box.dataset.podPrivate + '/private', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ private: box.checked }),
+      });
+    } catch (e) {
+      box.checked = !box.checked;
+      showError('Change failed: ' + e.message);
     }
   }));
   panel.querySelectorAll('[data-pod-check]').forEach((b) => b.addEventListener('click', async () => {

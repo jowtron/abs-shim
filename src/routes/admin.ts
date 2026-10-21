@@ -240,12 +240,13 @@ adminRoutes.post('/libraries', requireTenantOwner, async (c) => {
 // episode analysis setting with its counts and latest problem, and who
 // follows it (migration 0028): the count and whether the caller does for
 // everyone, the usernames for the owner. Every show, followed or not: this
-// is where the owner sees the whole library, idle shows included.
+// is where the owner sees the whole library, idle shows included. A member
+// doesn't see a private show they don't follow (migration 0035).
 adminRoutes.get('/libraries/:libId/podcasts', async (c) => {
   const tenantId = c.get('tenantId');
   const r = await c.env.DB.prepare(
     `SELECT p.library_item_id, p.title, p.author, p.feed_url, p.archive, p.auto_download, p.last_episode_check,
-            p.next_check_at, p.last_error, p.check_failures, li.rel_path, p.previewed_at,
+            p.next_check_at, p.last_error, p.check_failures, li.rel_path, p.previewed_at, p.private,
             (SELECT COUNT(*) FROM podcast_follows f WHERE f.library_item_id = p.library_item_id) AS followers,
             EXISTS (SELECT 1 FROM podcast_follows f WHERE f.user_id = ? AND f.library_item_id = p.library_item_id) AS following,
             (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.in_library = 1) AS on_show,
@@ -278,11 +279,13 @@ adminRoutes.get('/libraries/:libId/podcasts', async (c) => {
     ).bind(c.req.param('libId'), tenantId).all<{ library_item_id: string; username: string }>();
     for (const row of f.results) names.set(row.library_item_id, [...(names.get(row.library_item_id) ?? []), row.username]);
   }
+  const owner = c.get('tenantRole') === 'owner';
   return c.json({
-    podcasts: r.results.map((p) => ({
+    podcasts: r.results.filter((p) => owner || p['private'] !== 1 || p['following'] === 1).map((p) => ({
       ...p,
+      private: p['private'] === 1,
       following: p['following'] === 1,
-      ...(c.get('tenantRole') === 'owner' ? { follower_names: names.get(p['library_item_id'] as string) ?? [] } : {}),
+      ...(owner ? { follower_names: names.get(p['library_item_id'] as string) ?? [] } : {}),
       analysis_island: jobIsland(p['analysis_job'] as string | null),
     })),
   });

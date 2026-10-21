@@ -125,7 +125,8 @@ podcastRoutes.post('/opml/create', async (c) => {
 // server" list: {shows: [{id, title, author, feedUrl, numEpisodes,
 // following, followers}]}. Covers come from /api/items/:id/cover as usual.
 // Not a show someone only looked at (`previewed_at`, migration 0033): a
-// stranger's browsing isn't a recommendation.
+// stranger's browsing isn't a recommendation. Not a private show the caller
+// doesn't follow (migration 0035): its feed URL is often the subscriber's key.
 podcastRoutes.get('/shows', async (c) => {
   const tenantId = c.get('tenantId');
   const scope = await resolveLibraryScope(c.env, c.req.query('libraryId') ?? '', tenantId);
@@ -133,7 +134,7 @@ podcastRoutes.get('/shows', async (c) => {
   if (scope.library.media_type !== 'podcast') return c.json({ error: 'Not a podcast library' }, 400);
   const view = scope.filter('li.');
   const r = await c.env.DB.prepare(
-    `SELECT p.library_item_id AS id, p.title, p.author, p.feed_url,
+    `SELECT p.library_item_id AS id, p.title, p.author, p.feed_url, p.private,
             (SELECT COUNT(*) FROM podcast_episodes e WHERE e.library_item_id = p.library_item_id AND e.in_library = 1) AS num_episodes,
             (SELECT COUNT(*) FROM podcast_follows f WHERE f.library_item_id = p.library_item_id) AS followers,
             EXISTS (SELECT 1 FROM podcast_follows f WHERE f.user_id = ? AND f.library_item_id = p.library_item_id) AS following
@@ -141,11 +142,11 @@ podcastRoutes.get('/shows', async (c) => {
       WHERE li.library_id = ? AND p.tenant_id = ? AND p.previewed_at IS NULL${view.sql}
       ORDER BY p.title COLLATE NOCASE`,
   ).bind(c.get('userId'), scope.library.id, tenantId, ...view.binds).all<{
-    id: string; title: string | null; author: string | null; feed_url: string; num_episodes: number; followers: number; following: number;
+    id: string; title: string | null; author: string | null; feed_url: string; private: number; num_episodes: number; followers: number; following: number;
   }>();
   return c.json({
-    shows: r.results.map((p) => ({
-      id: p.id, title: p.title, author: p.author, feedUrl: p.feed_url,
+    shows: r.results.filter((p) => p.private !== 1 || p.following === 1).map((p) => ({
+      id: p.id, title: p.title, author: p.author, feedUrl: p.feed_url, private: p.private === 1,
       numEpisodes: p.num_episodes, following: p.following === 1, followers: p.followers,
     })),
   });
@@ -189,6 +190,27 @@ podcastRoutes.put('/:id/follow', async (c) => {
   if (body['follow']) await followShow(c.env, userId, show.item.id, show.item.tenant_id);
   else await unfollowShow(c.env, userId, show.item.id);
   return c.json((await followInfo(c.env, userId, [show.item.id])).get(show.item.id)!);
+});
+
+// PUT /api/podcasts/:id/private {private} → {private} — shim-only
+// (migration 0035). A private show is listed ("On this server", /admin's
+// Shows panel) only to the people who follow it; the owner still sees it in
+// /admin. Anyone who follows the show may set it, since it protects whoever's
+// subscription the feed address is, and so may the tenant owner. It hides the
+// show from lists only: someone with the feed address can still subscribe,
+// and a show's id still opens it.
+podcastRoutes.put('/:id/private', async (c) => {
+  const show = await loadShow(c);
+  if (!show) return c.json({ error: 'Podcast not found' }, 404);
+  const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+  if (typeof body['private'] !== 'boolean') return c.json({ error: 'private must be true or false' }, 400);
+  const userId = c.get('userId');
+  if (c.get('tenantRole') !== 'owner' && !(await followInfo(c.env, userId, [show.item.id])).get(show.item.id)!.following) {
+    return c.json({ error: 'Only someone who follows this show can change that' }, 403);
+  }
+  await c.env.DB.prepare('UPDATE podcasts SET private = ?, updated_at = ? WHERE library_item_id = ?')
+    .bind(body['private'] ? 1 : 0, Date.now(), show.item.id).run();
+  return c.json({ private: body['private'] });
 });
 
 // GET /api/podcasts/:id/checknew?limit=3 — poll the feed now. Returns the
