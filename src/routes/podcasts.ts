@@ -251,11 +251,13 @@ podcastRoutes.get('/:id/search-episode', async (c) => {
   if (!show) return c.json({ error: 'Podcast not found' }, 404);
   const title = (c.req.query('title') ?? '').trim();
   if (!title) return c.json({ episodes: [] });
-  const pattern = '%' + title.replace(/[\\%_]/g, (ch) => '\\' + ch).toLowerCase() + '%';
+  // instr(), not LIKE: D1 refuses a LIKE pattern over 50 bytes, and an
+  // episode title is often longer.
+  const needle = title.toLowerCase();
   const rows = await c.env.DB.prepare(
-    `SELECT * FROM podcast_episodes WHERE library_item_id = ? AND (lower(COALESCE(title, '')) LIKE ? ESCAPE '\\' OR lower(COALESCE(subtitle, '')) LIKE ? ESCAPE '\\')
+    `SELECT * FROM podcast_episodes WHERE library_item_id = ? AND (instr(lower(COALESCE(title, '')), ?) > 0 OR instr(lower(COALESCE(subtitle, '')), ?) > 0)
       ORDER BY published_at DESC LIMIT 25`,
-  ).bind(show.item.id, pattern, pattern).all<EpisodeRow>();
+  ).bind(show.item.id, needle, needle).all<EpisodeRow>();
   return c.json({ episodes: rows.results.map((e) => ({ episode: feedEpisodeJson(e) })) });
 });
 
@@ -493,9 +495,10 @@ podcastRoutes.get('/:id/all-episodes', async (c) => {
   const limit = Math.min(Math.max(Number(c.req.query('limit') ?? '50') || 50, 1), 200);
   const offset = Math.max(Number(c.req.query('offset') ?? '0') || 0, 0);
   const q = (c.req.query('q') ?? '').trim();
-  const pattern = q ? '%' + q.replace(/[\\%_]/g, (ch) => '\\' + ch).toLowerCase() + '%' : null;
-  const where = `library_item_id = ?${pattern ? " AND lower(COALESCE(title, '')) LIKE ? ESCAPE '\\'" : ''}`;
-  const binds = pattern ? [show.item.id, pattern] : [show.item.id];
+  // instr(), not LIKE: D1 refuses a LIKE pattern over 50 bytes.
+  const needle = q ? q.toLowerCase() : null;
+  const where = `library_item_id = ?${needle ? " AND instr(lower(COALESCE(title, '')), ?) > 0" : ''}`;
+  const binds = needle ? [show.item.id, needle] : [show.item.id];
   const sort = c.req.query('sort') === 'oldest' ? 'ASC' : 'DESC';
   const [rows, total] = await Promise.all([
     c.env.DB.prepare(`SELECT * FROM podcast_episodes WHERE ${where} ORDER BY published_at ${sort}, idx ${sort} LIMIT ? OFFSET ?`)

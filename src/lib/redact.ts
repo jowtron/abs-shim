@@ -26,7 +26,12 @@ export function redactSecrets(config: unknown): unknown {
 // `code` is pCloud's OAuth authorisation code on the callback. Until
 // 2026-10-19 hono's logger wrote every URL whole into Workers Logs.
 const SECRET_QUERY = /([?&](?:token|sig|code)=)[^&\s]*/gi;
+// A query value that is itself a URL keeps only its scheme and host: a
+// private podcast feed is pasted into search as `?q=` (the library search)
+// and `?term=` (/api/search/podcast), and its path IS the subscriber's key
+// (Supercast, 2026-10-21). Matches the URL encoded or not.
+const URL_VALUE = /([?&][^=&\s]+=)(https?(?:%3A|:)(?:%2F|\/){2}[^%/&\s]*)[^&\s]*/gi;
 
 export function redactUrlSecrets(s: string): string {
-  return s.replace(SECRET_QUERY, '$1…');
+  return s.replace(SECRET_QUERY, '$1…').replace(URL_VALUE, '$1$2…');
 }

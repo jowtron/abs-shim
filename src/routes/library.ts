@@ -192,28 +192,28 @@ libraryRoutes.get('/:id/search', async (c) => {
   if (!q) return c.json(empty);
   if (scope.library.media_type === 'podcast') return podcastSearch(c, scope, q, limit);
 
-  // LIKE with an escaped pattern: a title containing % or _ would otherwise
-  // turn into a wildcard.
-  // LIKE with an escaped pattern: a title containing % or _ would otherwise
-  // turn into a wildcard. D1's bind() is positional only — numbered ?1
-  // placeholders are rejected with "Wrong number of parameter bindings", so
-  // the pattern is simply bound once per placeholder.
-  const pattern = '%' + q.replace(/[\\%_]/g, (ch) => '\\' + ch).toLowerCase() + '%';
+  // A substring match with instr(), never LIKE: D1 refuses a LIKE pattern
+  // over 50 bytes ("LIKE or GLOB pattern too complex", a 500), so a long
+  // query, or a feed URL pasted into search (2026-10-21), failed outright.
+  // instr() has no such limit and no wildcards to escape. D1's bind() is
+  // positional only — numbered ?1 placeholders are rejected with "Wrong
+  // number of parameter bindings", so the needle is bound once per use.
+  const needle = q.toLowerCase();
   const rows = await c.env.DB.prepare(
     `SELECT li.id AS item_id, bm.title, bm.subtitle, bm.author_name, bm.narrator_name, bm.series_name
        FROM library_items li
        JOIN book_metadata bm ON bm.library_item_id = li.id
       WHERE li.library_id = ? AND li.tenant_id = ? AND li.is_missing = 0${view.sql}
-        AND (lower(COALESCE(bm.title, '')) LIKE ? ESCAPE '\\'
-          OR lower(COALESCE(bm.subtitle, '')) LIKE ? ESCAPE '\\'
-          OR lower(COALESCE(bm.author_name, '')) LIKE ? ESCAPE '\\'
-          OR lower(COALESCE(bm.narrator_name, '')) LIKE ? ESCAPE '\\'
-          OR lower(COALESCE(bm.series_name, '')) LIKE ? ESCAPE '\\')
+        AND (instr(lower(COALESCE(bm.title, '')), ?) > 0
+          OR instr(lower(COALESCE(bm.subtitle, '')), ?) > 0
+          OR instr(lower(COALESCE(bm.author_name, '')), ?) > 0
+          OR instr(lower(COALESCE(bm.narrator_name, '')), ?) > 0
+          OR instr(lower(COALESCE(bm.series_name, '')), ?) > 0)
       ORDER BY
-        CASE WHEN lower(COALESCE(bm.title, '')) LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END,
+        CASE WHEN instr(lower(COALESCE(bm.title, '')), ?) > 0 THEN 0 ELSE 1 END,
         bm.title COLLATE NOCASE
       LIMIT ?`,
-  ).bind(id, tenantId, ...view.binds, pattern, pattern, pattern, pattern, pattern, pattern, limit).all<{
+  ).bind(id, tenantId, ...view.binds, needle, needle, needle, needle, needle, needle, limit).all<{
     item_id: string; title: string | null; subtitle: string | null;
     author_name: string | null; narrator_name: string | null; series_name: string | null;
   }>();
@@ -753,23 +753,24 @@ async function podcastSearch(c: Context<{ Bindings: Env; Variables: AuthVars }>,
   const tenantId = c.get('tenantId');
   const userId = c.get('userId');
   const view = scope.filter('li.');
-  const pattern = '%' + q.replace(/[\\%_]/g, (ch) => '\\' + ch).toLowerCase() + '%';
+  // instr(), not LIKE: see the book search above (D1's 50-byte pattern cap).
+  const needle = q.toLowerCase();
   // The caller's shows and their visible episodes, like every list here.
   const shows = await c.env.DB.prepare(
     `SELECT li.* FROM podcast_follows f
        JOIN library_items li ON li.id = f.library_item_id
        JOIN podcasts p ON p.library_item_id = li.id
       WHERE f.user_id = ? AND li.library_id = ? AND li.tenant_id = ?${view.sql}
-        AND (lower(COALESCE(p.title, '')) LIKE ? ESCAPE '\\' OR lower(COALESCE(p.author, '')) LIKE ? ESCAPE '\\')
+        AND (instr(lower(COALESCE(p.title, '')), ?) > 0 OR instr(lower(COALESCE(p.author, '')), ?) > 0)
       LIMIT ?`,
-  ).bind(userId, scope.library.id, tenantId, ...view.binds, pattern, pattern, limit).all<LibraryItemRow>();
+  ).bind(userId, scope.library.id, tenantId, ...view.binds, needle, needle, limit).all<LibraryItemRow>();
   const showJson = await podcastItemsMinified(c.env, shows.results, tenantId, userId);
   const epRows = await c.env.DB.prepare(
     `SELECT e.*, li.library_id AS li_library_id FROM podcast_episodes e JOIN library_items li ON li.id = e.library_item_id
       WHERE li.library_id = ? AND e.tenant_id = ? AND e.in_library = 1${view.sql}${FOLLOWED_AND_VISIBLE}
-        AND lower(COALESCE(e.title, '')) LIKE ? ESCAPE '\\'
+        AND instr(lower(COALESCE(e.title, '')), ?) > 0
       ORDER BY e.published_at DESC LIMIT ?`,
-  ).bind(scope.library.id, tenantId, ...view.binds, userId, userId, pattern, limit).all<EpisodeWithShow>();
+  ).bind(scope.library.id, tenantId, ...view.binds, userId, userId, needle, limit).all<EpisodeWithShow>();
   const progress = await episodeProgress(c.env, userId);
   const episodeEntities = await episodeShelfEntities(c.env, epRows.results, tenantId, userId, progress);
   return c.json({

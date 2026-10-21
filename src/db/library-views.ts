@@ -28,15 +28,17 @@ export type LibraryScope = {
   filter(col: string): { sql: string; binds: string[] };
 };
 
-const likePrefix = (p: string) => p.replace(/[\\%_]/g, (ch) => '\\' + ch) + '%';
-
 export function viewFilter(view: LibraryViewRow | null, col: string): { sql: string; binds: string[] } {
   if (!view) return { sql: '', binds: [] };
   let sql = '';
   const binds: string[] = [];
   if (view.folder_id) { sql += ` AND ${col}folder_id = ?`; binds.push(view.folder_id); }
-  if (view.include_prefix) { sql += ` AND ${col}rel_path LIKE ? ESCAPE '\\'`; binds.push(likePrefix(view.include_prefix)); }
-  if (view.exclude_prefix) { sql += ` AND ${col}rel_path NOT LIKE ? ESCAPE '\\'`; binds.push(likePrefix(view.exclude_prefix)); }
+  // A prefix compare, not LIKE: D1 refuses a LIKE pattern over 50 bytes, and
+  // that would fail every list of a view with a long prefix. lower() on both
+  // sides keeps LIKE's (ASCII) case-insensitivity, which views were made with.
+  const starts = (not: string) => ` AND ${not}lower(substr(${col}rel_path, 1, length(?))) = lower(?)`;
+  if (view.include_prefix) { sql += starts(''); binds.push(view.include_prefix, view.include_prefix); }
+  if (view.exclude_prefix) { sql += starts('NOT '); binds.push(view.exclude_prefix, view.exclude_prefix); }
   return { sql, binds };
 }
 

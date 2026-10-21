@@ -339,8 +339,13 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<CreateResu
   const itemId = 'li_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
   // One folder per show, named after it, like ABS. Archived episodes go in it.
   let relPath = safeName(title);
-  const taken = await env.DB.prepare('SELECT rel_path FROM library_items WHERE folder_id = ? AND (rel_path = ? OR rel_path LIKE ?)')
-    .bind(folder.id, relPath, relPath + ' (%').all<{ rel_path: string }>();
+  // A prefix compare, not `LIKE '<name> (%'`: D1 refuses a LIKE pattern over
+  // 50 bytes, so every show with a title longer than ~47 bytes failed to add
+  // with a 500 (found 2026-10-21), and a % or _ in a title was a wildcard.
+  // length() in SQL, because SQLite counts characters where JS counts UTF-16.
+  const taken = await env.DB.prepare(
+    'SELECT rel_path FROM library_items WHERE folder_id = ? AND (rel_path = ? OR substr(rel_path, 1, length(?)) = ?)',
+  ).bind(folder.id, relPath, relPath + ' (', relPath + ' (').all<{ rel_path: string }>();
   if (taken.results.length) {
     const names = new Set(taken.results.map((r) => r.rel_path));
     let n = 2;
