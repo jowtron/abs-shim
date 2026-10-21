@@ -19,7 +19,9 @@ export type PushPayload = {
   tag?: string;
   libraryItemId?: string;
   episodeId?: string;
-  kind: 'episode' | 'test';
+  // 'archive': a show's "Archive all" is over (no episodeId; Pholia opens
+  // the show).
+  kind: 'episode' | 'test' | 'archive';
 };
 
 // ============================================================
@@ -572,4 +574,62 @@ export async function announceNewEpisodes(
     status: summarise(deliveries.filter((d) => d.userId === u)),
   })));
   return `${show.title ?? show.library_item_id}: ${eps.length} new to ${users.length} user(s), ${summarise(deliveries)}`;
+}
+
+// ── "Archive all" is over (2026-10-21) ──────────────────────────────────
+//
+// archive_requests (migration 0034) has a row per show and person who
+// pressed "Archive all" while it runs. Run at the end of every archivePump:
+// a request whose show has nothing queued or fetching any more is over. The
+// row is claimed by deleting it (matching `queued`, so a second press that
+// added to it in between makes this delete miss, and the next pump reports
+// the lot), then the person's devices get one push: how many were copied,
+// how many failed. Sent whatever their per-show bell says (they asked for
+// this copy), to an active member of the show's tenant only.
+export async function announceArchiveDone(env: Env): Promise<string[]> {
+  const done = (await env.DB.prepare(
+    `SELECT r.library_item_id, r.user_id, r.requested_at, r.queued, p.title, p.tenant_id
+       FROM archive_requests r JOIN podcasts p ON p.library_item_id = r.library_item_id
+      WHERE NOT EXISTS (SELECT 1 FROM podcast_episodes e
+                         WHERE e.library_item_id = r.library_item_id AND e.archive_state IN ('queued', 'fetching'))
+      LIMIT 10`,
+  ).all<{ library_item_id: string; user_id: string; requested_at: number; queued: number; title: string | null; tenant_id: string }>()).results;
+  const log: string[] = [];
+  const cfg = pushConfig(env);
+  for (const r of done) {
+    const claim = await env.DB.prepare(
+      'DELETE FROM archive_requests WHERE library_item_id = ? AND user_id = ? AND queued = ?',
+    ).bind(r.library_item_id, r.user_id, r.queued).run();
+    if (!claim.meta.changes) continue;
+    const c = await env.DB.prepare(
+      `SELECT COUNT(*) AS total, SUM(archive_state = 'done') AS done, SUM(archive_state = 'error') AS failed
+         FROM podcast_episodes WHERE library_item_id = ? AND removed = 0`,
+    ).bind(r.library_item_id).first<{ total: number; done: number | null; failed: number | null }>();
+    // Failures still standing are this request's (it requeued every earlier
+    // one) or a later single episode's; never more than it queued.
+    const failed = Math.min(c?.failed ?? 0, r.queued);
+    const copied = r.queued - failed;
+    const eps = (n: number) => `${n} episode${n === 1 ? '' : 's'}`;
+    const body = failed
+      ? `${eps(copied)} copied to pCloud, ${failed} couldn't be. Open the show to try those again.`
+      : `${eps(copied)} copied to pCloud.${c && c.total > 0 && (c.done ?? 0) === c.total ? ' The whole feed is archived.' : ''}`;
+    const title = clip(r.title?.trim() || 'Podcast');
+    if (!cfg) { log.push(`[archive] ${title}: done (${body}); push not configured`); continue; }
+    const subs = (await env.DB.prepare(
+      `SELECT s.id, s.user_id, s.endpoint, s.p256dh, s.auth FROM push_subscriptions s
+         JOIN tenant_members tm ON tm.user_id = s.user_id AND tm.tenant_id = ?
+         JOIN users u ON u.id = s.user_id AND u.is_active = 1 AND u.is_locked = 0
+        WHERE s.user_id = ?`,
+    ).bind(r.tenant_id, r.user_id).all<SubRow>()).results;
+    const payload: PushPayload = {
+      title, body: clip(body),
+      tag: `archive-${r.library_item_id}`,
+      libraryItemId: r.library_item_id,
+      kind: 'archive',
+    };
+    const deliveries = subs.length ? await deliver(env, cfg, subs, payload) : [];
+    await logPush(env, [{ userId: r.user_id, kind: 'archive', title: `${title}: ${payload.body}`, status: summarise(deliveries) }]);
+    log.push(`[archive] ${title}: done, ${summarise(deliveries)}`);
+  }
+  return log;
 }

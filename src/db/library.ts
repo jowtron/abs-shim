@@ -190,6 +190,7 @@ export function itemDeleteStatements(env: Env, itemId: string): D1PreparedStatem
     // library_items cascade would take them too; said here like the rest).
     env.DB.prepare('DELETE FROM podcast_follows WHERE library_item_id = ?').bind(itemId),
     env.DB.prepare('DELETE FROM podcast_episode_hidden WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM archive_requests WHERE library_item_id = ?').bind(itemId),
     env.DB.prepare('DELETE FROM library_items WHERE id = ?').bind(itemId),
   ];
 }

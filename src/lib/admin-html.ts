@@ -2000,6 +2000,13 @@ async function podLoadShows(libId, panel, status, hasPcloud) {
   panel.querySelectorAll('[data-pod-archall]').forEach((b) => b.addEventListener('click', async () => {
     b.disabled = true;
     try {
+      // Every episode in the feed since 2026-10-21, not just the show's:
+      // say how many before starting (Late Night Linux Family is 1,044).
+      const st = await api('/api/podcasts/' + b.dataset.podArchall + '/archive');
+      if (!st.toCopy) { b.textContent = 'Nothing left to copy'; return; }
+      const mins = Math.ceil((st.queueAhead + st.toCopy) / 3) * 2 + 4;
+      const when = mins < 60 ? mins + ' min' : (Math.round(mins / 6) / 10) + ' h';
+      if (!confirm('Copy ' + st.toCopy + ' episode' + (st.toCopy === 1 ? '' : 's') + ' into pCloud? That is every episode in the feed not there yet: about ' + when + ', 3 every 2 minutes.')) { b.disabled = false; return; }
       const r = await api('/api/podcasts/' + b.dataset.podArchall + '/archive', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
       });

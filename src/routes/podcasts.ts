@@ -8,7 +8,8 @@ import { followInfo, followShow, hideEpisode, hiddenAmong, unfollowShow, unhideE
 import { resolveLibraryScope } from '../db/library-views';
 import { buildEpisode, buildEpisodeExpanded, buildPodcastItemExpanded, hasDynamicAds } from '../lib/podcast-shapes';
 import {
-  archivePump, canArchive, createPodcast, ensureEpisodeChapters, episodeTranscript, fetchAndParse, PodcastError, refreshPodcast, searchPodcasts, validFeedUrl,
+  archivePump, archiveStatus, canArchive, createPodcast, ensureEpisodeChapters, episodeTranscript, fetchAndParse, PodcastError, queueArchiveAll, refreshPodcast,
+  searchPodcasts, validFeedUrl,
 } from '../lib/podcasts';
 import { AnalysisInputError, analysisOrigin, analysisPump, analysisStatus, queueAnalysis, storeResult, waitsForArchive } from '../lib/episode-analysis';
 import { wharfConfigured } from '../lib/wharf';
@@ -545,9 +546,12 @@ podcastRoutes.post('/:id/episodes/add', async (c) => {
   return c.json(await expandedItem(c, show.item.id));
 });
 
-// POST /api/podcasts/:id/archive {episodeIds?} — queue episodes for copying
-// into the library's storage: the given ones, or every episode on the show
-// that isn't archived yet.
+// POST /api/podcasts/:id/archive {episodeIds?, retryFailed?} — queue
+// episodes for copying into the library's storage: the given ones, or
+// ("Archive all") every episode in the feed that isn't archived yet, on the
+// show or not (the show's own only until 2026-10-21), or with `retryFailed`
+// only the ones that failed. The last two record the caller's request, so a
+// push tells them when it's over (queueArchiveAll). `queued` says how many.
 podcastRoutes.post('/:id/archive', requireCanAdd, async (c) => {
   const show = await loadShow(c);
   if (!show) return c.json({ error: 'Podcast not found' }, 404);
@@ -558,16 +562,25 @@ podcastRoutes.post('/:id/archive', requireCanAdd, async (c) => {
   if (ids?.length) {
     n = await queueArchive(c.env, show.item.id, ids);
   } else {
-    const r = await c.env.DB.prepare(
-      `UPDATE podcast_episodes SET archive_state = 'queued', archive_error = NULL, updated_at = ?
-        WHERE library_item_id = ? AND in_library = 1 AND (archive_state IS NULL OR archive_state = 'error')`,
-    ).bind(Date.now(), show.item.id).run();
-    n = r.meta.changes ?? 0;
+    n = await queueArchiveAll(c.env, show.item.id, c.get('userId'), { retryFailed: body['retryFailed'] === true });
   }
   // Start the copies now rather than at the next cron tick (up to 2 min);
   // the cron still notices when pCloud has finished.
   if (n) c.executionCtx.waitUntil(archivePump(c.env).then(() => undefined, () => undefined));
   return c.json({ queued: n });
+});
+
+// GET /api/podcasts/:id/archive[?since=<ms>] — where the show's copying to
+// pCloud stands (archiveStatus): counts over every episode in the feed, the
+// failures, an estimate of the time left, whether the caller will be told
+// when it's done, and with `since` the episodes whose state moved since.
+// Pholia's show page polls it while copying is under way.
+podcastRoutes.get('/:id/archive', async (c) => {
+  const show = await loadShow(c);
+  if (!show) return c.json({ error: 'Podcast not found' }, 404);
+  const since = c.req.query('since');
+  const st = await archiveStatus(c.env, show.item.id, c.get('userId'), since ? Number(since) : null);
+  return c.json({ ...st, canArchive: await canArchive(c.env, show.folder) });
 });
 
 // Queue these episodes for archiving, putting them on the show; one already

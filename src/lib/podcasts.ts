@@ -18,7 +18,7 @@ import { decodeFeedBytes, episodeKey, parseFeed, type FeedEpisode, type ParsedFe
 import { cuesToServed, currentAnalysis, episodeExt, EPISODE_AUDIO_UA, hasDynamicAds } from './podcast-shapes';
 import { parseTranscript, rankTranscripts, type Transcript, type TranscriptCue } from './transcript';
 import { adoptAnalysisForSize, analysisPump, whisperTranscriptFor } from './episode-analysis';
-import { announceNewEpisodes } from './push';
+import { announceArchiveDone, announceNewEpisodes } from './push';
 import { followShow, isIdle } from '../db/podcast-follows';
 import {
   pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudStat, type PcloudProfile,
@@ -35,13 +35,15 @@ const FEED_UA = 'audiobookshelf (+https://audiobookshelf.org; like iTMS)';
 const FEED_MAX_BYTES = 32 * 1024 * 1024;
 const POLL_EVERY_MS = 60 * 60 * 1000;
 const MAX_BACKOFF_MS = 24 * 60 * 60 * 1000;
-// What lands on a new show: an episodic feed's newest 100, a serial feed's
-// whole run (serial shows are listened to from episode 1). The rest stay
-// browsable and can be added.
-const INITIAL_EPISODES = 100;
+// What lands on a new show: an episodic feed's newest 500 (100 until
+// 2026-10-21; migration 0034 did the same for existing shows), a serial
+// feed's first 500 (serial shows are listened to from episode 1). The rest
+// stay browsable and can be added. Each episode adds ~4 KB to the show item,
+// so 500 is ~2 MB raw, ~250 KB gzipped; The Daily's 3,000 would be 12 MB.
+const INITIAL_EPISODES = 500;
 const SERIAL_CAP = 500;
 const TICK_FEEDS = 5;
-const ARCHIVE_STARTS_PER_TICK = 3;
+export const ARCHIVE_STARTS_PER_TICK = 3;
 const ARCHIVE_POLLS_PER_TICK = 10;
 const ARCHIVE_GIVE_UP_MS = 6 * 60 * 60 * 1000;
 // Starting a pull (probe, stat, folder, downloadfileasync) takes seconds; a
@@ -1187,5 +1189,123 @@ export async function archivePump(env: Env): Promise<string[]> {
       else log.push(`archive poll ${e.id}: ${(err as Error).message}`);
     }
   }
+  // Whoever asked for "Archive all" hears when it's over (migration 0034).
+  try { log.push(...await announceArchiveDone(env)); }
+  catch (err) { log.push(`archive done notice: ${(err as Error).message}`); }
   return log;
+}
+
+// Roughly how long until `ahead` queued copies (everything queued on the
+// instance: the pump is one FIFO for all shows) have all landed, in seconds:
+// ARCHIVE_STARTS_PER_TICK start per 2-minute tick, and the last one then
+// needs a few minutes to settle (ARCHIVE_MIN_FETCH_MS + ARCHIVE_SETTLE_MS
+// and a poll). An estimate for "about N left", not a promise.
+export function archiveEtaSeconds(ahead: number, fetching: number): number {
+  if (!ahead && !fetching) return 0;
+  return Math.ceil(ahead / ARCHIVE_STARTS_PER_TICK) * 120 + 240;
+}
+
+// "Archive all" (2026-10-21): every episode the feed has listed that isn't
+// on pCloud or on its way, on the show or not (it used to be the show's own
+// episodes only, 100 of Incognito Mode's 140), minus the owner's removed
+// ones; `retryFailed` requeues only the ones that failed. The request is
+// recorded for the caller so they get a push when the show's copying is
+// over (announceArchiveDone). Returns how many were queued.
+export async function queueArchiveAll(env: Env, itemId: string, userId: string, opts: { retryFailed?: boolean } = {}): Promise<number> {
+  const now = Date.now();
+  // A request covers what it queues plus what was already on its way for
+  // the show (a press while an earlier "Archive all" runs, as Joseph's
+  // Incognito Mode was when this shipped): the notice reports every copy
+  // that ends while it waits. A press while the caller's request is still
+  // open adds only episodes never tried: the failed ones it requeues were
+  // counted when it began, and counting them again would report "88 copied"
+  // where 85 were.
+  const before = await env.DB.prepare(
+    `SELECT SUM(archive_state IS NULL) AS fresh, SUM(archive_state IN ('queued', 'fetching')) AS inflight
+       FROM podcast_episodes WHERE library_item_id = ? AND removed = 0`,
+  ).bind(itemId).first<{ fresh: number | null; inflight: number | null }>();
+  const fresh = opts.retryFailed ? 0 : before?.fresh ?? 0;
+  const r = await env.DB.prepare(
+    `UPDATE podcast_episodes SET archive_state = 'queued', archive_error = NULL, updated_at = ?
+      WHERE library_item_id = ? AND removed = 0 AND ${opts.retryFailed ? "archive_state = 'error'" : "(archive_state IS NULL OR archive_state = 'error')"}`,
+  ).bind(now, itemId).run();
+  const n = r.meta.changes ?? 0;
+  const covers = n + (before?.inflight ?? 0);
+  if (covers) {
+    await env.DB.prepare(
+      `INSERT INTO archive_requests (library_item_id, user_id, requested_at, queued) VALUES (?, ?, ?, ?)
+       ON CONFLICT (library_item_id, user_id) DO UPDATE SET queued = queued + ?`,
+    ).bind(itemId, userId, now, covers, Math.min(fresh, n)).run();
+  }
+  return n;
+}
+
+export type ArchiveStatus = {
+  now: number;
+  total: number;
+  done: number;
+  queued: number;
+  fetching: number;
+  error: number;
+  toCopy: number;
+  toCopyNotOnShow: number;
+  queueAhead: number;
+  etaSeconds: number;
+  requested: boolean;
+  errors: Array<{ id: string; title: string | null; error: string | null }>;
+  changed?: Array<{ id: string; archiveState: string | null; archiveError: string | null }>;
+};
+
+// GET /api/podcasts/:id/archive: where a show's copying to pCloud stands,
+// over every episode in the feed (not removed). `since` (the previous
+// answer's `now`) adds the episodes whose archive state moved since, so a
+// show page redraws just those rows. Polled every 20 s while a show page
+// with copying under way is open: one grouped read of the show's rows.
+export async function archiveStatus(env: Env, itemId: string, userId: string, since: number | null): Promise<ArchiveStatus> {
+  const now = Date.now();
+  // The pump is one queue for every show, oldest updated_at first: this
+  // show is done once everything up to its own last queued row has gone, so
+  // its estimate counts only those (a show queued after it doesn't slow it).
+  // `queueAhead` (all queued) is what a new "Archive all" would wait behind.
+  const [counts, errors, ahead, mine, changed, upTo] = await Promise.all([
+    env.DB.prepare(
+      `SELECT archive_state AS s, in_library AS on_show, COUNT(*) AS n FROM podcast_episodes
+        WHERE library_item_id = ? AND removed = 0 GROUP BY archive_state, in_library`,
+    ).bind(itemId).all<{ s: string | null; on_show: number; n: number }>(),
+    env.DB.prepare(
+      `SELECT id, title, archive_error FROM podcast_episodes
+        WHERE library_item_id = ? AND removed = 0 AND archive_state = 'error' ORDER BY published_at DESC LIMIT 20`,
+    ).bind(itemId).all<{ id: string; title: string | null; archive_error: string | null }>(),
+    env.DB.prepare("SELECT COUNT(*) AS n FROM podcast_episodes WHERE archive_state = 'queued'").first<{ n: number }>(),
+    env.DB.prepare('SELECT 1 AS x FROM archive_requests WHERE library_item_id = ? AND user_id = ?').bind(itemId, userId).first<{ x: number }>(),
+    since != null && Number.isFinite(since)
+      ? env.DB.prepare(
+        `SELECT id, archive_state, archive_error FROM podcast_episodes
+          WHERE library_item_id = ? AND updated_at > ? AND archive_state IS NOT NULL LIMIT 600`,
+      // 10 s of overlap: a pump stamps updated_at with its own clock and may
+      // commit just after this read; a row sent twice is harmless (the page
+      // compares states), a row missed would stay stale until reopened.
+      ).bind(itemId, since - 10_000).all<{ id: string; archive_state: string | null; archive_error: string | null }>()
+      : Promise.resolve(null),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM podcast_episodes WHERE archive_state = 'queued'
+          AND updated_at <= (SELECT MAX(updated_at) FROM podcast_episodes WHERE library_item_id = ? AND archive_state = 'queued')`,
+    ).bind(itemId).first<{ n: number }>(),
+  ]);
+  const by = (s: string | null) => counts.results.filter((r) => r.s === s).reduce((a, r) => a + r.n, 0);
+  const total = counts.results.reduce((a, r) => a + r.n, 0);
+  const queued = by('queued');
+  const fetching = by('fetching');
+  const toCopyRows = counts.results.filter((r) => r.s === null || r.s === 'error');
+  const queueAhead = ahead?.n ?? 0;
+  return {
+    now, total, done: by('done'), queued, fetching, error: by('error'),
+    toCopy: toCopyRows.reduce((a, r) => a + r.n, 0),
+    toCopyNotOnShow: toCopyRows.filter((r) => r.on_show !== 1).reduce((a, r) => a + r.n, 0),
+    queueAhead,
+    etaSeconds: queued || fetching ? archiveEtaSeconds(queued ? upTo?.n ?? queued : 0, fetching) : 0,
+    requested: !!mine,
+    errors: errors.results.map((e) => ({ id: e.id, title: e.title, error: e.archive_error })),
+    ...(changed ? { changed: changed.results.map((e) => ({ id: e.id, archiveState: e.archive_state, archiveError: e.archive_error })) } : {}),
+  };
 }
