@@ -191,6 +191,7 @@ export function itemDeleteStatements(env: Env, itemId: string): D1PreparedStatem
     env.DB.prepare('DELETE FROM podcast_follows WHERE library_item_id = ?').bind(itemId),
     env.DB.prepare('DELETE FROM podcast_episode_hidden WHERE library_item_id = ?').bind(itemId),
     env.DB.prepare('DELETE FROM archive_requests WHERE library_item_id = ?').bind(itemId),
+    env.DB.prepare('DELETE FROM video_progress WHERE library_item_id = ?').bind(itemId),
     env.DB.prepare('DELETE FROM library_items WHERE id = ?').bind(itemId),
   ];
 }

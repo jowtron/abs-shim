@@ -7,7 +7,7 @@ import type { LibraryFolderRow, LibraryItemRow } from '../db/library';
 import type { EpisodeCounts, EpisodeRow, PodcastRow } from '../db/podcasts';
 import type { FollowInfo } from '../db/podcast-follows';
 import { derivedId } from './ids';
-import { stripAllTags } from './rss';
+import { stripAllTags, type FeedVideo } from './rss';
 import { storageLabel } from './storage-label';
 
 export function podcastMetadata(p: PodcastRow) {
@@ -92,7 +92,16 @@ function shimFields(p: PodcastRow, folder?: LibraryFolderRow) {
 
 const coverPathFor = (itemId: string) => `/metadata/items/${itemId}/cover.jpg`;
 
+// What sniffEpisodeFile found the file to be (migration 0037), as an
+// extension. It beats the URL and the feed's label: Incognito Mode labels a
+// 3.2 GB mp4 video audio/mpeg.
+const SNIFFED_EXT: Record<string, string> = {
+  'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'video/mp4': 'mp4', 'audio/ogg': 'ogg', 'audio/flac': 'flac', 'audio/wav': 'wav',
+};
+
 export function episodeExt(e: EpisodeRow): string {
+  const sniffed = e.file_type ? SNIFFED_EXT[e.file_type] : undefined;
+  if (sniffed) return sniffed;
   const fromPath = /\.([a-z0-9]{2,4})$/i.exec((e.archive_rel_path ?? e.enclosure_url.split('?')[0]) || '')?.[1]?.toLowerCase();
   if (fromPath && ['mp3', 'm4a', 'mp4', 'aac', 'ogg', 'opus', 'oga', 'wav', 'flac', 'm4b'].includes(fromPath)) return fromPath;
   const t = (e.enclosure_type ?? '').toLowerCase();
@@ -103,6 +112,10 @@ export function episodeExt(e: EpisodeRow): string {
 }
 
 export function episodeMime(e: EpisodeRow): string {
+  // An mp4, video or not, goes to LISTENERS as audio/mp4: every audio player
+  // takes one and plays its sound. The video route says video/mp4.
+  if (e.file_type === 'video/mp4' || e.file_type === 'audio/mp4') return 'audio/mp4';
+  if (e.file_type && SNIFFED_EXT[e.file_type]) return e.file_type;
   const t = (e.enclosure_type ?? '').toLowerCase();
   if (t.startsWith('audio/') && t !== 'audio/x-m4a') return t;
   const ext = episodeExt(e);
@@ -243,11 +256,44 @@ export async function buildEpisode(e: EpisodeRow, item: LibraryItemRow, opts: { 
     // so the feed's chapter and transcript times (made from the master)
     // run early by the ads played before them, differently per listener.
     dynamicAds: hasDynamicAds(e.enclosure_url),
+    // Not ABS: the episode's video versions (episodeVideos), [] for most.
+    videos: episodeVideos(e),
     // Not ABS: the analysis of the file served now (size, ad ranges, where
     // the chapters and transcript come from), or null when there's none
     // for this size (src/lib/episode-analysis.ts).
     analysis: analysisField(e, analysis, served.source),
   };
+}
+
+// The episode's video versions (migration 0037), each streamed through this
+// server at `url` (GET /api/podcasts/:id/episode/:episodeId/video/:n; a
+// client adds ?token= as for audio):
+//   * `file`: the episode's own file, when that is a video (a video feed, or
+//     a mislabelled enclosure). One timeline with the audio (`sameAsAudio`),
+//     so the listening position applies to it.
+//   * `0`…: the feed's <podcast:alternateEnclosure> videos. A separate edit
+//     (LINUX Unplugged's video runs minutes shorter or longer than its mp3,
+//     which has art19's ads stitched in), so it keeps its own position
+//     (PUT …/video-progress).
+export type EpisodeVideo = {
+  id: string; url: string; type: string; height: number | null; size: number | null; title: string | null; sameAsAudio: boolean;
+};
+
+export function episodeVideos(e: EpisodeRow): EpisodeVideo[] {
+  const base = `/api/podcasts/${e.library_item_id}/episode/${e.id}/video`;
+  const out: EpisodeVideo[] = [];
+  const own = (e.file_type || e.enclosure_type || '').toLowerCase();
+  if (own.startsWith('video/')) {
+    out.push({ id: 'file', url: `${base}/file`, type: own, height: null, size: e.size_bytes || null, title: null, sameAsAudio: true });
+  }
+  if (e.videos) {
+    try {
+      (JSON.parse(e.videos) as FeedVideo[]).forEach((v, i) => out.push({
+        id: String(i), url: `${base}/${i}`, type: v.type, height: v.height, size: v.length, title: v.title, sameAsAudio: false,
+      }));
+    } catch { /* a bad row shows no videos */ }
+  }
+  return out;
 }
 
 // Hosts that insert ads per download (verified 2026-10-12: art19 served

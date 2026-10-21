@@ -21,7 +21,7 @@ import { adoptAnalysisForSize, analysisPump, whisperTranscriptFor } from './epis
 import { announceArchiveDone, announceNewEpisodes } from './push';
 import { followShow, isIdle } from '../db/podcast-follows';
 import {
-  pcloudDeleteFile, pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudStat, type PcloudProfile,
+  pcloudDeleteFile, pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudRenameFile, pcloudStat, type PcloudProfile,
 } from '../storage/pcloud';
 
 export class PodcastError extends Error {
@@ -69,9 +69,12 @@ const ARCHIVE_NO_START_MS = 30 * 60 * 1000;
 const ARCHIVE_MAX_ATTEMPTS = 3;
 // Raise when the parser starts storing a field older rows lack: each show's
 // next poll then re-reads its whole feed once (migration 0018: chapters_url;
-// 2 = migration 0021: transcripts).
-const PARSE_VERSION = 2;
+// 2 = migration 0021: transcripts; 3 = migration 0037: video alternates).
+const PARSE_VERSION = 3;
 const CHAPTERS_PER_TICK = 15;
+// Episodes from before migration 0037 have their files looked at by the
+// chapter pump, this many a tick (one 16-byte read each), newest first.
+const SNIFFS_PER_TICK = 20;
 const CHAPTERS_RECHECK_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ─── Fetching ────────────────────────────────────────────────────────────────
@@ -429,7 +432,7 @@ export async function createPodcast(env: Env, a: CreateArgs): Promise<CreateResu
 
 const EP_COLS = `id, library_item_id, tenant_id, ino, guid, idx, season, episode, episode_type, title, subtitle,
   description, pub_date, published_at, enclosure_url, enclosure_type, enclosure_length, duration_seconds,
-  chapters, chapters_url, transcripts, in_library, removed, created_at, updated_at`;
+  chapters, chapters_url, transcripts, videos, in_library, removed, created_at, updated_at`;
 
 function lengthOf(s: string | null): number | null {
   const n = Number(s);
@@ -454,7 +457,7 @@ async function upsertEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], start
   const ordered = [...eps].sort((x, y) => (x.publishedAt ?? 0) - (y.publishedAt ?? 0));
   const stmts = ordered.map((e, i) => env.DB.prepare(
     `INSERT INTO podcast_episodes (${EP_COLS})
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
      ON CONFLICT(library_item_id, guid) DO UPDATE SET
        enclosure_url = excluded.enclosure_url, enclosure_type = excluded.enclosure_type,
        enclosure_length = excluded.enclosure_length, title = excluded.title, subtitle = excluded.subtitle,
@@ -464,6 +467,7 @@ async function upsertEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], start
        chapters_url = excluded.chapters_url,
        chapters_checked_at = CASE WHEN podcast_episodes.chapters_url IS NOT excluded.chapters_url THEN NULL ELSE podcast_episodes.chapters_checked_at END,
        transcripts = excluded.transcripts,
+       videos = excluded.videos,
        updated_at = excluded.updated_at
      WHERE podcast_episodes.enclosure_url IS NOT excluded.enclosure_url
         OR podcast_episodes.title IS NOT excluded.title
@@ -471,13 +475,15 @@ async function upsertEpisodes(env: Env, p: PodcastRow, eps: FeedEpisode[], start
         OR (excluded.duration_seconds > 0 AND podcast_episodes.duration_measured = 0 AND podcast_episodes.duration_seconds IS NOT excluded.duration_seconds)
         OR podcast_episodes.chapters_url IS NOT excluded.chapters_url
         OR podcast_episodes.transcripts IS NOT excluded.transcripts
+        OR podcast_episodes.videos IS NOT excluded.videos
      RETURNING id, published_at, created_at`,
   ).bind(
     crypto.randomUUID(), p.library_item_id, p.tenant_id, String(Math.floor(Math.random() * 0xffffffff)),
     episodeKey(e), startIdx + i + 1, e.season || null, e.episode || null, e.episodeType || null,
     e.title || null, e.subtitle || null, e.description || null, e.pubDate || null, e.publishedAt,
     e.enclosure.url, e.enclosure.type, lengthOf(e.enclosure.length), e.durationSeconds ?? 0,
-    JSON.stringify(e.chapters), e.chaptersUrl, e.transcripts.length ? JSON.stringify(e.transcripts) : null, now, now,
+    JSON.stringify(e.chapters), e.chaptersUrl, e.transcripts.length ? JSON.stringify(e.transcripts) : null,
+    e.videos.length ? JSON.stringify(e.videos) : null, now, now,
   ));
   for (let i = 0; i < stmts.length; i += 100) {
     const res = await env.DB.batch<{ id: string; published_at: number | null; created_at: number }>(stmts.slice(i, i + 100));
@@ -924,6 +930,9 @@ function shortHash(s: string): string {
 // mp3 header every week.
 export async function ensureEpisodeChapters(env: Env, e: EpisodeRow): Promise<Chapter[]> {
   const now = Date.now();
+  // First what the file is, so the probe below reads it as what it is (an
+  // unrecognised one, '', is looked at again on each check).
+  if (!e.file_type) e = await sniffAndStore(env, e).catch(() => e);
   const have = JSON.parse(e.chapters || '[]') as Chapter[];
   let chapters: Chapter[] = have;
   let duration: number | null = null;
@@ -968,6 +977,88 @@ export async function ensureEpisodeChapters(env: Env, e: EpisodeRow): Promise<Ch
   }
 }
 
+// ── What the file really is (migration 0037) ─────────────────────────────
+
+// From its first bytes, because the feed's type is a label and labels lie:
+// Incognito Mode's "The State of Search Engine 2025" says audio/mpeg and is
+// a 3.2 GB 1080p mp4 video, so it went to players as an mp3 and to pCloud as
+// ".mp3". An mp4 that isn't branded M4A/M4B is opened (its moov, wherever it
+// sits; that one's is at the end) to see whether it has a video track.
+// Returns '' for anything not recognised.
+async function sniffEpisodeFile(url: string): Promise<string> {
+  const res = await fetch(url, {
+    headers: { 'User-Agent': EPISODE_AUDIO_UA, Range: 'bytes=0-15' }, redirect: 'follow', signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) { await res.body?.cancel().catch(() => undefined); throw new Error(`HTTP ${res.status}`); }
+  const b = await readHead(res, 16);
+  const tag = (at: number, n: number) => String.fromCharCode(...b.subarray(at, at + n));
+  if (b.length >= 12 && tag(4, 4) === 'ftyp') {
+    if (tag(8, 3) === 'M4A' || tag(8, 3) === 'M4B') return 'audio/mp4';
+    const { probeM4b } = await import('../prober/m4b');
+    return (await probeM4b(url, { 'User-Agent': EPISODE_AUDIO_UA })).hasVideo ? 'video/mp4' : 'audio/mp4';
+  }
+  if (tag(0, 3) === 'ID3' || (b[0] === 0xff && ((b[1] ?? 0) & 0xe0) === 0xe0)) return 'audio/mpeg';
+  if (tag(0, 4) === 'OggS') return 'audio/ogg';
+  if (tag(0, 4) === 'fLaC') return 'audio/flac';
+  if (tag(0, 4) === 'RIFF' && tag(8, 4) === 'WAVE') return 'audio/wav';
+  return '';
+}
+
+// The first n bytes of a body, then the rest abandoned: a server that
+// ignores Range sends the whole file.
+async function readHead(res: Response, n: number): Promise<Uint8Array> {
+  const reader = res.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const out = new Uint8Array(n);
+  let got = 0;
+  try {
+    while (got < n) {
+      const { value, done } = await reader.read();
+      if (done || !value) break;
+      const take = Math.min(value.length, n - got);
+      out.set(value.subarray(0, take), got);
+      got += take;
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  return out.subarray(0, got);
+}
+
+// Look the file up, store what it is, and when it is already archived under
+// the wrong extension (the ".mp3" that is an mp4) rename the pCloud copy to
+// match, so the name says what the file is. A failed lookup stores '' (an
+// enclosure that 404s would otherwise be fetched every tick); ensureEpisode-
+// Chapters looks at '' again on its own schedule.
+async function sniffAndStore(env: Env, e: EpisodeRow): Promise<EpisodeRow> {
+  const type = await sniffEpisodeFile(e.enclosure_url).catch((err) => {
+    console.warn(`[podcasts] sniff ${e.id}: ${(err as Error).message}`);
+    return '';
+  });
+  const next: EpisodeRow = { ...e, file_type: type };
+  await env.DB.prepare('UPDATE podcast_episodes SET file_type = ? WHERE id = ?').bind(type, e.id).run();
+  const rel = e.archive_state === 'done' ? e.archive_rel_path : null;
+  const want = type ? episodeExt(next) : null;
+  const have = rel ? /\.([a-z0-9]{2,4})$/i.exec(rel)?.[1]?.toLowerCase() : null;
+  if (rel && want && have && have !== want) {
+    try {
+      const folder = await env.DB.prepare('SELECT f.* FROM library_folders f JOIN library_items li ON li.folder_id = f.id WHERE li.id = ?')
+        .bind(e.library_item_id).first<LibraryFolderRow>();
+      const target = folder ? await pcloudFor(env, folder) : null;
+      if (target) {
+        const to = rel.slice(0, -have.length) + want;
+        await pcloudRenameFile(target.profile, join(target.rootPath, rel), join(target.rootPath, to));
+        await env.DB.prepare('UPDATE podcast_episodes SET archive_rel_path = ? WHERE id = ? AND archive_rel_path = ?').bind(to, e.id, rel).run();
+        next.archive_rel_path = to;
+        console.log(`[podcasts] ${rel} is ${type}: renamed to .${want}`);
+      }
+    } catch (err) {
+      console.warn(`[podcasts] rename ${rel}: ${(err as Error).message}`);
+    }
+  }
+  return next;
+}
+
 // Only shows someone follows: a show stored just to be looked at (migration
 // 0033) arrives with up to 500 unchecked episodes, and probing each one's
 // audio at its publisher would be work for nobody. Playing one still looks
@@ -982,7 +1073,22 @@ export async function chapterPump(env: Env): Promise<string[]> {
   ).bind(Date.now() - CHAPTERS_RECHECK_MS, Date.now() - 30 * 86400_000, CHAPTERS_PER_TICK).all<EpisodeRow>();
   let found = 0;
   for (const e of due.results) if ((await ensureEpisodeChapters(env, e)).length) found++;
-  return due.results.length ? [`chapters: ${due.results.length} checked, ${found} with chapters`] : [];
+  const log = due.results.length ? [`chapters: ${due.results.length} checked, ${found} with chapters`] : [];
+  // Episodes whose chapters were checked before migration 0037 haven't had
+  // their files looked at. The partial index makes this read nothing once
+  // they all have.
+  const unsniffed = await env.DB.prepare(
+    `SELECT * FROM podcast_episodes WHERE file_type IS NULL AND in_library = 1
+        AND EXISTS (SELECT 1 FROM podcast_follows f WHERE f.library_item_id = podcast_episodes.library_item_id)
+      ORDER BY published_at DESC LIMIT ?`,
+  ).bind(SNIFFS_PER_TICK).all<EpisodeRow>();
+  const kinds: Record<string, number> = {};
+  for (const e of unsniffed.results) {
+    const t = (await sniffAndStore(env, e)).file_type || 'unknown';
+    kinds[t] = (kinds[t] ?? 0) + 1;
+  }
+  if (unsniffed.results.length) log.push(`files: ${Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ')}`);
+  return log;
 }
 
 // ─── Archiving ───────────────────────────────────────────────────────────────

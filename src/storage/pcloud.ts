@@ -560,6 +560,16 @@ export async function pcloudDeleteEmptyFolder(profile: PcloudProfile, absPath: s
   throw new Error(`pCloud deletefolder(${absPath}) result=${data.result} ${data.error ?? ''}`);
 }
 
+// Rename (or move) a file to the full path `toPath`. pCloud refuses when
+// something is already there (2004), which the caller reports.
+export async function pcloudRenameFile(profile: PcloudProfile, absPath: string, toPath: string): Promise<void> {
+  const params = new URLSearchParams();
+  params.set('path', absPath);
+  params.set('topath', toPath);
+  const data = await pcloudGet<PcloudApiResult>(profile, 'renamefile', params);
+  if (data.result !== 0) throw new Error(`pCloud renamefile(${absPath}) result=${data.result} ${data.error ?? ''}`);
+}
+
 export async function pcloudDeleteFile(profile: PcloudProfile, absPath: string): Promise<void> {
   const params = new URLSearchParams();
   params.set('path', absPath);

@@ -77,6 +77,8 @@ export type EpisodeRow = {
   transcripts: string | null;      // migration 0021: JSON TranscriptLink[] from <podcast:transcript>
   analysis: string | null;         // migration 0025: JSON AnalysisSummary of the newest finished analysis
   duration_measured: number;       // migration 0025: 1 = duration_seconds was measured, the feed's can't replace it
+  videos: string | null;           // migration 0037: JSON FeedVideo[] from <podcast:alternateEnclosure type="video/…">
+  file_type: string | null;        // migration 0037: what the enclosure really is, from its bytes ('' = unrecognised, NULL = not looked at)
   created_at: number;
   updated_at: number;
 };

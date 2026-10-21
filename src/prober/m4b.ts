@@ -493,7 +493,21 @@ export type ProbeResult = {
   // R2 for fast iOS seek-to-moov responses.
   moovOffset: number;
   moovSize: number;
+  // A trak whose handler is 'vide' (migration 0037: a podcast enclosure
+  // labelled audio/mpeg turned out to be a 1080p mp4 video).
+  hasVideo: boolean;
 };
+
+// Any trak's mdia/hdlr handler_type is 'vide'. A cover picture is stored in
+// udta/ilst, not as a track, so an m4b with art isn't counted.
+function moovHasVideo(moov: Uint8Array): boolean {
+  for (const c of walkChildren(moov)) {
+    if (c.type !== 'trak') continue;
+    const hdlr = findPath(moov.subarray(c.start + c.headerSize, c.start + c.size), 'mdia', 'hdlr');
+    if (hdlr && hdlr.length >= 12 && fourCC(new DataView(hdlr.buffer, hdlr.byteOffset, hdlr.byteLength), 8) === 'vide') return true;
+  }
+  return false;
+}
 
 export async function probeM4b(url: string, headers?: Record<string, string>): Promise<ProbeResult> {
   const { moov, moovOffset, moovSize } = await fetchMoov(url, headers);
@@ -583,5 +597,5 @@ export async function probeM4b(url: string, headers?: Record<string, string>): P
     }
   }
 
-  return { durationSeconds, timeScale, tags, cover, chapters, moovOffset, moovSize };
+  return { durationSeconds, timeScale, tags, cover, chapters, moovOffset, moovSize, hasVideo: moovHasVideo(moov) };
 }

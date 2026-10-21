@@ -33,7 +33,11 @@ export type FeedEpisode = {
   // <podcast:transcript> links (Podcasting 2.0), as listed; the shim picks
   // and parses one when a client asks (src/lib/transcript.ts).
   transcripts: TranscriptLink[];
+  // <podcast:alternateEnclosure> entries that are VIDEO (migration 0037).
+  videos: FeedVideo[];
 };
+
+export type FeedVideo = { url: string; type: string; length: number | null; height: number | null; bitrate: number | null; title: string | null };
 
 export type TranscriptLink = { url: string; type: string | null; language: string | null; rel: string | null };
 
@@ -312,6 +316,23 @@ function parseItem(s: string): FeedEpisode | null {
     }
   }
 
+  // Podcasting 2.0 alternative files: <podcast:alternateEnclosure type
+  // length height bitrate title><podcast:source uri/>…</…>. Only video ones
+  // are kept (LINUX Unplugged lists a 1080p mp4 beside the mp3 on every
+  // episode since Feb 2026); an audio alternative (another bitrate, an Opus
+  // copy) gives a listener here nothing the enclosure doesn't. The first
+  // http(s) source of each; torrent and IPFS sources are skipped.
+  const videos: FeedVideo[] = [];
+  for (const el of allElements(s, 'podcast:alternateEnclosure')) {
+    const type = (attr(el.attrs, 'type') ?? '').trim().toLowerCase();
+    if (!type.startsWith('video/') || !el.inner) continue;
+    const url = allElements(el.inner, 'podcast:source').map((src) => attr(src.attrs, 'uri')?.trim() ?? '').find((u) => /^https?:\/\//i.test(u));
+    if (!url) continue;
+    const num = (name: string) => { const n = Number(attr(el.attrs, name)); return Number.isFinite(n) && n > 0 ? n : null; };
+    videos.push({ url, type, length: num('length'), height: num('height'), bitrate: num('bitrate'), title: attr(el.attrs, 'title')?.trim() || null });
+    if (videos.length >= 4) break;
+  }
+
   let chapters: FeedEpisode['chapters'] = [];
   const psc = element(s, 'psc:chapters');
   if (psc?.inner && durationSeconds) {
@@ -347,6 +368,7 @@ function parseItem(s: string): FeedEpisode | null {
     chaptersType,
     chapters,
     transcripts,
+    videos,
   };
 }
 

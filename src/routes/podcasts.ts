@@ -1,7 +1,7 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../types';
 import { canAddBooks, requireAuth, requireCanAdd, requireTenantOwner, type AuthVars } from '../auth/middleware';
-import { getFolderById, getItem, type LibraryFolderRow, type LibraryItemRow } from '../db/library';
+import { episodeAudioRow, getFolderById, getItem, type LibraryFolderRow, type LibraryItemRow } from '../db/library';
 import { getEpisode, getPodcast, listShowEpisodes, type EpisodeRow, type PodcastRow } from '../db/podcasts';
 import { progressForShows } from '../db/progress';
 import { followInfo, followShow, hideEpisode, hiddenAmong, unfollowShow, unhideEpisodes } from '../db/podcast-follows';
@@ -13,7 +13,8 @@ import {
 } from '../lib/podcasts';
 import { AnalysisInputError, analysisOrigin, analysisPump, analysisStatus, queueAnalysis, storeResult, waitsForArchive } from '../lib/episode-analysis';
 import { wharfConfigured } from '../lib/wharf';
-import { parseOpml, sanitizeHtml, type TranscriptLink } from '../lib/rss';
+import { parseOpml, sanitizeHtml, type FeedVideo, type TranscriptLink } from '../lib/rss';
+import { streamAudio, streamRemoteAudio } from '../storage/resolve';
 
 // ABS's podcast routes (server/routers/ApiRouter.js "Podcast Routes"), plus a
 // few shim-only ones marked as such. ABS gates writes on admin. Here a
@@ -354,8 +355,74 @@ podcastRoutes.get('/:id/episode/:episodeId', async (c) => {
   // The whole notes: lists carry a snippet (notesForList), and Pholia's
   // episode page asks here for the rest. Answered even when hidden (a link
   // never 404s); `hidden` (shim extra) says so, for "Show again".
-  const hidden = await hiddenAmong(c.env, c.get('userId'), [e.id]);
-  return c.json({ ...await buildEpisode(e, show.item, { fullNotes: true }), hidden: hidden.has(e.id) });
+  const [hidden, videoProgress] = await Promise.all([
+    hiddenAmong(c.env, c.get('userId'), [e.id]),
+    // Shim extra: where the caller is in the episode's video (migration
+    // 0037), for Pholia's Watch; null when they haven't watched it.
+    c.env.DB.prepare('SELECT position, duration, updated_at FROM video_progress WHERE user_id = ? AND episode_id = ?')
+      .bind(c.get('userId'), e.id).first<{ position: number; duration: number | null; updated_at: number }>(),
+  ]);
+  return c.json({
+    ...await buildEpisode(e, show.item, { fullNotes: true }),
+    hidden: hidden.has(e.id),
+    videoProgress: videoProgress ? { position: videoProgress.position, duration: videoProgress.duration, updatedAt: videoProgress.updated_at } : null,
+  });
+});
+
+// GET|HEAD /api/podcasts/:id/episode/:episodeId/video/:n — shim-only. One of
+// the episode's video versions (episodeVideos in podcast-shapes.ts): `file`,
+// the episode's own file when that is a video, or the feed's alternate n.
+// Streamed through this Worker with Range like the audio, never redirected
+// (the CDN sends no CORS headers, and would see the viewer's IP), as the
+// video's own type: the audio route says audio/mp4 for the same file.
+podcastRoutes.get('/:id/episode/:episodeId/video/:n', async (c) => {
+  const show = await loadShow(c);
+  if (!show) return c.json({ error: 'Podcast not found' }, 404);
+  const e = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), c.get('tenantId'));
+  if (!e) return c.json({ error: 'Episode not found' }, 404);
+  const n = c.req.param('n');
+  const head = (type: string, size: number) => new Response(null, {
+    status: 200, headers: { 'Content-Type': type, 'Content-Length': String(size), 'Accept-Ranges': 'bytes' },
+  });
+  if (n === 'file') {
+    const type = (e.file_type || e.enclosure_type || '').toLowerCase();
+    if (!type.startsWith('video/')) return c.json({ error: 'This episode is not a video' }, 404);
+    const row = { ...episodeAudioRow(e), mime_type: type };
+    if (c.req.method === 'HEAD' && row.size_bytes) return head(type, row.size_bytes);
+    return row.rel_path ? streamAudio(c.env, show.folder, row, c.req.raw) : streamRemoteAudio(row, c.req.raw);
+  }
+  let videos: FeedVideo[] = [];
+  try { videos = JSON.parse(e.videos || '[]') as FeedVideo[]; } catch { /* none */ }
+  const v = /^\d+$/.test(n) ? videos[Number(n)] : undefined;
+  if (!v) return c.json({ error: 'No such video' }, 404);
+  // Never the episode's own row's size or path: this is another file.
+  const row = { ...episodeAudioRow(e), filedn_url: v.url, rel_path: null, mime_type: v.type, size_bytes: v.length ?? 0 };
+  return streamRemoteAudio(row, c.req.raw);
+});
+
+// PUT /api/podcasts/:id/episode/:episodeId/video-progress {position,
+// duration?} — shim-only. Where the caller is in the episode's video
+// (migration 0037), kept apart from the listening position because the
+// video is usually another edit. Any member of the show's tenant, own row.
+// "Played" stays the episode's ordinary progress: a client that reaches the
+// end of the video marks it there.
+podcastRoutes.put('/:id/episode/:episodeId/video-progress', async (c) => {
+  const show = await loadShow(c);
+  if (!show) return c.json({ error: 'Podcast not found' }, 404);
+  const e = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), c.get('tenantId'));
+  if (!e) return c.json({ error: 'Episode not found' }, 404);
+  const body = await c.req.json().catch(() => ({})) as { position?: unknown; duration?: unknown };
+  const position = Number(body.position);
+  const duration = body.duration == null ? null : Number(body.duration);
+  if (!Number.isFinite(position) || position < 0) return c.json({ error: 'position must be a number of seconds' }, 400);
+  if (duration != null && !(Number.isFinite(duration) && duration > 0)) return c.json({ error: 'duration must be a positive number of seconds' }, 400);
+  const now = Date.now();
+  await c.env.DB.prepare(
+    `INSERT INTO video_progress (user_id, episode_id, library_item_id, position, duration, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT (user_id, episode_id) DO UPDATE SET position = excluded.position,
+       duration = COALESCE(excluded.duration, video_progress.duration), updated_at = excluded.updated_at`,
+  ).bind(c.get('userId'), e.id, show.item.id, position, duration, now).run();
+  return c.json({ position, duration, updatedAt: now });
 });
 
 // GET /api/podcasts/:id/episode/:episodeId/transcript — shim-only. The
