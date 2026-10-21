@@ -21,7 +21,7 @@ import { adoptAnalysisForSize, analysisPump, whisperTranscriptFor } from './epis
 import { announceArchiveDone, announceNewEpisodes } from './push';
 import { followShow, isIdle } from '../db/podcast-follows';
 import {
-  pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudStat, type PcloudProfile,
+  pcloudDeleteFile, pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudStat, type PcloudProfile,
 } from '../storage/pcloud';
 
 export class PodcastError extends Error {
@@ -58,6 +58,15 @@ const ARCHIVE_SETTLE_MS = 60 * 1000;
 // A settled file smaller than the source's size is accepted after this: an
 // ad-inserting host the list doesn't know serves pCloud its own stitch.
 const ARCHIVE_ANY_SIZE_AFTER_MS = 30 * 60 * 1000;
+// pCloud answers downloadfileasync with result 0 whether or not it can
+// fetch the URL, and a pull it never starts leaves no file at all. An episode
+// lands in a minute or two (pCloud pulls from a datacentre), so no bytes after
+// this long means it isn't coming: the pull is started again, with the
+// publisher's redirect chain resolved afresh, ARCHIVE_MAX_ATTEMPTS in all.
+// Incognito Mode's "America vs. China" (2026-10-21) sat at 0 bytes for the
+// whole ARCHIVE_GIVE_UP_MS beside 139 siblings from the same host that landed.
+const ARCHIVE_NO_START_MS = 30 * 60 * 1000;
+const ARCHIVE_MAX_ATTEMPTS = 3;
 // Raise when the parser starts storing a field older rows lack: each show's
 // next poll then re-reads its whole feed once (migration 0018: chapters_url;
 // 2 = migration 0021: transcripts).
@@ -1177,6 +1186,20 @@ export async function archivePump(env: Env): Promise<string[]> {
       if (archiveSettled(e, size, st?.modified, now)) {
         await archiveLanded(env, e, e.archive_rel_path, size);
         log.push(`archive ${e.archive_rel_path}: done (${size} bytes${e.archive_expected_size && size !== e.archive_expected_size ? `, the source said ${e.archive_expected_size}` : ''})`);
+      } else if (!size && now - (e.archive_started_at ?? now) > ARCHIVE_NO_START_MS) {
+        const attempts = (e.archive_attempts ?? 0) + 1;
+        // An empty file left at the name would make the next pull save
+        // "name (1)", which nothing would ever look at.
+        if (st) await pcloudDeleteFile(target.profile, join(target.rootPath, e.archive_rel_path)).catch(() => undefined);
+        if (attempts >= ARCHIVE_MAX_ATTEMPTS) {
+          await fail(e, `pCloud never started the copy (${attempts} tries)`);
+        } else {
+          await env.DB.prepare(
+            `UPDATE podcast_episodes SET archive_state = 'queued', archive_attempts = ?, archive_started_at = NULL,
+               archive_seen_size = NULL, archive_error = NULL, updated_at = ? WHERE id = ? AND archive_state = 'fetching'`,
+          ).bind(attempts, now, e.id).run();
+          log.push(`archive ${e.archive_rel_path}: pCloud never started it, queued again (${attempts + 1} of ${ARCHIVE_MAX_ATTEMPTS})`);
+        }
       } else if (now - (e.archive_started_at ?? now) > ARCHIVE_GIVE_UP_MS) {
         await fail(e, `pCloud stopped at ${size} bytes${e.archive_expected_size ? ` of ${e.archive_expected_size}` : ''}`);
       } else {
@@ -1226,7 +1249,7 @@ export async function queueArchiveAll(env: Env, itemId: string, userId: string, 
   ).bind(itemId).first<{ fresh: number | null; inflight: number | null }>();
   const fresh = opts.retryFailed ? 0 : before?.fresh ?? 0;
   const r = await env.DB.prepare(
-    `UPDATE podcast_episodes SET archive_state = 'queued', archive_error = NULL, updated_at = ?
+    `UPDATE podcast_episodes SET archive_state = 'queued', archive_error = NULL, archive_attempts = 0, updated_at = ?
       WHERE library_item_id = ? AND removed = 0 AND ${opts.retryFailed ? "archive_state = 'error'" : "(archive_state IS NULL OR archive_state = 'error')"}`,
   ).bind(now, itemId).run();
   const n = r.meta.changes ?? 0;

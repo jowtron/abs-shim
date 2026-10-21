@@ -69,6 +69,7 @@ export type EpisodeRow = {
   archive_seen_size: number | null;
   archive_started_at: number | null;
   archive_error: string | null;
+  archive_attempts: number;
   in_library: number;
   removed: number;
   chapters_url: string | null;     // migration 0018: <podcast:chapters url>

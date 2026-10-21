@@ -255,16 +255,51 @@ export const ABB_COVER_PREFIX = 'abbcovers/';
 // ABS_SHIM_SHARD/SHARDS in the wharf service's .env). No lease is needed the
 // way the detail crawler needs one: id % shards is a fixed partition, and a
 // duplicate PUT would only cost a wasted download, not corrupt anything.
+// A cover whose host never answers is left pending by the runner (a timeout
+// is usually a blip, see abb-covers.py's failure classes), so a host that is
+// simply gone used to be handed out on every pass for ever: 28 of them sat at
+// the head of the queue from mid-September to 2026-10-21, costing both nodes
+// ~9 minutes of timeouts every ~24. So handouts are counted here, and a cover
+// handed out COVER_GIVE_UP_TRIES times over at least COVER_GIVE_UP_MS without
+// being stored or failed is recorded as failed. Counted on the shim, so no
+// runner needs changing. A box that is offline can't fetch a batch, so it
+// can't age anything; "Retry cover errors" puts them back with a fresh count.
+const COVER_GIVE_UP_TRIES = 12;
+const COVER_GIVE_UP_MS = 3 * 24 * 3600_000;
+
+type PendingCoverRow = { id: number; url: string; title: string; cover_tries: number; cover_first_try: number | null };
+
+async function noteCoverHandout(env: Env, rows: PendingCoverRow[]): Promise<Array<{ id: number; url: string; title: string }>> {
+  if (!rows.length) return [];
+  const now = Date.now();
+  const dead = rows.filter((r) => r.cover_tries >= COVER_GIVE_UP_TRIES && r.cover_first_try != null && now - r.cover_first_try >= COVER_GIVE_UP_MS);
+  const deadIds = new Set(dead.map((r) => r.id));
+  const live = rows.filter((r) => !deadIds.has(r.id));
+  const stmts: D1PreparedStatement[] = [];
+  if (dead.length) {
+    stmts.push(env.DB.prepare(
+      `UPDATE abb_posts SET cover_error = ? WHERE cover_r2 IS NULL AND cover_error IS NULL AND id IN (SELECT value FROM json_each(?))`,
+    ).bind(`no answer from the host in ${COVER_GIVE_UP_MS / 86400_000}+ days of tries`, JSON.stringify([...deadIds])));
+  }
+  if (live.length) {
+    stmts.push(env.DB.prepare(
+      `UPDATE abb_posts SET cover_tries = cover_tries + 1, cover_first_try = COALESCE(cover_first_try, ?) WHERE id IN (SELECT value FROM json_each(?))`,
+    ).bind(now, JSON.stringify(live.map((r) => r.id))));
+  }
+  await env.DB.batch(stmts);
+  return live.map(({ id, url, title }) => ({ id, url, title }));
+}
+
 export async function coversPending(env: Env, limit: number, shard = 0, shards = 1): Promise<Array<{ id: number; url: string; title: string }>> {
   const n = Math.min(Math.max(Math.round(shards) || 1, 1), 16);
   const i = Math.min(Math.max(Math.round(shard) || 0, 0), n - 1);
   const cap = Math.min(Math.max(limit, 1), 1000);
   const rows = await env.DB.prepare(
-    `SELECT id, cover AS url, title FROM abb_posts WHERE cover IS NOT NULL AND cover_r2 IS NULL AND cover_error IS NULL
+    `SELECT id, cover AS url, title, cover_tries, cover_first_try FROM abb_posts WHERE cover IS NOT NULL AND cover_r2 IS NULL AND cover_error IS NULL
        AND (? = 1 OR id % ? = ?)
        ORDER BY posted_ts DESC, id DESC LIMIT ?`,
-  ).bind(n, n, i, cap).all<{ id: number; url: string; title: string }>();
-  if (n === 1 || rows.results.length >= cap) return rows.results;
+  ).bind(n, n, i, cap).all<PendingCoverRow>();
+  if (n === 1 || rows.results.length >= cap) return noteCoverHandout(env, rows.results);
 
   // This shard can't fill a batch — top it up from the whole pool instead of
   // letting the node idle. A fixed partition splits the backlog evenly by id
@@ -280,11 +315,11 @@ export async function coversPending(env: Env, limit: number, shard = 0, shards =
   // middle rather than racing over the same head of queue.
   const want = cap - rows.results.length;
   const helper = await env.DB.prepare(
-    `SELECT id, cover AS url, title FROM abb_posts WHERE cover IS NOT NULL AND cover_r2 IS NULL AND cover_error IS NULL
+    `SELECT id, cover AS url, title, cover_tries, cover_first_try FROM abb_posts WHERE cover IS NOT NULL AND cover_r2 IS NULL AND cover_error IS NULL
        ORDER BY posted_ts ASC, id ASC LIMIT ?`,
-  ).bind(Math.min(want + rows.results.length, 1000)).all<{ id: number; url: string; title: string }>();
+  ).bind(Math.min(want + rows.results.length, 1000)).all<PendingCoverRow>();
   const seen = new Set(rows.results.map((r) => r.id));
-  return rows.results.concat(helper.results.filter((r) => !seen.has(r.id)).slice(0, want));
+  return noteCoverHandout(env, rows.results.concat(helper.results.filter((r) => !seen.has(r.id)).slice(0, want)));
 }
 
 export async function coverStore(env: Env, id: number, webp: ArrayBuffer): Promise<boolean> {
@@ -762,7 +797,7 @@ export async function catalogControl(env: Env, action: CatalogAction, value?: nu
     // Covers that answered 403/404/523 are recorded so the runner stops
     // re-fetching them every pass; this puts them back when a host recovers.
     case 'retry-cover-errors': {
-      const r = await env.DB.prepare('UPDATE abb_posts SET cover_error = NULL WHERE cover_error IS NOT NULL').run();
+      const r = await env.DB.prepare('UPDATE abb_posts SET cover_error = NULL, cover_tries = 0, cover_first_try = NULL WHERE cover_error IS NOT NULL').run();
       const n = r.meta.changes ?? 0;
       said = n ? `${n.toLocaleString()} cover(s) queued for another try.` : 'No cover errors to retry.';
       break;

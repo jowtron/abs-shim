@@ -614,7 +614,7 @@ async function queueArchive(env: Env, showItemId: string, ids: string[]): Promis
   for (let i = 0; i < ids.length; i += 90) {
     const part = ids.slice(i, i + 90);
     const r = await env.DB.prepare(
-      `UPDATE podcast_episodes SET in_library = 1, removed = 0, archive_state = 'queued', archive_error = NULL, updated_at = ?
+      `UPDATE podcast_episodes SET in_library = 1, removed = 0, archive_state = 'queued', archive_error = NULL, archive_attempts = 0, updated_at = ?
         WHERE library_item_id = ? AND (archive_state IS NULL OR archive_state = 'error') AND id IN (${part.map(() => '?').join(',')})`,
     ).bind(Date.now(), showItemId, ...part).run();
     n += r.meta.changes ?? 0;
