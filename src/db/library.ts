@@ -1,6 +1,7 @@
 import type { Env } from '../types';
 import { getEpisodeForFile, type EpisodeRow } from './podcasts';
 import { episodeExt, episodeMime } from '../lib/podcast-shapes';
+import { findHoldForFile, type HoldRow } from '../lib/episode-holds';
 
 export type LibraryRow = {
   id: string;
@@ -192,6 +193,8 @@ export function itemDeleteStatements(env: Env, itemId: string): D1PreparedStatem
     env.DB.prepare('DELETE FROM podcast_episode_hidden WHERE library_item_id = ?').bind(itemId),
     env.DB.prepare('DELETE FROM archive_requests WHERE library_item_id = ?').bind(itemId),
     env.DB.prepare('DELETE FROM video_progress WHERE library_item_id = ?').bind(itemId),
+    // Held copies' rows; their R2 objects go first (deleteItemHeldObjects).
+    env.DB.prepare('DELETE FROM episode_holds WHERE library_item_id = ?').bind(itemId),
     env.DB.prepare('DELETE FROM library_items WHERE id = ?').bind(itemId),
   ];
 }
@@ -239,7 +242,7 @@ export async function getStreamingTarget(
   itemId: string,
   fileId: string,
   tenantId: string,
-): Promise<{ audio: AudioFileRow; folder: LibraryFolderRow; episode?: EpisodeRow } | null> {
+): Promise<{ audio: AudioFileRow; folder: LibraryFolderRow; episode?: EpisodeRow; hold?: HoldRow } | null> {
   // Tenant filter is a single extra predicate on the existing index — NOT a
   // JOIN — to keep this Range hot path cheap (see migration 0004 rationale).
   const item = await env.DB.prepare(
@@ -251,13 +254,21 @@ export async function getStreamingTarget(
   // episode's ino. No fall-back-to-the-first-file here: playing the wrong
   // episode is worse than a 404.
   if (item.media_type === 'podcast') {
-    const [episode, folder] = await Promise.all([
+    const [episode, folder, hold] = await Promise.all([
       getEpisodeForFile(env, itemId, fileId, tenantId),
       env.DB.prepare('SELECT * FROM library_folders WHERE id = ? AND tenant_id = ? LIMIT 1')
         .bind(item.folder_id, tenantId).first<LibraryFolderRow>(),
+      // A held copy (src/lib/episode-holds.ts), looked up beside the episode
+      // so the Range hot path gains no round trip.
+      findHoldForFile(env, itemId, fileId).catch(() => null),
     ]);
     if (!episode || !folder) return null;
-    return { audio: episodeAudioRow(episode), folder, episode };
+    const audio = episodeAudioRow(episode);
+    // Only while the episode isn't archived: an archive plays from pCloud.
+    if (hold && hold.episode_id === episode.id && !audio.rel_path) {
+      return { audio: { ...audio, size_bytes: hold.size_bytes }, folder, episode, hold };
+    }
+    return { audio, folder, episode };
   }
 
   const numericFid = Number(fileId);

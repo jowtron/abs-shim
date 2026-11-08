@@ -103,7 +103,7 @@ export async function analysisRunsReport(env: Env, tenantId: string, q: RunsQuer
       `SELECT library_item_id, title, analyse FROM podcasts WHERE tenant_id = ?${q.showId ? ' AND library_item_id = ?' : ''}`,
     ).bind(tenantId, ...(q.showId ? [q.showId] : [])),
     env.DB.prepare(
-      `SELECT a.episode_id, a.library_item_id, a.state, a.job_id, a.error, a.reason, a.updated_at,
+      `SELECT a.episode_id, a.library_item_id, a.state, a.job_id, a.error, a.reason, a.listen, a.updated_at,
               e.title AS episode_title, e.enclosure_url, e.archive_state, p.title AS show_title
          FROM episode_analysis a
          LEFT JOIN podcast_episodes e ON e.id = a.episode_id
@@ -147,7 +147,7 @@ export async function analysisRunsReport(env: Env, tenantId: string, q: RunsQuer
   const showList = [...showMap.values()].sort((a, b) =>
     b.costUsd - a.costUsd || b.runs - a.runs || (a.title ?? '').localeCompare(b.title ?? '', undefined, { sensitivity: 'base' }));
 
-  type ActiveRow = Pick<AnalysisRow, 'episode_id' | 'library_item_id' | 'state' | 'job_id' | 'error' | 'reason' | 'updated_at'>
+  type ActiveRow = Pick<AnalysisRow, 'episode_id' | 'library_item_id' | 'state' | 'job_id' | 'error' | 'reason' | 'listen' | 'updated_at'>
     & Pick<EpisodeRow, 'enclosure_url' | 'archive_state'> & { episode_title: string | null; show_title: string | null };
   const activeList = (active!.results as ActiveRow[]).map((a) => ({
     episodeId: a.episode_id,
@@ -156,7 +156,8 @@ export async function analysisRunsReport(env: Env, tenantId: string, q: RunsQuer
     episodeTitle: a.episode_title,
     state: a.state,
     island: jobIsland(a.job_id),
-    waitingFor: a.state === 'queued' && a.enclosure_url != null && waitsForArchive(a) ? 'archive' as const : null,
+    waitingFor: a.state === 'queued' && !a.listen && a.enclosure_url != null && waitsForArchive(a) ? 'archive' as const : null,
+    listen: !!a.listen,
     error: a.error,
     reason: a.reason,
     since: a.updated_at,

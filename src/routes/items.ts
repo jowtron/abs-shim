@@ -18,7 +18,8 @@ import { followInfo, unhideEpisodes } from '../db/podcast-follows';
 import { ensureEpisodeChapters } from '../lib/podcasts';
 import { buildEpisodeExpanded, buildPodcastItemExpanded, normalizeSkip, podcastMetadata } from '../lib/podcast-shapes';
 import { adoptAnalysisForSize } from '../lib/episode-analysis';
-import { getBookMetadata, getFolderById, getItem, getStreamingTarget, type AudioFileRow } from '../db/library';
+import { holdEligible, holdingStream, serveHeld, verifyHoldParam } from '../lib/episode-holds';
+import { episodeAudioRow, getBookMetadata, getFolderById, getItem, getStreamingTarget, type AudioFileRow } from '../db/library';
 import { tryServeMoovRange, warmMoovCache } from '../storage/moov-cache';
 import { tryServeByteRange, warmByteChunk, estimateByteOffsetForTime, CHUNK_SIZE } from '../storage/byte-cache';
 
@@ -249,7 +250,23 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
   if (target.episode) {
     if (!target.audio.rel_path) {
       const episodeId = target.episode.id;
-      return finish(await streamRemoteAudio(target.audio, c.req.raw, (size) => {
+      // A held copy (src/lib/episode-holds.ts): the exact bytes an analysis
+      // was made of, served to every client until it expires.
+      let audio = target.audio;
+      if (target.hold) {
+        const held = await serveHeld(c.env, c.executionCtx, target.hold, audioContentType(audio), c.req.raw);
+        if (held) return finish(held);
+        // Its object is gone (the row went with it): the publisher again.
+        audio = episodeAudioRow(target.episode);
+      }
+      // The analysis job of a listen run, downloading the file it analyses:
+      // the same bytes go into R2, and become the hold once all are there.
+      const hold = c.req.query('hold');
+      if (hold && c.req.method === 'GET' && !rangeHeader && holdEligible(target.episode)
+        && await verifyHoldParam(c.env, episodeId, hold)) {
+        return finish(await holdingStream(c.env, c.executionCtx, target.episode, audio, audioContentType(audio)));
+      }
+      return finish(await streamRemoteAudio(audio, c.req.raw, (size) => {
         // A size that CHANGES means the publisher now serves a different
         // file (ad-inserting hosts restitch it as campaigns change), so
         // its length and embedded chapters are looked up again, and an
@@ -257,8 +274,8 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
         // (none: it's served unanalysed until the pump re-runs it).
         c.executionCtx.waitUntil(c.env.DB.prepare(
           `UPDATE podcast_episodes SET chapters_checked_at = CASE WHEN size_bytes > 0 THEN NULL ELSE chapters_checked_at END,
-             size_bytes = ? WHERE id = ?`,
-        ).bind(size, episodeId).run()
+             size_bytes = ? WHERE id = ? AND NOT EXISTS (SELECT 1 FROM episode_holds WHERE episode_id = ?)`,
+        ).bind(size, episodeId, episodeId).run()
           .then(() => adoptAnalysisForSize(c.env, episodeId, size))
           .then(() => undefined, () => undefined));
       }));

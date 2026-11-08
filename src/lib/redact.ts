@@ -23,9 +23,10 @@ export function redactSecrets(config: unknown): unknown {
 // is an access token (Pholia and the bundled UI authenticate with ?token=, so
 // it is on nearly every request, 30-day JWTs included); `sig` signs a
 // /public/proxy or /public/audible-staged link, which is a pass to that file;
-// `code` is pCloud's OAuth authorisation code on the callback. Until
+// `code` is pCloud's OAuth authorisation code on the callback; `hold` signs
+// an analysis job's download as one to keep (src/lib/episode-holds.ts). Until
 // 2026-10-19 hono's logger wrote every URL whole into Workers Logs.
-const SECRET_QUERY = /([?&](?:token|sig|code)=)[^&\s]*/gi;
+const SECRET_QUERY = /([?&](?:token|sig|code|hold)=)[^&\s]*/gi;
 // A query value that is itself a URL keeps only its scheme and host: a
 // private podcast feed is pasted into search as `?q=` (the library search)
 // and `?term=` (/api/search/podcast), and its path IS the subscriber's key

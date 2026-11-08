@@ -11,6 +11,7 @@ import {
 } from '../storage/pcloud';
 import { runScan, addBookByPath, reprobeItem, type ScanReport } from '../scanner/scan';
 import { getLibrary, listFolders, getFolderById, getAudioFiles, getItem, getBookMetadata, itemDeleteStatements } from '../db/library';
+import { deleteItemHeldObjects } from '../lib/episode-holds';
 import { resolveLibraryScope, viewFilter, type LibraryViewRow } from '../db/library-views';
 import type { PodcastRow } from '../db/podcasts';
 import { refreshPodcast } from '../lib/podcasts';
@@ -1426,6 +1427,7 @@ adminRoutes.delete('/items/:itemId', requireTenantOwner, async (c) => {
       }
     }
   }
+  await deleteItemHeldObjects(c.env, itemId).catch(() => undefined);
   await c.env.DB.batch(itemDeleteStatements(c.env, itemId));
   try { await c.env.COVERS.delete(`covers/${itemId}`); } catch { /* non-fatal */ }
   if (!deleteFiles) return c.body(null, 204);

@@ -18,6 +18,7 @@ import { decodeFeedBytes, episodeKey, parseFeed, type FeedEpisode, type ParsedFe
 import { cuesToServed, currentAnalysis, episodeExt, EPISODE_AUDIO_UA, hasDynamicAds } from './podcast-shapes';
 import { parseTranscript, rankTranscripts, type Transcript, type TranscriptCue } from './transcript';
 import { adoptAnalysisForSize, analysisPump, whisperTranscriptFor } from './episode-analysis';
+import { deleteItemHeldObjects, getHold, pruneHolds } from './episode-holds';
 import { announceArchiveDone, announceNewEpisodes } from './push';
 import { followShow, isIdle } from '../db/podcast-follows';
 import {
@@ -778,6 +779,11 @@ export async function runPodcastTick(env: Env): Promise<string[]> {
     log.push(`analysis pump: ${(e as Error).message}`);
   }
   log.push(...await prunePreviews(env));
+  try {
+    log.push(...await pruneHolds(env));
+  } catch (e) {
+    log.push(`holds: ${(e as Error).message}`);
+  }
   return log;
 }
 
@@ -804,6 +810,7 @@ export async function prunePreviews(env: Env): Promise<string[]> {
   ).bind(cutoff, cutoff).all<{ library_item_id: string; title: string | null }>();
   const log: string[] = [];
   for (const r of stale.results) {
+    await deleteItemHeldObjects(env, r.library_item_id);
     await env.DB.batch(itemDeleteStatements(env, r.library_item_id));
     try { await env.COVERS.delete(`covers/${r.library_item_id}`); } catch { /* non-fatal */ }
     log.push(`preview pruned: ${r.title ?? r.library_item_id}`);
@@ -955,7 +962,10 @@ export async function ensureEpisodeChapters(env: Env, e: EpisodeRow): Promise<Ch
     // its length isn't the played file's (that file's analysis sets it).
     // Without this, the weekly re-check of an episode with no chapters put
     // the streamed stitch's length back.
-    const otherStitch = e.archive_state === 'done' && !!e.archive_rel_path && hasDynamicAds(e.enclosure_url);
+    // Likewise a held copy (episode-holds.ts): it is what plays, not the
+    // stitch this probe was handed.
+    const otherStitch = hasDynamicAds(e.enclosure_url)
+      && ((e.archive_state === 'done' && !!e.archive_rel_path) || !!await getHold(env, e.id).catch(() => null));
     const probed = otherStitch ? null : fromAudio.duration;
     let measured = false;
     if (probed && probed > 0) {

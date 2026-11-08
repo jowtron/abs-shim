@@ -6,7 +6,8 @@ import { getEpisode, getPodcast, listShowEpisodes, type EpisodeRow, type Podcast
 import { progressForShows } from '../db/progress';
 import { followInfo, followShow, hideEpisode, hiddenAmong, unfollowShow, unhideEpisodes } from '../db/podcast-follows';
 import { resolveLibraryScope } from '../db/library-views';
-import { buildEpisode, buildEpisodeExpanded, buildPodcastItemExpanded, hasDynamicAds } from '../lib/podcast-shapes';
+import { buildEpisode, buildEpisodeExpanded, buildPodcastItemExpanded, currentAnalysis, hasDynamicAds } from '../lib/podcast-shapes';
+import { getHold } from '../lib/episode-holds';
 import {
   archivePump, archiveStatus, canArchive, createPodcast, ensureEpisodeChapters, episodeTranscript, fetchAndParse, PodcastError, queueArchiveAll, refreshPodcast,
   searchPodcasts, validFeedUrl,
@@ -476,6 +477,12 @@ podcastRoutes.post('/:id/episode/:episodeId/analysis', requireCanAdd, async (c) 
 
 // POST …/analysis/run — shim-only "Analyse now": queue the stitch served now
 // (again, if done or failed) and start it at once if the Mac is free.
+// Body {listen: true} (2026-11-08, "Play without ads, I'll wait"): the run
+// goes before every other, never waits for (or queues) a pCloud archive, and
+// its download is held in R2 and played from there (src/lib/episode-holds.ts).
+// A listen run on an episode whose served file already has an analysis that
+// can't drift (held, archived, or a host that doesn't insert ads) queues
+// nothing and answers the status as it is.
 podcastRoutes.post('/:id/episode/:episodeId/analysis/run', requireCanAdd, async (c) => {
   if (!wharfConfigured(c.env)) return c.json({ error: 'Episode analysis is not configured on this shim (needs the wharf-router binding and ROUTER_TOKEN)' }, 503);
   const show = await loadShow(c);
@@ -483,6 +490,12 @@ podcastRoutes.post('/:id/episode/:episodeId/analysis/run', requireCanAdd, async 
   const tenantId = c.get('tenantId');
   let e = await getEpisode(c.env, show.item.id, c.req.param('episodeId'), tenantId);
   if (!e) return c.json({ error: 'Episode not found' }, 404);
+  const body = await c.req.json().catch(() => ({})) as { listen?: unknown };
+  const listen = body?.listen === true;
+  if (listen && currentAnalysis(e)
+    && (e.archive_state === 'done' || !hasDynamicAds(e.enclosure_url) || await getHold(c.env, e.id))) {
+    return c.json(await analysisStatus(c.env, e));
+  }
   // The job is told whether the publisher has chapters; look them up first
   // if the chapter pump hasn't yet.
   if (e.chapters_checked_at == null) {
@@ -493,12 +506,12 @@ podcastRoutes.post('/:id/episode/:episodeId/analysis/run', requireCanAdd, async 
   // holds the analysis until the pCloud copy lands (waitsForArchive), so it
   // describes a file that never changes. The answer then carries
   // waitingFor: 'archive'.
-  if (hasDynamicAds(e.enclosure_url) && e.archive_state !== 'done' && await canArchive(c.env, show.folder)) {
+  if (!listen && hasDynamicAds(e.enclosure_url) && e.archive_state !== 'done' && await canArchive(c.env, show.folder)) {
     await queueArchive(c.env, show.item.id, [e.id]);
     e = (await getEpisode(c.env, show.item.id, e.id, tenantId)) ?? e;
   }
-  await queueAnalysis(c.env, e);
-  if (waitsForArchive(e)) c.executionCtx.waitUntil(archivePump(c.env).then(() => undefined, () => undefined));
+  await queueAnalysis(c.env, e, { listen });
+  if (!listen && waitsForArchive(e)) c.executionCtx.waitUntil(archivePump(c.env).then(() => undefined, () => undefined));
   c.executionCtx.waitUntil(analysisPump(c.env, { origin: analysisOrigin(c.env, c.req.url) }).then(() => undefined, () => undefined));
   return c.json(await analysisStatus(c.env, e));
 });

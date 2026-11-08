@@ -11,6 +11,7 @@ import {
   detailClaim, detailSubmit, noteCoverStored, noteCoverFailed, type DetailSubmission,
 } from '../lib/abb-catalog';
 import { sealSecret, openSecret, secretsConfigured } from '../lib/secret-box';
+import { wharfConfigured } from '../lib/wharf';
 import {
   rdUser, rdInfo, rdAddMagnet, rdSelectFiles, rdDelete, rdUnrestrict, rdWaitForFiles,
   audioFiles, extOf, AUDIO_EXT, ARCHIVE_EXT, RD_FAILED, rdList } from '../lib/realdebrid';
@@ -143,6 +144,10 @@ abbRoutes.get('/settings', async (c) => {
     canDelete: isOwner,
     canSubscribe: true,
     canPreview: true,
+    // "Play without ads, I'll wait" (2026-11-08): POST …/analysis/run takes
+    // {listen: true}, held copies (src/lib/episode-holds.ts). False on a
+    // shim with no wharf-router binding, where the run route answers 503.
+    canListenAnalyse: wharfConfigured(c.env),
     membersCanAdd: membersMayAdd,
     encryptionConfigured: secretsConfigured(c.env),
   });

@@ -42,6 +42,7 @@ import {
 import { rankTranscripts, whisperTranscript, type Transcript } from './transcript';
 import { stripAllTags, type TranscriptLink } from './rss';
 import { doneRun, emptyRun, LOST_PREFIX, nodeStats, recordRun } from './analysis-runs';
+import { getHold, holdEligible, holdParam } from './episode-holds';
 
 export const ANALYSIS_PROJECT = 'podcast-transcribe';
 export const ANALYSIS_HANDLER = 'analyse_episode';
@@ -118,6 +119,7 @@ export type AnalysisRow = {
   transcript_key: string | null;
   timings: string | null;
   reason: string | null;              // migration 0027: 'asked' | 'played' | 'new'
+  listen: number;                     // migration 0038: a listen run (1), see episode-holds.ts
   created_at: number;
   updated_at: number;
 };
@@ -182,7 +184,11 @@ export function waitsForArchive(e: Pick<EpisodeRow, 'enclosure_url' | 'archive_s
 
 // ─── Submitting ──────────────────────────────────────────────────────────────
 
-async function buildArgs(env: Env, e: EpisodeRow, origin: string) {
+// `listen`: a listen run, whose download is held (src/lib/episode-holds.ts)
+// when the file can be: the stream route keeps the bytes the node gets, and
+// serves them to every listener afterwards. Not when a hold already exists
+// (the route serves that one, so the node gets those bytes anyway).
+async function buildArgs(env: Env, e: EpisodeRow, origin: string, listen = false) {
   const owner = await env.DB.prepare(
     'SELECT u.id, u.username, u.tokens_valid_after FROM tenants t JOIN users u ON u.id = t.owner_user_id WHERE t.id = ?',
   ).bind(e.tenant_id).first<{ id: string; username: string; tokens_valid_after: number | null }>();
@@ -192,6 +198,10 @@ async function buildArgs(env: Env, e: EpisodeRow, origin: string) {
   // The token acts in the owner's default tenant; name this one when it isn't.
   const m = await getActiveMembership(env, owner.id);
   const q = m?.tenantId === e.tenant_id ? '' : `?tenant=${encodeURIComponent(e.tenant_id)}`;
+  let audioQ = q;
+  if (listen && holdEligible(e) && !await getHold(env, e.id)) {
+    audioQ = `${q}${q ? '&' : '?'}hold=${await holdParam(env, e.id)}`;
+  }
   const chapters = publisherChapters(e);
   const transcripts = transcriptLinks(e);
   const show = await env.DB.prepare('SELECT title FROM podcasts WHERE library_item_id = ?')
@@ -200,7 +210,7 @@ async function buildArgs(env: Env, e: EpisodeRow, origin: string) {
     episodeId: e.id,
     libraryItemId: e.library_item_id,
     sizeBytes: e.size_bytes || 0,
-    audioUrl: `${origin}/api/items/${e.library_item_id}/file/${e.ino}${q}`,
+    audioUrl: `${origin}/api/items/${e.library_item_id}/file/${e.ino}${audioQ}`,
     token,
     transcripts,
     chapters: chapters.length ? chapters.map((c) => ({ start: c.start, title: c.title })) : null,
@@ -264,7 +274,7 @@ async function failRow(env: Env, episodeId: string, size: number, msg: string, o
 
 // `reason`: why the pump took it ('asked', 'played', 'new'), kept on the
 // row and copied onto its runs.
-async function submit(env: Env, e: EpisodeRow, queuedSize: number | null, origin: string, reason: string | null): Promise<string> {
+async function submit(env: Env, e: EpisodeRow, queuedSize: number | null, origin: string, reason: string | null, listen = false): Promise<string> {
   const now = Date.now();
   const size = e.size_bytes || 0;
   // A row queued for a stitch the episode no longer has gives way to one
@@ -281,13 +291,13 @@ async function submit(env: Env, e: EpisodeRow, queuedSize: number | null, origin
      SELECT ?, ?, ?, ?, 'running', 1, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM episode_analysis WHERE state = 'running')
      ON CONFLICT (episode_id, size_bytes) DO UPDATE SET state = 'running', job_id = NULL,
        attempts = episode_analysis.attempts + 1, reason = COALESCE(excluded.reason, episode_analysis.reason),
-       updated_at = excluded.updated_at
+       listen = MAX(episode_analysis.listen, ?), updated_at = excluded.updated_at
      WHERE episode_analysis.state != 'running'`,
-  ).bind(e.id, size, e.tenant_id, e.library_item_id, reason, now, now).run();
+  ).bind(e.id, size, e.tenant_id, e.library_item_id, reason, now, now, listen ? 1 : 0).run();
   if (!claim.meta.changes) return `analysis: ${e.id} not started (a job is in flight)`;
   let jobId: string | null = null;
   try {
-    const args = await buildArgs(env, e, origin);
+    const args = await buildArgs(env, e, origin, listen);
     // wharf's dashboard line for the job: which episode it is.
     const label = [args.show, e.title ?? e.id].filter((x): x is string => !!x && !!x.trim()).join(' \u00b7 ');
     jobId = await runAsync(env, ANALYSIS_PROJECT, ANALYSIS_HANDLER, args, { label });
@@ -388,7 +398,7 @@ async function checkRunning(env: Env, r: RunningRow, now: number): Promise<{ bus
 
 // ─── Choosing the next episode ───────────────────────────────────────────────
 
-type Candidate = EpisodeRow & { show_analyse: string | null; queued_size?: number; queued_reason?: string | null };
+type Candidate = EpisodeRow & { show_analyse: string | null; queued_size?: number; queued_reason?: string | null; queued_listen?: number };
 
 // The run log's `reason` for each kind of pick: a queued row keeps the one
 // it was queued with ("Analyse now" queues 'asked'; an automatic pick that
@@ -399,16 +409,18 @@ async function nextCandidate(env: Env, now: number): Promise<(Candidate & { reas
   //    chapter pump's re-probe (chapters_checked_at) like any other, and an
   //    ad-inserting one for its archive in flight (waitsForArchive). Those
   //    with an archive in flight sort last, so a run of them can't push a
-  //    ready row out of the batch.
+  //    ready row out of the batch. A listen run (someone waiting to play
+  //    it, migration 0038) goes before everything and never waits for an
+  //    archive: its download is held instead.
   const queued = await env.DB.prepare(
-    `SELECT e.*, p.analyse AS show_analyse, a.size_bytes AS queued_size, a.reason AS queued_reason
+    `SELECT e.*, p.analyse AS show_analyse, a.size_bytes AS queued_size, a.reason AS queued_reason, a.listen AS queued_listen
        FROM episode_analysis a
        JOIN podcast_episodes e ON e.id = a.episode_id
        JOIN podcasts p ON p.library_item_id = e.library_item_id
       WHERE a.state = 'queued' AND e.chapters_checked_at IS NOT NULL
-      ORDER BY COALESCE(e.archive_state IN ('queued', 'fetching'), 0) ASC, a.updated_at ASC LIMIT 25`,
+      ORDER BY a.listen DESC, COALESCE(e.archive_state IN ('queued', 'fetching'), 0) ASC, a.updated_at ASC LIMIT 25`,
   ).all<Candidate>();
-  const q = queued.results.find((e) => !waitsForArchive(e));
+  const q = queued.results.find((e) => e.queued_listen || !waitsForArchive(e));
   if (q) return { ...q, reason: q.queued_reason ?? 'asked' };
 
   // 2. Being played, with nothing for the stitch being streamed: results
@@ -467,21 +479,26 @@ export async function analysisPump(env: Env, opts: { origin?: string } = {}): Pr
   }
   if (busy) return log;
   const next = await nextCandidate(env, now);
-  if (next) log.push(await submit(env, next, next.queued_size ?? null, opts.origin ?? analysisOrigin(env), next.reason));
+  if (next) log.push(await submit(env, next, next.queued_size ?? null, opts.origin ?? analysisOrigin(env), next.reason, !!next.queued_listen));
   return log;
 }
 
 // "Analyse now": the episode's current stitch, queued (again, if it was
-// done or failed). A job in flight for it is left alone.
-export async function queueAnalysis(env: Env, e: EpisodeRow): Promise<void> {
+// done or failed). A job in flight for it is left alone. `listen`: "Play
+// without ads, I'll wait" (episode-holds.ts); a row already queued keeps a
+// listen flag a plain press finds on it.
+export async function queueAnalysis(env: Env, e: EpisodeRow, opts: { listen?: boolean } = {}): Promise<void> {
   const now = Date.now();
+  const listen = opts.listen ? 1 : 0;
   await env.DB.prepare(
-    `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, attempts, reason, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'queued', 0, 'asked', ?, ?)
+    `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, attempts, reason, listen, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'queued', 0, 'asked', ?, ?, ?)
      ON CONFLICT (episode_id, size_bytes) DO UPDATE SET state = 'queued', attempts = 0, error = NULL, job_id = NULL,
-       reason = 'asked', updated_at = excluded.updated_at
+       reason = 'asked',
+       listen = CASE WHEN episode_analysis.state = 'queued' THEN MAX(episode_analysis.listen, excluded.listen) ELSE excluded.listen END,
+       updated_at = excluded.updated_at
      WHERE episode_analysis.state != 'running'`,
-  ).bind(e.id, e.size_bytes || 0, e.tenant_id, e.library_item_id, now, now).run();
+  ).bind(e.id, e.size_bytes || 0, e.tenant_id, e.library_item_id, listen, now, now).run();
 }
 
 // ─── Storing a result ────────────────────────────────────────────────────────
@@ -723,7 +740,7 @@ export async function adoptAnalysisForSize(env: Env, episodeId: string, size: nu
 
 function rowJson(r: AnalysisRow) {
   return {
-    size: r.size_bytes, state: r.state, attempts: r.attempts, error: r.error, jobId: r.job_id, island: jobIsland(r.job_id), reason: r.reason ?? null,
+    size: r.size_bytes, state: r.state, listen: !!r.listen, attempts: r.attempts, error: r.error, jobId: r.job_id, island: jobIsland(r.job_id), reason: r.reason ?? null,
     duration: r.duration, model: r.model, llmModel: r.llm_model, transcriptSource: r.transcript_source,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
@@ -731,18 +748,37 @@ function rowJson(r: AnalysisRow) {
 
 // GET …/analysis: where the episode's analysis stands. `state` is the row
 // for the size served now, else one waiting or running for it.
-// `waitingFor: 'archive'` while a queued row is held for the pCloud copy.
+// `waitingFor` on a queued row: 'archive' while it is held for the pCloud
+// copy, 'other-job' while another episode's job is in flight (one at a
+// time), 'node' when the last submit found the node away (asleep, not
+// routed: `error` says which), else null (it starts on the next pump).
+// `held`: the held copy served now (episode-holds.ts), or null.
 export async function analysisStatus(env: Env, e: EpisodeRow) {
-  const rows = (await env.DB.prepare('SELECT * FROM episode_analysis WHERE episode_id = ? ORDER BY updated_at DESC')
-    .bind(e.id).all<AnalysisRow>()).results;
+  const [rowsRes, hold, other] = await Promise.all([
+    env.DB.prepare('SELECT * FROM episode_analysis WHERE episode_id = ? ORDER BY updated_at DESC').bind(e.id).all<AnalysisRow>(),
+    getHold(env, e.id),
+    env.DB.prepare("SELECT 1 AS x FROM episode_analysis WHERE state = 'running' AND episode_id != ? LIMIT 1").bind(e.id).first<{ x: number }>(),
+  ]);
+  const rows = rowsRes.results;
   const current = rows.find((r) => r.size_bytes === e.size_bytes)
     ?? rows.find((r) => r.state === 'running' || r.state === 'queued') ?? null;
   const a = currentAnalysis(e);
+  const archived = e.archive_state === 'done' && !!e.archive_rel_path;
+  let waitingFor: 'archive' | 'other-job' | 'node' | null = null;
+  if (current?.state === 'queued') {
+    if (!current.listen && waitsForArchive(e)) waitingFor = 'archive';
+    else if (other) waitingFor = 'other-job';
+    else if (current.error) waitingFor = 'node';
+  }
   return {
     configured: wharfConfigured(env),
     currentSize: e.size_bytes,
     state: current?.state ?? null,
-    waitingFor: current?.state === 'queued' && waitsForArchive(e) ? 'archive' as const : null,
+    waitingFor,
+    listen: !!current?.listen,
+    error: current?.error ?? null,
+    island: jobIsland(current?.job_id),
+    held: hold && !archived ? { size: hold.size_bytes, until: hold.held_until } : null,
     current: current ? rowJson(current) : null,
     rows: rows.map(rowJson),
     analysis: analysisField(e, a, servedChapters(e, a).source),
