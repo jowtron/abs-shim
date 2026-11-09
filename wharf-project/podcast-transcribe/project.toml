@@ -20,9 +20,12 @@
 name        = "podcast-transcribe"
 description = "Podcast episode analysis for ABS_shim: whisper transcript of the served (ad-stitched) file, alignment to the publisher's transcript and chapters, inserted-ad ranges, optional LLM ad labels and chapters."
 
-# One whisper run at a time: it already uses the GPU and 8 cores. A backlog
-# waits here; past the queue depth the router fails over (queue_full).
+# Two at once since 2026-11-09: the shim keeps at most ONE background
+# analysis in flight and gives the second slot to "Play without ads" runs
+# (someone waiting), so a listener never waits behind background work. Two
+# whisper runs share the GPU (each slower), which is fine for the rare overlap.
+# A backlog waits here; past the queue depth the router fails over (queue_full).
 max_queue_depth = 16
 
 [slots]
-total = 1
+total = 2
