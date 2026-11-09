@@ -23,8 +23,9 @@
 //           job result, so the pump can take it from the job when the POST
 //           never came. Stored under the size the node MEASURED.
 //
-// The pump runs on the 2-minute podcast cron with one job in flight at a
-// time (one Mac). The Mac sleeps: a submit answered island_unreachable
+// The pump runs on the 2-minute podcast cron with one background job in
+// flight at a time (one Mac), plus a second lane for listen runs since
+// 2026-11-09 (MAX_RUNNING, submit). The Mac sleeps: a submit answered island_unreachable
 // leaves the row queued with the reason (shown in /admin) and is tried again
 // next tick; a job caught by sleep freezes until wake, so one unfinished
 // past its island's limit (`lostAfterMs`: 45 minutes on the Mac) is treated
@@ -47,13 +48,15 @@ import { getHold, holdEligible, holdParam } from './episode-holds';
 export const ANALYSIS_PROJECT = 'podcast-transcribe';
 export const ANALYSIS_HANDLER = 'analyse_episode';
 
-const RECENT_MS = 14 * 86400_000;          // new episodes analysed ahead of the first listen
+const RECENT_MS = 14 * 86400_000;
+const MAX_RUNNING = 2;                    // jobs in flight: one background, the rest listen runs (submit)          // new episodes analysed ahead of the first listen
 const PLAYING_MS = 2 * 3600_000;           // "being played": progress written this recently
 const UNSUBMITTED_AFTER_MS = 5 * 60_000;   // a claim whose submit never finished
 const MAX_ATTEMPTS = 3;
 // wharfd logs a job's full args, token included, so keep it short: the shim
-// has one job in flight, so the node fetches the audio within a minute of the
-// submit, and a result POST after expiry (a long stereo-au run) is covered by
+// has at most one background job in flight, so the node fetches the audio
+// within minutes of the submit (a listen run on a 1-slot node waits behind
+// at most one background job, a few minutes on the Mac), and a result POST after expiry (a long stereo-au run) is covered by
 // the pump taking the result from the finished job (2026-10-13).
 const TOKEN_TTL_SECONDS = 20 * 60;
 const KEEP_ROWS = 2;
@@ -284,16 +287,22 @@ async function submit(env: Env, e: EpisodeRow, queuedSize: number | null, origin
       .bind(e.id, queuedSize).run();
   }
   // The claim is one statement, so two pumps (the cron and a route's
-  // waitUntil) can't both start a job: it only inserts while no row is
-  // running.
+  // waitUntil) can't over-start: it only inserts while there is room.
+  // Two lanes (2026-11-09): at most MAX_RUNNING jobs in flight, of which at
+  // most ONE is a background job (asked, played, new), so a listen run
+  // ("Play without ads", someone waiting) never queues behind background
+  // work. The node needs [slots] total = 2 to actually run two at once;
+  // with 1 the second job waits in wharf's queue, as it used to here.
   const claim = await env.DB.prepare(
-    `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, attempts, reason, created_at, updated_at)
-     SELECT ?, ?, ?, ?, 'running', 1, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM episode_analysis WHERE state = 'running')
+    `INSERT INTO episode_analysis (episode_id, size_bytes, tenant_id, library_item_id, state, attempts, reason, listen, created_at, updated_at)
+     SELECT ?, ?, ?, ?, 'running', 1, ?, ?, ?, ?
+      WHERE (SELECT COUNT(*) FROM episode_analysis WHERE state = 'running') < ${MAX_RUNNING}
+        AND (? = 1 OR NOT EXISTS (SELECT 1 FROM episode_analysis WHERE state = 'running' AND listen = 0))
      ON CONFLICT (episode_id, size_bytes) DO UPDATE SET state = 'running', job_id = NULL,
        attempts = episode_analysis.attempts + 1, reason = COALESCE(excluded.reason, episode_analysis.reason),
-       listen = MAX(episode_analysis.listen, ?), updated_at = excluded.updated_at
+       listen = MAX(episode_analysis.listen, excluded.listen), updated_at = excluded.updated_at
      WHERE episode_analysis.state != 'running'`,
-  ).bind(e.id, size, e.tenant_id, e.library_item_id, reason, now, now, listen ? 1 : 0).run();
+  ).bind(e.id, size, e.tenant_id, e.library_item_id, reason, listen ? 1 : 0, now, now, listen ? 1 : 0).run();
   if (!claim.meta.changes) return `analysis: ${e.id} not started (a job is in flight)`;
   let jobId: string | null = null;
   try {
@@ -403,7 +412,8 @@ type Candidate = EpisodeRow & { show_analyse: string | null; queued_size?: numbe
 // The run log's `reason` for each kind of pick: a queued row keeps the one
 // it was queued with ("Analyse now" queues 'asked'; an automatic pick that
 // found the Mac asleep keeps its own).
-async function nextCandidate(env: Env, now: number): Promise<(Candidate & { reason: string }) | null> {
+// `lanes`: which kinds of job there is room for (analysisPump).
+async function nextCandidate(env: Env, now: number, lanes: { listen: boolean; background: boolean }): Promise<(Candidate & { reason: string }) | null> {
   // 1. Asked for (the "Analyse now" route), or an automatic pick that found
   //    the Mac asleep: oldest first. A restitched episode waits for the
   //    chapter pump's re-probe (chapters_checked_at) like any other, and an
@@ -420,8 +430,9 @@ async function nextCandidate(env: Env, now: number): Promise<(Candidate & { reas
       WHERE a.state = 'queued' AND e.chapters_checked_at IS NOT NULL
       ORDER BY a.listen DESC, COALESCE(e.archive_state IN ('queued', 'fetching'), 0) ASC, a.updated_at ASC LIMIT 25`,
   ).all<Candidate>();
-  const q = queued.results.find((e) => e.queued_listen || !waitsForArchive(e));
+  const q = queued.results.find((e) => e.queued_listen ? lanes.listen : lanes.background && !waitsForArchive(e));
   if (q) return { ...q, reason: q.queued_reason ?? 'asked' };
+  if (!lanes.background) return null;
 
   // 2. Being played, with nothing for the stitch being streamed: results
   //    are a couple of minutes away, so the rest of this listen is right.
@@ -471,14 +482,14 @@ export async function analysisPump(env: Env, opts: { origin?: string } = {}): Pr
        FROM episode_analysis a LEFT JOIN podcast_episodes e ON e.id = a.episode_id
       WHERE a.state = 'running' ORDER BY a.updated_at ASC`,
   ).all<RunningRow>();
-  let busy = false;
+  let inFlight = 0, background = 0;
   for (const r of running.results) {
     const res = await checkRunning(env, r, now);
     if (res.log) log.push(res.log);
-    busy ||= res.busy;
+    if (res.busy) { inFlight++; if (!r.listen) background++; }
   }
-  if (busy) return log;
-  const next = await nextCandidate(env, now);
+  if (inFlight >= MAX_RUNNING) return log;
+  const next = await nextCandidate(env, now, { listen: true, background: background === 0 });
   if (next) log.push(await submit(env, next, next.queued_size ?? null, opts.origin ?? analysisOrigin(env), next.reason, !!next.queued_listen));
   return log;
 }
@@ -749,15 +760,17 @@ function rowJson(r: AnalysisRow) {
 // GET …/analysis: where the episode's analysis stands. `state` is the row
 // for the size served now, else one waiting or running for it.
 // `waitingFor` on a queued row: 'archive' while it is held for the pCloud
-// copy, 'other-job' while another episode's job is in flight (one at a
-// time), 'node' when the last submit found the node away (asleep, not
+// copy, 'other-job' while there's no lane free for it (a
+// background job in flight, or for a listen run both lanes busy), 'node' when the last submit found the node away (asleep, not
 // routed: `error` says which), else null (it starts on the next pump).
 // `held`: the held copy served now (episode-holds.ts), or null.
 export async function analysisStatus(env: Env, e: EpisodeRow) {
   const [rowsRes, hold, other] = await Promise.all([
     env.DB.prepare('SELECT * FROM episode_analysis WHERE episode_id = ? ORDER BY updated_at DESC').bind(e.id).all<AnalysisRow>(),
     getHold(env, e.id),
-    env.DB.prepare("SELECT 1 AS x FROM episode_analysis WHERE state = 'running' AND episode_id != ? LIMIT 1").bind(e.id).first<{ x: number }>(),
+    // What a queued row waits behind: for a listen run, a full house; for
+    // a background one, the background job in flight (two lanes, submit).
+    env.DB.prepare(`SELECT COUNT(*) AS x, SUM(listen = 0) AS bg FROM episode_analysis WHERE state = 'running' AND episode_id != ?`).bind(e.id).first<{ x: number; bg: number | null }>(),
   ]);
   const rows = rowsRes.results;
   const current = rows.find((r) => r.size_bytes === e.size_bytes)
@@ -767,7 +780,7 @@ export async function analysisStatus(env: Env, e: EpisodeRow) {
   let waitingFor: 'archive' | 'other-job' | 'node' | null = null;
   if (current?.state === 'queued') {
     if (!current.listen && waitsForArchive(e)) waitingFor = 'archive';
-    else if (other) waitingFor = 'other-job';
+    else if (current.listen ? (other?.x ?? 0) >= MAX_RUNNING : (other?.bg ?? 0) > 0) waitingFor = 'other-job';
     else if (current.error) waitingFor = 'node';
   }
   return {
