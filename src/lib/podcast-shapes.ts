@@ -9,6 +9,7 @@ import type { FollowInfo } from '../db/podcast-follows';
 import { derivedId } from './ids';
 import { stripAllTags, type FeedVideo } from './rss';
 import { storageLabel } from './storage-label';
+import { identifyAudioHost, urlHasDynamicAds } from './audio-host';
 
 export function podcastMetadata(p: PodcastRow) {
   return {
@@ -256,6 +257,10 @@ export async function buildEpisode(e: EpisodeRow, item: LibraryItemRow, opts: { 
     // so the feed's chapter and transcript times (made from the master)
     // run early by the ads played before them, differently per listener.
     dynamicAds: hasDynamicAds(e.enclosure_url),
+    // Not ABS: who serves the audio ({name: 'Megaphone' | 'PRX' | a
+    // self-hosted domain, host: the hostname}), from where a fetch saw the
+    // redirect chain end, else named from the enclosure (src/lib/audio-host.ts).
+    audioHost: episodeAudioHost(e),
     // Not ABS: the episode's video versions (episodeVideos), [] for most.
     videos: episodeVideos(e),
     // Not ABS: the analysis of the file served now (size, ad ranges, where
@@ -296,15 +301,10 @@ export function episodeVideos(e: EpisodeRow): EpisodeVideo[] {
   return out;
 }
 
-// Hosts that insert ads per download (verified 2026-10-12: art19 served
-// this Worker and a home connection two different LINUX Unplugged files,
-// 41 s apart after the mid-roll; Audioboom's No Such Thing As A Fish
-// differed by two minutes). Tracking prefixes (podtrac, chartable, op3,
-// podscribe, mgln) only redirect and aren't listed.
-const DYNAMIC_AD_HOSTS = ['art19.com', 'audioboom.com', 'megaphone.fm', 'simplecastaudio.com', 'simplecast.com',
-  'acast.com', 'omny.fm', 'omnycontent.com', 'anchor.fm', 'spotify.com', 'adswizz.com', 'spreaker.com',
-  // PRX's Dovetail (The West Wing Weekly and other PRX shows) stitches per download too.
-  'prxu.org'];
+// Hosts that insert ads per download: the `dynamicAds` companies in
+// src/lib/audio-host.ts, matched on every non-tracker host the URL names
+// (tracking prefixes such as podtrac, chartable, op3, podscribe and mgln
+// only redirect).
 // One identity for every request that touches an episode's audio (the
 // stream proxy and the chapter/length probe): art19 served this Worker's
 // home-network twin three different stitches of one episode under three
@@ -312,9 +312,14 @@ const DYNAMIC_AD_HOSTS = ['art19.com', 'audioboom.com', 'megaphone.fm', 'simplec
 // file that is then streamed.
 export const EPISODE_AUDIO_UA = 'audiobookshelf (+https://audiobookshelf.org; like iTMS)';
 
+export function episodeAudioHost(e: Pick<EpisodeRow, 'enclosure_url' | 'audio_host' | 'audio_host_url_host'>): { name: string; host: string } | null {
+  if (e.audio_host && e.audio_host_url_host) return { name: e.audio_host, host: e.audio_host_url_host };
+  const h = identifyAudioHost(e.enclosure_url);
+  return h ? { name: h.name, host: h.host } : null;
+}
+
 export function hasDynamicAds(url: string | null | undefined): boolean {
-  const u = (url || '').toLowerCase();
-  return DYNAMIC_AD_HOSTS.some((h) => u.includes(h));
+  return urlHasDynamicAds(url);
 }
 
 // ─── Episode analysis (migration 0025, src/lib/episode-analysis.ts) ─────────

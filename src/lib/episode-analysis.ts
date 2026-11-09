@@ -42,6 +42,7 @@ import {
 } from './podcast-shapes';
 import { rankTranscripts, whisperTranscript, type Transcript } from './transcript';
 import { stripAllTags, type TranscriptLink } from './rss';
+import { identifyAudioHost } from './audio-host';
 import { doneRun, emptyRun, LOST_PREFIX, nodeStats, recordRun } from './analysis-runs';
 import { getHold, holdEligible, holdParam } from './episode-holds';
 
@@ -692,11 +693,15 @@ export async function storeResult(env: Env, e: EpisodeRow, body: unknown, opts: 
 
   // The episode as it is now (the stream route may have recorded a new
   // size while the job ran).
-  const cur = await env.DB.prepare('SELECT size_bytes, analysis, duration_seconds FROM podcast_episodes WHERE id = ?')
-    .bind(e.id).first<{ size_bytes: number; analysis: string | null; duration_seconds: number }>();
+  const cur = await env.DB.prepare(
+    'SELECT size_bytes, analysis, duration_seconds, archive_state, audio_host, audio_host_url_host FROM podcast_episodes WHERE id = ?',
+  ).bind(e.id).first<{ size_bytes: number; analysis: string | null; duration_seconds: number; archive_state: string | null;
+    audio_host: string | null; audio_host_url_host: string | null }>();
   const curSize = cur?.size_bytes || 0;
   const current = !curSize || curSize === r.size;
   await pruneRows(env, e.id, curSize || r.size);
+  await recordAdObservation(env, e, r.size, r.ads, current && cur?.archive_state === 'done' ? 'pcloud' : 'worker',
+    cur?.audio_host ?? null, cur?.audio_host_url_host ?? null, now);
 
   const summary: AnalysisSummary = {
     size: r.size, duration: r.duration, offsets: r.offsets, cuts: r.cuts, ads: r.ads,
@@ -719,6 +724,26 @@ export async function storeResult(env: Env, e: EpisodeRow, body: unknown, opts: 
   }
   if (sets.length) await env.DB.prepare(`UPDATE podcast_episodes SET ${sets.join(', ')} WHERE id = ?`).bind(...binds, e.id).run();
   return { size: r.size, current };
+}
+
+// Evidence for the home-fetch idea (migration 0039): what each analysed
+// stitch held, by host and by who fetched it. One row per episode + size,
+// so the POST and the pump storing one result write it once. Never throws.
+async function recordAdObservation(
+  env: Env, e: EpisodeRow, size: number, ads: Array<{ start: number; end: number; kind: string }>, via: string,
+  hostName: string | null, finalHost: string | null, now: number,
+): Promise<void> {
+  const inserted = ads.filter((a) => a.kind === 'inserted');
+  const secs = inserted.reduce((t, a) => t + Math.max(0, a.end - a.start), 0);
+  const host = hostName ?? identifyAudioHost(e.enclosure_url)?.name ?? null;
+  await env.DB.prepare(
+    `INSERT INTO episode_ad_observations (episode_id, size_bytes, tenant_id, library_item_id, fetched_via, host, final_host,
+       inserted_ads, inserted_seconds, ads_total, analysed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (episode_id, size_bytes) DO UPDATE SET fetched_via = excluded.fetched_via, host = excluded.host,
+       final_host = excluded.final_host, inserted_ads = excluded.inserted_ads, inserted_seconds = excluded.inserted_seconds,
+       ads_total = excluded.ads_total, analysed_at = excluded.analysed_at`,
+  ).bind(e.id, size, e.tenant_id, e.library_item_id, via, host, finalHost, inserted.length, Math.round(secs * 10) / 10, ads.length, now)
+    .run().catch((err) => console.log(`[analysis] observation for ${e.id} not recorded: ${(err as Error).message}`));
 }
 
 // The newest two rows per episode, plus the one for the size served now.

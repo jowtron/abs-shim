@@ -12,6 +12,7 @@ import { resolveItemIdFromUuid } from '../lib/ids';
 import { findCatalogCover } from '../lib/cover-from-catalog';
 import { insertListeningSession } from '../db/sessions';
 import { getProgress, progressForShows, progressToAbs } from '../db/progress';
+import { audioHostUpdate } from '../lib/audio-host';
 import { audioContentType, resolveProbeUrl, resolveStreamUrl, streamAudio, streamRemoteAudio } from '../storage/resolve';
 import { getEpisode, getPodcast, listShowEpisodes } from '../db/podcasts';
 import { followInfo, unhideEpisodes } from '../db/podcast-follows';
@@ -278,6 +279,11 @@ itemRoutes.get('/:id/file/:fileId', async (c) => {
         ).bind(size, episodeId, episodeId).run()
           .then(() => adoptAnalysisForSize(c.env, episodeId, size))
           .then(() => undefined, () => undefined));
+      }, (finalUrl) => {
+        // Which host served it (src/lib/audio-host.ts): written only when
+        // it changed, so most Range requests write nothing.
+        const st = audioHostUpdate(c.env, target.episode!, finalUrl);
+        if (st) c.executionCtx.waitUntil(st.run().then(() => undefined, () => undefined));
       }));
     }
     return finish(await streamAudio(c.env, target.folder, target.audio, c.req.raw));

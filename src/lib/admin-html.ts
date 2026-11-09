@@ -1706,6 +1706,8 @@ function podcastLibraryHtml(lib, folders, s, isOwner, canAdd, status) {
   h += '</div>';
   // Filled by wirePodcastLibraries from /api/analysis/runs (canAdd only).
   if (canAdd) h += '<div class="muted" data-pod-runs="' + id + '" style="font-size:0.85rem;margin-top:0.4rem"></div>';
+  // Ads found per audio host (/api/analysis/hosts, canAdd), loaded on demand.
+  if (canAdd) h += '<div style="margin-top:0.3rem"><button class="secondary" data-pod-hosts="' + id + '" title="Which hosts serve these episodes, and how many inserted ads the analyses found, by who fetched the file">Ads by host</button><div data-pod-hosts-out="' + id + '" style="display:none"></div></div>';
   // Subscribing is open to every member (a podcast list is personal);
   // archiving spends the library's pCloud, so that box is canAdd's.
   h += '<div class="upload-area" id="pod-add-' + id + '">';
@@ -1759,8 +1761,40 @@ async function podLoadRunTotals(el) {
   el.textContent = line;
 }
 
+// One row per host and per who fetched the analysed files: Worker =
+// Cloudflare's egress (streamed or held), pCloud = an archived copy.
+async function podLoadHosts(el) {
+  el.innerHTML = '<span class="muted">Loading…</span>';
+  let d;
+  try { d = await api('/api/analysis/hosts'); } catch (e) { el.textContent = 'Could not load: ' + e.message; return; }
+  if (!d.hosts.length) { el.innerHTML = '<span class="muted">Nothing recorded yet: a host is noted when an episode is streamed, held or archived.</span>'; return; }
+  const via = { worker: 'Worker', pcloud: 'pCloud', home: 'home', '': '' };
+  let h = '<div style="overflow-x:auto"><table class="mini-table" style="font-size:0.85rem;border-collapse:collapse;margin-top:0.4rem">'
+    + '<tr><th style="text-align:left;padding:2px 8px 2px 0">Host</th><th style="text-align:left;padding:2px 8px">Fetched by</th>'
+    + '<th style="text-align:right;padding:2px 8px" title="Episodes whose audio a fetch saw this host serve">Seen</th>'
+    + '<th style="text-align:right;padding:2px 8px" title="Analysed files (one per stitch)">Analysed</th>'
+    + '<th style="text-align:right;padding:2px 8px" title="Analysed files with at least one inserted ad">With ads</th>'
+    + '<th style="text-align:right;padding:2px 0 2px 8px" title="Inserted-ad seconds per analysed file">Avg ad time</th></tr>';
+  for (const r of d.hosts) {
+    const pct = r.analysed ? Math.round(100 * r.withInserted / r.analysed) + '%' : '';
+    h += '<tr><td style="padding:2px 8px 2px 0">' + escapeHtml(r.name) + '</td>'
+      + '<td style="padding:2px 8px" class="muted">' + escapeHtml(via[r.via] != null ? via[r.via] : r.via) + '</td>'
+      + '<td style="text-align:right;padding:2px 8px">' + (r.seen || '') + '</td>'
+      + '<td style="text-align:right;padding:2px 8px">' + (r.analysed || '') + '</td>'
+      + '<td style="text-align:right;padding:2px 8px">' + (r.analysed ? r.withInserted + ' (' + pct + ')' : '') + '</td>'
+      + '<td style="text-align:right;padding:2px 0 2px 8px">' + (r.analysed ? Math.round(r.avgInsertedSeconds) + ' s' : '') + '</td></tr>';
+  }
+  el.innerHTML = h + '</table></div>';
+}
+
 function wirePodcastLibraries(body, status) {
   body.querySelectorAll('[data-pod-runs]').forEach((el) => podLoadRunTotals(el));
+  body.querySelectorAll('[data-pod-hosts]').forEach((btn) => btn.addEventListener('click', () => {
+    const out = body.querySelector('[data-pod-hosts-out="' + btn.dataset.podHosts + '"]');
+    const open = out.style.display === 'none';
+    out.style.display = open ? '' : 'none';
+    if (open) podLoadHosts(out);
+  }));
   body.querySelectorAll('[data-pod-add]').forEach((btn) => btn.addEventListener('click', () => {
     const area = document.getElementById('pod-add-' + btn.dataset.podAdd);
     area.classList.toggle('open');

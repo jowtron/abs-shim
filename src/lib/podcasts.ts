@@ -20,6 +20,7 @@ import { parseTranscript, rankTranscripts, type Transcript, type TranscriptCue }
 import { adoptAnalysisForSize, analysisPump, whisperTranscriptFor } from './episode-analysis';
 import { deleteItemHeldObjects, getHold, pruneHolds } from './episode-holds';
 import { announceArchiveDone, announceNewEpisodes } from './push';
+import { noteAudioHost } from './audio-host';
 import { followShow, isIdle } from '../db/podcast-follows';
 import {
   pcloudDeleteFile, pcloudDownloadFileAsync, pcloudEnsureFolder, pcloudRenameFile, pcloudStat, type PcloudProfile,
@@ -1267,6 +1268,7 @@ export async function archivePump(env: Env): Promise<string[]> {
     try {
       const src = await probeEnclosure(e.enclosure_url);
       if (src.html) { await fail(e, 'The enclosure URL serves a web page, not audio'); continue; }
+      if (src.url !== e.enclosure_url || src.size) await noteAudioHost(env, e, src.url);
       const name = archiveName(e);
       const rel = `${e.show_path}/${name}`;
       const abs = join(target.rootPath, rel);

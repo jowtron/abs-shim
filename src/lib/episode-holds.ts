@@ -35,6 +35,7 @@ import type { EpisodeRow } from '../db/podcasts';
 import type { AudioFileRow } from '../db/library';
 import { EPISODE_AUDIO_UA } from './podcast-shapes';
 import { fetchWithHeaderTimeout } from '../storage/resolve';
+import { noteAudioHost } from './audio-host';
 
 export const HOLD_MAX_BYTES = 500 * 1024 * 1024;
 export const HOLD_KEEP_MS = 3 * 24 * 3600_000;
@@ -177,6 +178,7 @@ export async function holdingStream(env: Env, ctx: ExecutionContext, e: EpisodeR
   } catch {
     upstream = await fetchWithHeaderTimeout(audio.filedn_url, fwd);
   }
+  if (upstream.ok) ctx.waitUntil(noteAudioHost(env, e, upstream.url || audio.filedn_url));
   const total = Number(upstream.headers.get('content-length') ?? '');
   const holdable = upstream.status === 200 && !!upstream.body && !upstream.headers.get('content-encoding')
     && Number.isSafeInteger(total) && total > 0 && total <= HOLD_MAX_BYTES;

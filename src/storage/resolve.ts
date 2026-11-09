@@ -175,6 +175,8 @@ export async function streamRemoteAudio(
   audio: AudioFileRow,
   req: Request,
   onSize?: (size: number) => void,
+  // Where the redirect chain ended, on every 200/206 (audio-host.ts).
+  onFinal?: (url: string) => void,
 ): Promise<Response> {
   const fwd = new Headers({ 'User-Agent': EPISODE_AUDIO_UA });
   const range = req.headers.get('Range');
@@ -207,6 +209,7 @@ export async function streamRemoteAudio(
       await rememberResolvedEnclosure(audio.filedn_url, upstream.url);
     }
   }
+  if (upstream.status === 200 || upstream.status === 206) onFinal?.(upstream.url || known || audio.filedn_url);
   const total = Number(/\/(\d+)\s*$/.exec(upstream.headers.get('content-range') ?? '')?.[1]
     ?? (upstream.status === 200 ? upstream.headers.get('content-length') ?? '' : ''));
   if (Number.isFinite(total) && total > 0 && total !== audio.size_bytes) onSize?.(total);

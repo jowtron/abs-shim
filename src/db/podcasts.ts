@@ -79,6 +79,8 @@ export type EpisodeRow = {
   duration_measured: number;       // migration 0025: 1 = duration_seconds was measured, the feed's can't replace it
   videos: string | null;           // migration 0037: JSON FeedVideo[] from <podcast:alternateEnclosure type="video/…">
   file_type: string | null;        // migration 0037: what the enclosure really is, from its bytes ('' = unrecognised, NULL = not looked at)
+  audio_host: string | null;       // migration 0039: company serving the audio (src/lib/audio-host.ts), NULL until a fetch saw the chain's end
+  audio_host_url_host: string | null; // migration 0039: the hostname the redirect chain ended at
   created_at: number;
   updated_at: number;
 };

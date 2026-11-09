@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { Env } from '../types';
 import { requireAuth, requireCanAdd, type AuthVars } from '../auth/middleware';
 import { analysisRunsReport } from '../db/analysis-runs';
+import { hostAdReport } from '../db/ad-observations';
 
 // /api/analysis (shim-only): the episode analysis run log (migration 0027),
 // for Pholia's Settings "Episode analysis" section and /admin. canAdd, the
@@ -26,3 +27,8 @@ analysisRoutes.get('/runs', requireCanAdd, async (c) => {
   const tz = c.req.query('tz') || 'UTC';
   return c.json(await analysisRunsReport(c.env, c.get('tenantId'), { limit, before, showId, tz }));
 });
+
+// GET /api/analysis/hosts → {hosts: [{name, via, seen, analysed,
+// withInserted, avgInsertedSeconds}]}: ads found per audio host and per who
+// fetched the file (migration 0039, src/db/ad-observations.ts). /admin only.
+analysisRoutes.get('/hosts', requireCanAdd, async (c) => c.json(await hostAdReport(c.env, c.get('tenantId'))));
