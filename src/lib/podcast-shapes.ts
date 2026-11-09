@@ -302,7 +302,9 @@ export function episodeVideos(e: EpisodeRow): EpisodeVideo[] {
 // differed by two minutes). Tracking prefixes (podtrac, chartable, op3,
 // podscribe, mgln) only redirect and aren't listed.
 const DYNAMIC_AD_HOSTS = ['art19.com', 'audioboom.com', 'megaphone.fm', 'simplecastaudio.com', 'simplecast.com',
-  'acast.com', 'omny.fm', 'omnycontent.com', 'anchor.fm', 'spotify.com', 'adswizz.com', 'spreaker.com'];
+  'acast.com', 'omny.fm', 'omnycontent.com', 'anchor.fm', 'spotify.com', 'adswizz.com', 'spreaker.com',
+  // PRX's Dovetail (The West Wing Weekly and other PRX shows) stitches per download too.
+  'prxu.org'];
 // One identity for every request that touches an episode's audio (the
 // stream proxy and the chapter/length probe): art19 served this Worker's
 // home-network twin three different stitches of one episode under three

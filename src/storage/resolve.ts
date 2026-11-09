@@ -127,6 +127,50 @@ export async function streamAudio(
 // The feed's enclosure length is often wrong or missing, so size_bytes stays
 // 0 until a response states the real total; `onSize` records it, after which
 // the file route can answer HEAD from D1 like any other file.
+// ── Where an enclosure's redirect chain ends (2026-11-09) ──
+// Most enclosures are a chain of trackers before the file: The West Wing
+// Weekly's is podtrac → pscrb.fm → dovetail.prxu.org → dovetail-cdn, about
+// 3 s before the first byte from here. iOS starts an mp3 part-way through
+// with dozens of small Range requests one after another, and every one of
+// them walked the whole chain: 49 s from tap to sound on an iPhone. The
+// end of the chain is remembered for 6 h (in this isolate, and in the
+// colo's cache for the next one), so later requests go straight to the
+// file; anything but a 200/206 from it forgets it and walks the chain
+// again. It also keeps a listen on ONE stitch of an ad-inserting host,
+// where each walk could hand back a differently stitched file. Trackers
+// see one download per listen instead of one per Range request, which is
+// what a podcast app's download looks like to them anyway.
+const RESOLVED_TTL_S = 6 * 3600;
+const resolvedMemo = new Map<string, { url: string; until: number }>();
+function resolvedKey(enclosure: string): string {
+  return 'https://resolved-enclosure.internal/' + encodeURIComponent(enclosure);
+}
+async function resolvedEnclosure(enclosure: string): Promise<string | null> {
+  const m = resolvedMemo.get(enclosure);
+  if (m && m.until > Date.now()) return m.url;
+  try {
+    const hit = await caches.default.match(resolvedKey(enclosure));
+    if (!hit) return null;
+    const url = (await hit.text()).trim();
+    if (!/^https?:\/\//.test(url)) return null;
+    resolvedMemo.set(enclosure, { url, until: Date.now() + 10 * 60_000 });
+    return url;
+  } catch { return null; }
+}
+async function rememberResolvedEnclosure(enclosure: string, url: string): Promise<void> {
+  resolvedMemo.set(enclosure, { url, until: Date.now() + RESOLVED_TTL_S * 1000 });
+  if (resolvedMemo.size > 500) resolvedMemo.delete(resolvedMemo.keys().next().value as string);
+  try {
+    await caches.default.put(resolvedKey(enclosure), new Response(url, {
+      headers: { 'Content-Type': 'text/plain', 'Cache-Control': `max-age=${RESOLVED_TTL_S}` },
+    }));
+  } catch { /* the in-isolate memo still helps */ }
+}
+async function forgetResolvedEnclosure(enclosure: string): Promise<void> {
+  resolvedMemo.delete(enclosure);
+  try { await caches.default.delete(resolvedKey(enclosure)); } catch { /* expires anyway */ }
+}
+
 export async function streamRemoteAudio(
   audio: AudioFileRow,
   req: Request,
@@ -139,12 +183,29 @@ export async function streamRemoteAudio(
   // starting a whole download.
   if (head) fwd.set('Range', 'bytes=0-0');
   else if (range) fwd.set('Range', range);
-  let upstream: Response;
-  try {
-    upstream = await fetchWithHeaderTimeout(audio.filedn_url, fwd);
-    if (upstream.status >= 500) throw new Error(`publisher ${upstream.status}`);
-  } catch {
-    upstream = await fetchWithHeaderTimeout(audio.filedn_url, fwd);
+  let upstream: Response | null = null;
+  // Where the enclosure's redirect chain ended last time (see
+  // resolvedEnclosure): straight there, back to the start of the chain if
+  // that address no longer answers.
+  const known = await resolvedEnclosure(audio.filedn_url);
+  if (known) {
+    try {
+      const r = await fetchWithHeaderTimeout(known, fwd);
+      if (r.status === 200 || r.status === 206) upstream = r;
+      else await r.body?.cancel().catch(() => undefined);
+    } catch { /* fall through to the full chain */ }
+    if (!upstream) await forgetResolvedEnclosure(audio.filedn_url);
+  }
+  if (!upstream) {
+    try {
+      upstream = await fetchWithHeaderTimeout(audio.filedn_url, fwd);
+      if (upstream.status >= 500) throw new Error(`publisher ${upstream.status}`);
+    } catch {
+      upstream = await fetchWithHeaderTimeout(audio.filedn_url, fwd);
+    }
+    if ((upstream.status === 200 || upstream.status === 206) && upstream.url && upstream.url !== audio.filedn_url) {
+      await rememberResolvedEnclosure(audio.filedn_url, upstream.url);
+    }
   }
   const total = Number(/\/(\d+)\s*$/.exec(upstream.headers.get('content-range') ?? '')?.[1]
     ?? (upstream.status === 200 ? upstream.headers.get('content-length') ?? '' : ''));
